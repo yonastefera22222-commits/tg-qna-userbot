@@ -245,6 +245,54 @@ async def cb_account_reconnect(callback: CallbackQuery, ctx: AppContext) -> None
         )
 
 
+SHARE_STEPS = (
+    "🎁 <b>Share Your Setup With Someone</b>\n\n"
+    "This snapshot carries your <b>groups and their settings</b> only. It contains\n"
+    "<b>no credentials</b>: no Telegram session, no AI API keys, no owner id. It is\n"
+    "safe to send, but treat it as private — it reveals which groups you monitor.\n\n"
+    "<b>Do NOT send them your Backup snapshot instead.</b> A Telethon session string\n"
+    "is a complete account login: whoever holds it <i>is</i> your Telegram account.\n\n"
+    "<b>What they should do:</b>\n"
+    "1. Fork this repository to their own GitHub account\n"
+    "2. Create their own Render Blueprint (or Web Service) from the fork\n"
+    "3. Set <b>BOT_TOKEN</b> (their @BotFather token) and <b>OWNER_ID</b> (their own\n"
+    "   Telegram id from @userinfobot) in Render → Environment\n"
+    "4. Paste the value below into <b>BOT_STATE_B64</b> in Render → Environment\n"
+    "5. Deploy, then log in <b>their own</b> Telegram account and add <b>their own</b>\n"
+    "   AI key in the dashboard — credentials never transfer\n\n"
+)
+
+NO_CREDENTIALS_NOTE = (
+    "🔒 <i>This snapshot contains groups and settings only. tg_session, API keys "
+    "and owner_id are excluded by design.</i>"
+)
+
+
+@router.callback_query(F.data == "acc:export_share")
+async def cb_export_share(callback: CallbackQuery, ctx: AppContext) -> None:
+    await callback.answer("Preparing a credential-free snapshot...")
+    state_b64 = await ctx.db.export_state_b64(profile="share")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Delete Secret Message", callback_data="msg:delete_me")]
+        ]
+    )
+    if callback.message is None:
+        return
+    if len(state_b64) > 3400:
+        await callback.message.answer(
+            SHARE_STEPS
+            + "⚠️ Your snapshot is too large for one Telegram message. Enable fewer "
+            "groups, or have them configure groups by hand after deploying.",
+            reply_markup=kb,
+        )
+        return
+    await callback.message.answer(
+        SHARE_STEPS + NO_CREDENTIALS_NOTE + f"\n\n<code>{html.escape(state_b64)}</code>",
+        reply_markup=kb,
+    )
+
+
 @router.callback_query(F.data == "acc:export_render")
 async def cb_export_render(callback: CallbackQuery, ctx: AppContext) -> None:
     await callback.answer("Exported!")
@@ -258,9 +306,13 @@ async def cb_export_render(callback: CallbackQuery, ctx: AppContext) -> None:
         return
     if len(state_b64) <= 3400:
         await callback.message.answer(
-            "☁️ <b>Render Free Tier Persistence Backup</b>\n\n"
-            "Render Free wipes local disk on restart/redeploy. To make your Telegram login, "
-            "AI keys, and selected groups survive every restart automatically:\n\n"
+                "☁️ <b>Render Free Tier Persistence Backup</b>\n\n"
+                "🔐 <b>This backup contains your Telegram session and AI keys.</b>\n"
+                "Anyone who has it can log in as you. Keep it in your own Render env "
+                "only — never send it to another person. To share a setup, use "
+                "<b>🎁 Share Setup With Someone</b> instead.\n\n"
+                "Render Free wipes local disk on restart/redeploy. To make your Telegram login, "
+                "AI keys, and selected groups survive every restart automatically:\n\n"
             "1. Open your service on <b>Render → Environment</b>\n"
             "2. Add an environment variable named <code>BOT_STATE_B64</code>\n"
             "3. Paste the value below and click <b>Save Changes</b>\n"

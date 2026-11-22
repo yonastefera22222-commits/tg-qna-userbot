@@ -32,6 +32,17 @@ SECRET_SETTING_KEYS = frozenset(
 #: can be detected; it is worthless after the process dies and stays out of exports.
 EPHEMERAL_SETTING_KEYS = frozenset({"tg_pending_login"})
 
+#: Settings that identify the deployment's owner and must NEVER travel to
+#: someone else. A Telethon session string is a complete account login: whoever
+#: holds it *is* that Telegram account until the session is revoked. Sharing a
+#: snapshot containing it hands over the account, not just a config.
+IDENTITY_SETTING_KEYS = SECRET_SETTING_KEYS | frozenset({"owner_id", "tg_api_id"})
+
+#: Export profiles. ``backup`` is for the same deployment surviving a restart and
+#: keeps everything. ``share`` is for giving someone else a starting
+#: configuration and carries no credentials or owner identity at all.
+EXPORT_PROFILES = ("backup", "share")
+
 
 @dataclass
 class GroupConfig:
@@ -445,20 +456,34 @@ class Database:
     # Portable State Export / Import (for Ephemeral Hosts like Render Free)
     # ------------------------------------------------------------------
 
-    async def export_state_b64(self) -> str:
-        """Export settings + enabled groups as a compact gzip+base64 string for Render env vars."""
+    async def export_state_b64(self, profile: str = "backup") -> str:
+        """Export settings + enabled groups as a compact gzip+base64 string.
+
+        ``profile="backup"`` (default) keeps credentials so the *same*
+        deployment can restore itself on an ephemeral host.
+        ``profile="share"`` strips every credential and owner identity, so the
+        snapshot is safe to hand to another person. Handing over a backup
+        snapshot instead would give them the owner's Telegram account.
+        """
+        if profile not in EXPORT_PROFILES:
+            raise ValueError(f"Unknown export profile: {profile}")
+        skip = EPHEMERAL_SETTING_KEYS
+        if profile == "share":
+            skip = skip | IDENTITY_SETTING_KEYS
+
         cursor = await self.conn.execute("SELECT key FROM settings")
         rows = await cursor.fetchall()
         settings_dump: dict[str, Any] = {}
         for row in rows:
             key = str(row["key"])
-            if key in EPHEMERAL_SETTING_KEYS:
+            if key in skip:
                 continue
             settings_dump[key] = await self.get_setting(key)
 
         enabled_groups = await self.list_groups(only_enabled=True)
         payload = {
-            "v": 1,
+            "v": 2,
+            "profile": profile,
             "settings": settings_dump,
             "groups": [asdict(g) for g in enabled_groups],
         }
@@ -475,8 +500,45 @@ class Database:
         settings_dump = payload.get("settings") or {}
         groups_dump = payload.get("groups") or []
 
+        # Never let a snapshot take over this deployment's identity. An old
+        # "backup" snapshot contains the original owner's Telegram session and
+        # AI keys; importing it into someone else's deployment would answer
+        # from the wrong account and bill the wrong person. Credentials and
+        # owner identity always come from THIS deployment's env/dashboard.
+        imported_credentials = 0
+        skipped_identity: list[str] = []
+        current_owner = await self.get_setting("owner_id")
         for key, value in settings_dump.items():
-            await self.set_setting(str(key), value)
+            if key in IDENTITY_SETTING_KEYS:
+                # A snapshot may only restore a credential if this deployment has
+                # not claimed an owner of its own yet, i.e. it is the same
+                # deployment restoring itself:
+                #   * never-claimed deployment  -> original owner's snapshot, OK
+                #   * different owner claimed   -> someone else's snapshot, refused
+                if current_owner is None:
+                    imported_credentials += 1
+                    await self.set_setting(key, value)
+                else:
+                    skipped_identity.append(key)
+                continue
+            await self.set_setting(key, value)
+
+        if skipped_identity:
+            logger.warning(
+                "Refused %d credential/identity setting(s) from an imported snapshot: "
+                "this deployment is already owned by %s, so importing another "
+                "account's session or API keys would hijack it (%s). Set them from "
+                "this deployment's own dashboard or env.",
+                len(skipped_identity),
+                current_owner,
+                ", ".join(sorted(skipped_identity)),
+            )
+        if imported_credentials:
+            logger.info(
+                "Restored %d credential setting(s) from the snapshot for an "
+                "unclaimed deployment.",
+                imported_credentials,
+            )
 
         restored_groups = 0
         for g_dict in groups_dump:
