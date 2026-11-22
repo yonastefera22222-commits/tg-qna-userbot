@@ -314,3 +314,189 @@ async def cb_logout_do(callback: CallbackQuery, ctx: AppContext) -> None:
         callback,
         "🚪 Logged out and cleared saved session.\nSend /start anytime to connect an account again.",
     )
+
+
+# ----------------------------------------------------------------------
+# /diag — end-to-end responder diagnostics
+# ----------------------------------------------------------------------
+
+
+@router.message(Command("diag"))
+async def cmd_diag(message: Message, ctx: AppContext) -> None:
+    """Show exactly why the userbot is or is not answering.
+
+    Every gate between "a message arrives" and "a reply is sent" is reported, in
+    order, together with the most recent skip reasons. Before this, a misconfigured
+    group produced complete silence with no way to tell where it stopped.
+    """
+    ub = ctx.userbot
+    users_ok = ub.is_connected
+    global_on = bool(await ctx.db.get_setting("global_enabled", True))
+    groups = await ctx.db.list_groups()
+    enabled = [g for g in groups if g.enabled]
+    counters = ub.counters
+
+    lines = [
+        "🩺 <b>Responder Diagnostics</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{'🟢' if users_ok else '🔴'} <b>Telegram account:</b> "
+        f"{'connected as ' + html.escape(ub.account_display) if users_ok else 'NOT connected'}",
+        f"{'🟢' if global_on else '⏸'} <b>Responder:</b> "
+        f"{'ACTIVE' if global_on else 'PAUSED (/dashboard to resume)'}",
+        f"👥 <b>Groups enabled:</b> {len(enabled)} / {len(groups)} synced",
+        f"📥 <b>Messages seen since start:</b> {counters['messages_seen']}",
+        f"💬 <b>Answers sent since start:</b> {counters['answers_sent']}",
+    ]
+
+    ai_ok = bool(await ctx.db.get_all_provider_keys())
+    primary = str(await ctx.db.get_setting("primary_provider", "—"))
+    primary_model = str(await ctx.db.get_setting("primary_model", "—"))
+    lines.append(
+        f"{'🟢' if ai_ok else '🔴'} <b>AI:</b> {html.escape(primary)} · "
+        f"<code>{html.escape(primary_model)}</code>"
+        + ("" if ai_ok else " (no API key saved)")
+    )
+
+    # Per-group verdict
+    if enabled:
+        lines += ["", "<b>Enabled groups</b>"]
+        for g in enabled[:6]:
+            notes = []
+            if g.sender_filter == "admins":
+                entry = ub._admin_cache.get(g.chat_id)  # noqa: SLF001 - diagnostics
+                if entry is None:
+                    notes.append("admins not fetched yet")
+                elif entry[2]:
+                    notes.append(f"👑 {len(entry[1])} admins")
+                else:
+                    notes.append("👑 admin list unavailable → answering everyone")
+            else:
+                notes.append({"humans": "👥 humans only", "all": "🌐 everyone"}.get(
+                    g.sender_filter, g.sender_filter
+                ))
+            notes.append({"giveaway_aggressive": "🔥 aggressive", "balanced": "⚖️ balanced",
+                          "strict": "🔒 strict"}.get(g.detection_mode, g.detection_mode))
+            if g.trigger_keyword_list():
+                notes.append(f"🏷 must contain: {html.escape(g.trigger_keywords)}")
+            title = html.escape(g.title[:32])
+            lines.append(f"• <b>{title}</b> — {' · '.join(notes)}")
+        if len(enabled) > 6:
+            lines.append(f"…and {len(enabled) - 6} more")
+
+    # Recent decisions
+    recent = ub.recent_decisions
+    if recent:
+        lines += ["", "<b>Recent messages (newest last)</b>"]
+        for d in recent[-8:]:
+            icon = "✅" if d["outcome"] == "answered" else "⛔"
+            detail = str(d.get("detail") or d["outcome"])
+            snippet = html.escape(str(d.get("text") or "—")[:40])
+            lines.append(
+                f"{icon} <code>{d['at']}</code> <i>{snippet}</i>\\n"
+                f"   ↳ {html.escape(detail[:110])}"
+            )
+    else:
+        lines += [
+            "",
+            "📭 <b>No messages seen yet since the bot started.</b>",
+            "<i>That means the account is not receiving group updates at all — check "
+            "that the groups are enabled, and that this is the account that is in them.</i>",
+        ]
+
+    # Actionable verdict
+    lines += ["", "<b>Verdict</b>"]
+    if not users_ok:
+        lines.append("🔴 Log the Telegram account in first (/start Step 2).")
+    elif not global_on:
+        lines.append("⏸ The responder is paused. Tap /dashboard → Resume Responder.")
+    elif not enabled:
+        lines.append("⬛ No groups are enabled. Tap /dashboard → Select & Configure Groups.")
+    elif not ai_ok:
+        lines.append("🔴 No AI API key saved. Re-run Step 3 in /setup.")
+    elif counters["messages_seen"] == 0:
+        lines.append(
+            "⚠️ The account is connected but no group messages have arrived. Most common "
+            "cause: the enabled groups are not ones this account is actually in, or the "
+            "service was restarted and updates were missed while it slept."
+        )
+    elif counters["answers_sent"] == 0:
+        lines.append(
+            "⚠️ Messages ARE arriving but none passed the filters. Read the per-group "
+            "notes above: try detection mode 🔥 Aggressive, clear custom keywords, and "
+            "set who-triggers to 🌐 Everyone for testing."
+        )
+    else:
+        lines.append("🟢 The responder is working — answers are being sent.")
+
+    lines.append(
+        "\\n<i>Tip: send /diag right after posting a test question in a group to see "
+        "the exact gate that stopped it.</i>"
+    )
+    await message.answer("\\n".join(lines), disable_web_page_preview=True)
+
+
+@router.message(Command("testanswer"))
+async def cmd_testanswer(message: Message, ctx: AppContext) -> None:
+    """Prove the whole pipeline end-to-end without needing a real giveaway.
+
+    Runs the exact local filter + AI call the userbot uses for an incoming
+    message, and reports which stage answered or refused.
+    """
+    sample = "What is the capital of Kenya?"
+    groups = [g for g in await ctx.db.list_groups() if g.enabled]
+
+    lines = ["🧪 <b>Pipeline test</b>", f"<i>Sample question:</i> {html.escape(sample)}", ""]
+
+    if not groups:
+        lines.append("⬛ No enabled groups — enable one first.")
+        await message.answer("\n".join(lines))
+        return
+
+    group = groups[0]
+    decision = should_evaluate_message(sample, group)
+    lines.append(
+        f"1️⃣ <b>Local filter</b> ({html.escape(group.title[:30])}): "
+        + ("✅ passed — " + html.escape(decision.reason) if decision.should_process
+           else "⛔ blocked — " + html.escape(decision.reason))
+    )
+    if not decision.should_process:
+        lines.append(
+            "\n<i>The filter is stopping questions in this group. Set detection mode to "
+            "🔥 Aggressive and clear custom keywords to fix it.</i>"
+        )
+        await message.answer("\n".join(lines))
+        return
+
+    keys = await ctx.db.get_all_provider_keys()
+    provider = str(await ctx.db.get_setting("primary_provider", "groq"))
+    spec = PROVIDERS.get(provider, PROVIDERS["groq"])
+    model = str(await ctx.db.get_setting("primary_model", spec.default_model))
+
+    if provider not in keys:
+        lines.append(f"2️⃣ <b>AI call</b>: ⛔ no API key saved for {html.escape(provider)}")
+        await message.answer("\n".join(lines))
+        return
+
+    result = await ctx.ai.answer_question(
+        text=sample,
+        answer_style=group.answer_style,
+        primary_provider=provider,
+        primary_model=model,
+        provider_keys=keys,
+        local_math_enabled=group.local_math_enabled,
+    )
+    if result.error:
+        lines.append(f"2️⃣ <b>AI call</b>: ⛔ {html.escape(result.error[:300])}")
+    elif result.answered:
+        lines.append(
+            f"2️⃣ <b>AI call</b>: ✅ answered <code>{html.escape(result.answer or '')}</code> "
+            f"via {html.escape(result.provider)}/{html.escape(result.model)} "
+            f"in {result.latency_ms}ms"
+        )
+        lines.append("\n🟢 <b>Pipeline is healthy.</b> If the group still gets no replies, "
+                     "the account is probably not connected to that group's updates — "
+                     "send /diag right after posting a question there.")
+    else:
+        lines.append("2️⃣ <b>AI call</b>: ⛔ the model declined to answer (SKIP)")
+
+    await message.answer("\n".join(lines))

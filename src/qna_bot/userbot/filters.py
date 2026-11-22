@@ -152,3 +152,31 @@ def should_evaluate_message(text: str, group: GroupConfig) -> FilterDecision:
         return FilterDecision(True, "giveaway_candidate")
 
     return FilterDecision(False, "too_short_non_question")
+
+
+# ---------------------------------------------------------------------------
+# Human-readable reasons
+# ---------------------------------------------------------------------------
+
+#: Plain-English explanation for every :class:`FilterDecision` reason string.
+REASON_TEXT: dict[str, str] = {
+    "empty": "the message had no text",
+    "command": "it is a bot command (starts with /)",
+    "non_text": "it was only a link or emoji",
+    "too_long": "it is longer than 600 characters",
+    "keyword_match": "it matched your custom trigger keywords",
+    "no_keyword_match": "it did not contain any of your custom trigger keywords",
+    "math_detected": "it contains arithmetic",
+    "trivial_chat": "it is short casual chat (ok, lol, thanks, hi…)",
+    "strict_match": "it has a question mark / quiz format",
+    "strict_no_qmark": "Strict mode requires a '?' or quiz format",
+    "balanced_match": "it looks like a question",
+    "balanced_skip": "Balanced mode did not detect a clear question",
+    "giveaway_signal": "it contains a question or trivia keyword",
+    "giveaway_candidate": "it has 3+ words (aggressive mode)",
+    "too_short_non_question": "it is too short and not a question (aggressive mode)",
+}
+
+
+def describe_reason(reason: str) -> str:
+    return REASON_TEXT.get(reason, reason)
