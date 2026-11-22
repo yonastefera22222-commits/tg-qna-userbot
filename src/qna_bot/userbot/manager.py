@@ -27,6 +27,7 @@ from .login import (
     LoginResult,
     LoginStatus,
     PhoneLoginSession,
+    QrLoginSession,
     make_login_client,
     translate_send_error,
 )
@@ -49,6 +50,7 @@ class UserbotManager:
         self._client: TelegramClient | None = None
         self._login = PhoneLoginSession()
         self._login.set_persistence(self._persist_pending_login, self._clear_pending_login)
+        self._qr = QrLoginSession()
         self._me_id: int | None = None
         self._me_name: str | None = None
         self._me_username: str | None = None
@@ -133,6 +135,7 @@ class UserbotManager:
 
     async def stop(self) -> None:
         await self._login.close()
+        await self._qr.close()
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -205,6 +208,7 @@ class UserbotManager:
 
     async def cancel_pending_login(self) -> None:
         await self._login.close()
+        await self._qr.close()
 
     async def start_phone_login(self, api_id: int, api_hash: str, phone: str) -> LoginResult:
         """Step 1 of login: validate the number, request the OTP and report the delivery channel."""
@@ -227,6 +231,68 @@ class UserbotManager:
         if result.status is LoginStatus.OK:
             return await self._finalize_pending_login()
         return result
+
+    @property
+    def email_setup_required(self) -> bool:
+        """Telegram is blocking code delivery until a login email is set up."""
+        pending = self._login.pending
+        return bool(pending and pending.email_setup_required)
+
+    async def submit_login_email(self, email: str) -> LoginResult:
+        """Send Telegram the login email it demands before it will deliver a code."""
+        return await self._login.send_login_email_code(email)
+
+    async def submit_login_email_code(self, code: str) -> LoginResult:
+        """Verify the emailed code; afterwards the real login code is delivered."""
+        return await self._login.submit_login_email_code(code)
+
+    @property
+    def pending_email_length(self) -> int | None:
+        pending = self._login.pending
+        return pending.email_setup_length if pending is not None else None
+
+    # -- QR login -------------------------------------------------------
+    async def start_qr_login(self, api_id: int, api_hash: str) -> tuple[LoginResult, str | None]:
+        result, url = await self._qr.start(int(api_id), str(api_hash))
+        if result.status is LoginStatus.OK:
+            return await self._finalize_qr_login(), url
+        return result, url
+
+    def qr_login_status(self) -> tuple[LoginStatus, str]:
+        state = self._qr.poll()
+        if state is None:
+            return LoginStatus.ERROR, "No QR login in progress."
+        return state.status, state.message
+
+    async def submit_qr_2fa(self, password: str) -> LoginResult:
+        result = await self._qr.submit_password(password)
+        if result.status is LoginStatus.OK:
+            return await self._finalize_qr_login()
+        return result
+
+    async def _finalize_qr_login(self) -> LoginResult:
+        pending = self._qr.take_authorized_client()
+        if pending is None:
+            return LoginResult(LoginStatus.ERROR, "QR login session was lost. Start again.")
+        session_str = pending.client.session.save()
+        await self._db.set_setting("tg_api_id", pending.api_id)
+        await self._db.set_setting("tg_api_hash", pending.api_hash)
+        await self._db.set_setting("tg_session", session_str)
+        await self._attach_client(pending.client)
+        logger.info("Telegram account connected via QR login: %s", self.account_display)
+        return LoginResult(LoginStatus.OK, f"Successfully connected as {self.account_display}!")
+
+    async def finish_qr_login_if_scanned(self) -> LoginResult | None:
+        """Called by the wizard's refresh button once the phone approved the QR."""
+        status, message = self.qr_login_status()
+        if status is LoginStatus.OK:
+            return await self._finalize_qr_login()
+        if status is LoginStatus.ERROR:
+            return LoginResult(LoginStatus.ERROR, message)
+        return None
+
+    async def cancel_qr_login(self) -> None:
+        await self._qr.close()
 
     async def login_with_string_session(
         self, api_id: int, api_hash: str, session_str: str

@@ -63,6 +63,11 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
+from telethon.tl import types
+from telethon.tl.functions.account import (
+    SendVerifyEmailCodeRequest,
+    VerifyEmailRequest,
+)
 from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.types import auth as auth_types
 
@@ -103,6 +108,11 @@ _VALID_CALLING_CODES: frozenset[str] = frozenset(
 _LOCAL_TRUNK_PREFIXES = ("0",)
 
 _E164_RE = re.compile(r"^\+?[1-9]\d{6,14}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def _looks_like_email(value: str) -> bool:
+    return bool(_EMAIL_RE.match((value or "").strip()))
 
 
 class PhoneIssue(StrEnum):
@@ -398,6 +408,12 @@ class PendingLogin:
     code_verified: bool = False
     resend_count: int = 0
     code_length: int | None = None
+    #: Telegram refused to send any code until a "login email" is set up
+    #: (``SentCodeTypeSetUpEmailRequired``). Until this is cleared, *no* code will
+    #: ever arrive no matter how many times the owner taps Resend.
+    email_setup_required: bool = False
+    email_setup_sent_to: str | None = None
+    email_setup_length: int | None = None
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
 
@@ -718,6 +734,7 @@ class PhoneLoginSession:
             return translate_send_error(exc, parsed.e164)
 
         delivery = describe_delivery(sent)
+        blocked = delivery.channel is DeliveryChannel.SETUP_REQUIRED
         self._set_pending(
             PendingLogin(
                 client=client,
@@ -727,21 +744,128 @@ class PhoneLoginSession:
                 phone_code_hash=sent.phone_code_hash,
                 delivery=delivery,
                 code_length=delivery.length,
+                email_setup_required=blocked,
             )
         )
         await self._start_keepalive(client)
         await self._save()
         logger.info(
-            "Login code requested for %s via %s (length=%s)",
+            "Login code requested for %s via %s (length=%s, email_setup_required=%s)",
             parsed.e164,
             delivery.channel,
             delivery.length,
+            blocked,
         )
+        if blocked:
+            # Telegram genuinely sent nothing. Reporting "code sent" here is the
+            # silent dead end that made the wizard look broken.
+            return LoginResult(
+                LoginStatus.ERROR,
+                "Telegram refused to send a login code until a <b>login email</b> is set up "
+                "for this account. I can set one up for you — tap the button below.",
+                delivery=delivery,
+            )
         return LoginResult(
             LoginStatus.CODE_SENT,
             f"Login code requested for {parsed.e164}.",
             delivery=delivery,
         )
+
+    # -- login-email setup (unblocks SentCodeTypeSetUpEmailRequired) -----
+    async def send_login_email_code(self, email: str) -> LoginResult:
+        """Start Telegram's required login-email setup for a blocked account.
+
+        Some accounts (commonly new numbers, or numbers Telegram wants to verify
+        more strongly) get ``SentCodeTypeSetUpEmailRequired`` back instead of a
+        code. Telegram then sends a verification code *to the email address*, and
+        only after that email is verified will the login code be delivered.
+        Previously the wizard simply showed text here and stopped, so nothing the
+        owner did could ever produce a code.
+        """
+        pending = self._pending
+        if pending is None:
+            return LoginResult(LoginStatus.ERROR, "No login in progress. Send your phone number again.")
+
+        address = (email or "").strip()
+        if not _looks_like_email(address):
+            return LoginResult(
+                LoginStatus.ERROR,
+                "That does not look like an email address. Send one like "
+                "<code>you@gmail.com</code>.",
+            )
+
+        pending.touch()
+        await self._ensure_connected(pending.client)
+        try:
+            sent = await pending.client(
+                SendVerifyEmailCodeRequest(
+                    types.EmailVerifyPurposeLoginSetup(
+                        phone_number=pending.phone,
+                        phone_code_hash=pending.phone_code_hash,
+                    ),
+                    address,
+                )
+            )
+        except Exception as exc:
+            logger.warning("SendVerifyEmailCode failed for %s: %s", address, exc)
+            return translate_send_error(exc, pending.phone)
+
+        pattern = getattr(sent, "email_pattern", address)
+        length = getattr(sent, "length", None)
+        pending.email_setup_sent_to = address
+        pending.email_setup_length = length
+        await self._save()
+        logger.info("Login-email verification code sent to %s", pattern)
+        return LoginResult(
+            LoginStatus.CODE_SENT,
+            f"Telegram sent a verification code to <b>{pattern}</b>. "
+            f"It has <b>{length or 5} digits</b> — send it here.",
+        )
+
+    async def submit_login_email_code(self, raw_code: str) -> LoginResult:
+        """Verify the login-email code; afterwards the normal login code is delivered."""
+        pending = self._pending
+        if pending is None:
+            return LoginResult(LoginStatus.ERROR, "No login in progress. Send your phone number again.")
+
+        digits = "".join(ch for ch in (raw_code or "") if ch.isdigit())
+        if not digits:
+            return LoginResult(LoginStatus.ERROR, "Please send the code from your email inbox.")
+        if pending.email_setup_length and len(digits) != pending.email_setup_length:
+            return LoginResult(
+                LoginStatus.ERROR,
+                f"The email code should be <b>{pending.email_setup_length} digits</b>, "
+                f"but {len(digits)} were sent. Check the email again.",
+            )
+
+        pending.touch()
+        await self._ensure_connected(pending.client)
+        try:
+            await pending.client(
+                VerifyEmailRequest(
+                    types.EmailVerifyPurposeLoginSetup(
+                        phone_number=pending.phone,
+                        phone_code_hash=pending.phone_code_hash,
+                    ),
+                    types.EmailVerificationCode(code=digits),
+                )
+            )
+        except Exception as exc:
+            logger.warning("VerifyEmail failed: %s", exc)
+            return translate_send_error(exc, pending.phone)
+
+        # Email verified: the block is lifted, so request the real login code.
+        pending.email_setup_required = False
+        await self._save()
+        logger.info("Login email verified; requesting the login code now")
+        result = await self.resend_code()
+        if result.status is LoginStatus.CODE_SENT:
+            return LoginResult(
+                LoginStatus.CODE_SENT,
+                f"✅ Login email verified! {result.message}",
+                delivery=result.delivery,
+            )
+        return result
 
     # -- resend ---------------------------------------------------------
     async def resend_code(self) -> LoginResult:
@@ -925,3 +1049,158 @@ class PhoneLoginSession:
         """Hand the now-authorized client to the caller and stop tracking it."""
         pending, self._pending = self._pending, None
         return pending
+
+
+# ---------------------------------------------------------------------------
+# QR-code login: no code delivery involved at all
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QrLoginState:
+    """A live QR login attempt (no SMS/app code is ever sent)."""
+
+    client: TelegramClient
+    api_id: int
+    api_hash: str
+    url: str
+    expires_at: float
+    login: object  # telethon.tl.custom.qrlogin.QRLogin
+    task: asyncio.Task | None = None
+    status: LoginStatus = LoginStatus.CODE_SENT
+    message: str = ""
+
+
+class QrLoginSession:
+    """QR-code login: scan with the Telegram app and approve on the phone.
+
+    This exists because it removes the *entire* code-delivery problem: no SMS,
+    no service message, no email, no flood wait on code requests. If the owner is
+    already logged in on a phone (which is how they are talking to the bot), this
+    is the most reliable possible path.
+
+    ``wait()`` is driven by a background task so the FastAPI-style handler does
+    not block; the wizard polls :meth:`poll`.
+    """
+
+    def __init__(self, *, poll_timeout: float = 120.0) -> None:
+        self._state: QrLoginState | None = None
+        self._poll_timeout = poll_timeout
+
+    @property
+    def state(self) -> QrLoginState | None:
+        return self._state
+
+    @property
+    def active(self) -> bool:
+        return self._state is not None
+
+    async def start(self, api_id: int, api_hash: str) -> tuple[LoginResult, str | None]:
+        """Begin a QR login. Returns (result, otpauth_url_to_render_as_QR)."""
+        await self.close()
+        client = make_login_client(api_id, api_hash)
+        try:
+            await client.connect()
+            qr = await client.qr_login()
+        except Exception as exc:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            logger.warning("qr_login could not start: %s", exc)
+            return translate_send_error(exc, "your account"), None
+
+        expires = getattr(qr, "expires", None)
+        expires_at = (
+            expires.timestamp()
+            if expires is not None
+            else time.time() + self._poll_timeout
+        )
+        self._state = QrLoginState(
+            client=client,
+            api_id=int(api_id),
+            api_hash=api_hash.strip(),
+            url=qr.url,
+            expires_at=expires_at,
+            login=qr,
+        )
+        self._state.task = asyncio.create_task(self._wait_for_scan(qr, client))
+        logger.info("QR login started (url expires at %s)", expires_at)
+        return (
+            LoginResult(
+                LoginStatus.CODE_SENT,
+                "Scan this QR code with your phone's Telegram app to log in.",
+            ),
+            qr.url,
+        )
+
+    async def _wait_for_scan(self, qr: object, client: TelegramClient) -> None:
+        state = self._state
+        if state is None:
+            return
+        try:
+            await qr.wait(timeout=self._poll_timeout)  # type: ignore[attr-defined]
+        except SessionPasswordNeededError:
+            state.status = LoginStatus.TWO_FA_REQUIRED
+            state.message = "QR scanned — this account has 2FA. Send your cloud password."
+            return
+        except TimeoutError:
+            state.status = LoginStatus.ERROR
+            state.message = "The QR code expired before it was scanned. Tap 🔄 New QR Code."
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("QR login wait failed: %s", exc)
+            state.status = LoginStatus.ERROR
+            state.message = f"QR login failed: {exc}"
+            return
+
+        state.status = LoginStatus.OK
+        state.message = "QR code scanned and approved — logging in."
+
+    async def submit_password(self, password: str) -> LoginResult:
+        """Complete a QR login on accounts with 2FA."""
+        state = self._state
+        if state is None:
+            return LoginResult(LoginStatus.ERROR, "No QR login in progress.")
+        try:
+            await state.client.sign_in(password=password)
+        except Exception as exc:
+            return translate_signin_error(exc)
+        state.status = LoginStatus.OK
+        state.message = "Logged in with QR code + 2FA."
+        return LoginResult(LoginStatus.OK, state.message)
+
+    def poll(self) -> QrLoginState | None:
+        return self._state
+
+    def take_authorized_client(self) -> PendingLogin | None:
+        """Return the authorized client in the shape the manager expects."""
+        state, self._state = self._state, None
+        if state is None:
+            return None
+        if state.task is not None and not state.task.done():
+            state.task.cancel()
+        return PendingLogin(
+            client=state.client,
+            api_id=state.api_id,
+            api_hash=state.api_hash,
+            phone="",
+            phone_code_hash="",
+        )
+
+    async def close(self) -> None:
+        state, self._state = self._state, None
+        if state is None:
+            return
+        if state.task is not None and not state.task.done():
+            state.task.cancel()
+            try:
+                await state.task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await state.client.disconnect()
+        except Exception:  # pragma: no cover - best effort
+            pass

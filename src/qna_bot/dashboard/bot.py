@@ -9,9 +9,9 @@ from typing import Any
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, CallbackQuery, Message, TelegramObject
 
+from ..storage.fsm import SQLiteStorage
 from .context import AppContext
 from .handlers import ai_router, dashboard_router, groups_router, wizard_router
 
@@ -84,7 +84,9 @@ def create_dashboard_bot(ctx: AppContext) -> tuple[Bot, Dispatcher]:
         token=ctx.env.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher(storage=MemoryStorage())
+    # Persistent FSM storage: a Render restart (free tier sleeps after 15 min)
+    # or a duplicate instance must not silently swallow the wizard's current step.
+    dp = Dispatcher(storage=SQLiteStorage(str(ctx.env.db_path)))
 
     auth_mw = OwnerAuthMiddleware(ctx)
     dp.message.middleware(auth_mw)
@@ -115,6 +117,7 @@ def create_dashboard_bot(ctx: AppContext) -> tuple[Bot, Dispatcher]:
                 BotCommand(command="dashboard", description="Open Q&A control dashboard"),
                 BotCommand(command="setup", description="Re-run guided setup wizard"),
                 BotCommand(command="cancel", description="Cancel current input step"),
+                BotCommand(command="logindiagnose", description="Diagnose why no login code arrives"),
             ]
         )
         me = await bot.get_me()

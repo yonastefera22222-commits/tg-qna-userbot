@@ -302,17 +302,46 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
 
     status_msg = await message.answer("📡 Requesting login code from Telegram...")
     res = await ctx.userbot.start_phone_login(int(api_id), str(api_hash), phone)
+
+    if ctx.userbot.email_setup_required:
+        # Telegram point-blank refused to send anything until a login email exists.
+        # Showing "code sent" here (or just text) was the original dead end.
+        await state.update_data(phone=ctx.userbot.pending_phone or phone)
+        await state.set_state(WizardStates.waiting_login_email)
+        await status_msg.edit_text(
+            "🚧 <b>Telegram is blocking the code for this account</b>\n\n"
+            "Telegram will not deliver <i>any</i> login code until a <b>login email</b> is "
+            "set up for this number. Until that is done, no SMS, service message or call "
+            "will ever arrive — no matter how many times you tap Resend.\n\n"
+            "✅ <b>I can set it up right here.</b>\n\n"
+            "📥 Send the <b>email address</b> you want to use "
+            "(e.g. <code>you@gmail.com</code>).\n"
+            "<i>Telegram will email a short verification code, and then the normal login "
+            "code is delivered immediately.</i>\n\n"
+            "— or —",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📷 Use QR Login Instead", callback_data="wiz:login_qr")],
+                    [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+                ]
+            ),
+        )
+        return
+
     if res.status is not LoginStatus.CODE_SENT:
         # Show Telegram's real reason (flood wait, bad number, bad API hash, ...)
         # and offer a retry button instead of dumping the user back to Step 1.
         cancel_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔁 Try Again", callback_data="wiz:login_phone")],
+                [InlineKeyboardButton(text="📷 Use QR Login Instead", callback_data="wiz:login_qr")],
                 [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
             ]
         )
         await status_msg.edit_text(
-            f"{res.message}\n\n<i>Tap 🔁 Try Again and re-send your number.</i>",
+            f"{res.message}\n\n"
+            "<i>Tap 🔁 Try Again to re-send your number, or use QR login — it needs no "
+            "code at all.</i>",
             reply_markup=cancel_kb,
         )
         return
@@ -326,6 +355,182 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
         _otp_prompt_text(display_phone, "", delivery=delivery),
         reply_markup=otp_keypad_kb(""),
     )
+
+
+# ----------------------------------------------------------------------
+# Step 2b: login-email setup (unblocks SentCodeTypeSetUpEmailRequired)
+# ----------------------------------------------------------------------
+
+
+@router.message(WizardStates.waiting_login_email)
+async def msg_login_email(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    email = (message.text or "").strip()
+    await safe_delete_message(message)
+
+    wait = await message.answer("📧 Asking Telegram to email you a verification code...")
+    res = await ctx.userbot.submit_login_email(email)
+    if res.status is not LoginStatus.CODE_SENT:
+        await wait.edit_text(f"{res.message}\n\nSend the email address again:")
+        return
+
+    await state.update_data(login_email=email)
+    await state.set_state(WizardStates.waiting_login_email_code)
+    await wait.edit_text(
+        "📬 <b>Check your email inbox</b>\n\n"
+        f"{res.message}\n\n"
+        "📥 Send the code from that email now.\n"
+        "<i>(Check spam/junk if you do not see it. Your message is deleted after reading.)</i>",
+    )
+
+
+@router.message(WizardStates.waiting_login_email_code)
+async def msg_login_email_code(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    await safe_delete_message(message)
+
+    wait = await message.answer("✅ Verifying your email with Telegram...")
+    res = await ctx.userbot.submit_login_email_code(code)
+
+    if res.status is LoginStatus.CODE_SENT:
+        # Email verified — Telegram has now actually delivered the login code.
+        delivery = res.delivery or ctx.userbot.last_code_delivery
+        await state.update_data(otp_digits="")
+        await state.set_state(WizardStates.waiting_otp)
+        await wait.edit_text(
+            _otp_prompt_text(ctx.userbot.pending_phone or "", "", delivery=delivery),
+            reply_markup=otp_keypad_kb(""),
+        )
+        return
+
+    if res.status is LoginStatus.TWO_FA_REQUIRED:
+        await state.set_state(WizardStates.waiting_2fa)
+        await wait.edit_text(
+            "🔐 <b>Two-Step Verification (2FA) Required</b>\n\nSend your Telegram cloud password:"
+        )
+        return
+
+    await wait.edit_text(f"{res.message}\n\nSend the email code again, or tap Cancel.")
+
+
+# ----------------------------------------------------------------------
+# Step 2c: QR-code login (no code delivery involved)
+# ----------------------------------------------------------------------
+
+
+def _qr_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 I Scanned It — Continue", callback_data="wiz:qr_check")],
+            [InlineKeyboardButton(text="🔁 New QR Code", callback_data="wiz:login_qr")],
+            [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "wiz:login_qr")
+async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await callback.answer("Generating QR code...")
+    data = await state.get_data()
+    api_id = data.get("api_id") or ctx.env.tg_api_id or await ctx.db.get_setting("tg_api_id")
+    api_hash = data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
+    if not (api_id and api_hash):
+        await safe_edit_text(callback, "❌ Missing API credentials. Send /setup to restart.")
+        return
+
+    await safe_edit_text(callback, "📷 Generating a QR login link...")
+    res, url = await ctx.userbot.start_qr_login(int(api_id), str(api_hash))
+    if url is None:
+        await safe_edit_text(callback, f"{res.message}", reply_markup=_qr_kb())
+        return
+
+    await state.set_state(WizardStates.waiting_qr_2fa)
+    text = (
+        "📷 <b>QR Code Login — no SMS, no code needed</b>\n\n"
+        "On the phone that is <b>already logged in</b> to Telegram:\n"
+        "1️⃣ Open <b>Telegram → Settings → Devices</b>\n"
+        "2️⃣ Tap <b>Link Desktop Device</b>\n"
+        "3️⃣ Point the camera at the code below\n\n"
+        f"🔗 Or open this link on the phone: <a href='{html.escape(url)}'>tap here</a>\n\n"
+        "<i>The code expires in a couple of minutes. Tap 🔄 New QR Code if it does.</i>"
+    )
+    if callback.message is None:
+        return
+    try:
+        # Render a real scannable QR image (falls back to text if qrcode is missing).
+        import io
+
+        import qrcode
+
+        img = qrcode.make(url)
+        buf = io.BytesIO()
+        buf.name = "login_qr.png"
+        img.save(buf)
+        buf.seek(0)
+        from aiogram.types import BufferedInputFile
+
+        await callback.message.answer_photo(
+            BufferedInputFile(buf.read(), filename="login_qr.png"),
+            caption=text,
+            reply_markup=_qr_kb(),
+        )
+    except Exception as exc:  # pragma: no cover - optional dependency
+        import logging
+
+        logging.getLogger(__name__).debug("Could not render QR image: %s", exc)
+        await safe_edit_text(callback, text, reply_markup=_qr_kb())
+
+
+@router.callback_query(F.data == "wiz:qr_check")
+async def cb_qr_check(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    res = await ctx.userbot.finish_qr_login_if_scanned()
+    if res is None:
+        await callback.answer("Not scanned yet — waiting for your phone.", show_alert=True)
+        status, message = ctx.userbot.qr_login_status()
+        if status is LoginStatus.TWO_FA_REQUIRED:
+            await state.set_state(WizardStates.waiting_qr_2fa)
+            await safe_edit_text(
+                callback,
+                "🔐 <b>2FA Required</b>\n\nThe QR was approved, but this account has a "
+                "cloud password. Send your 2FA password now:",
+            )
+        return
+    if res.status is LoginStatus.OK:
+        await callback.answer("Logged in!")
+        await state.clear()
+        if callback.message is not None:
+            await safe_edit_text(callback, f"🎉 <b>{html.escape(res.message)}</b>")
+            await _show_ai_step(callback.message, ctx, state)
+        return
+    await callback.answer(res.message[:190], show_alert=True)
+
+
+@router.message(WizardStates.waiting_qr_2fa)
+async def msg_qr_2fa(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    password = message.text or ""
+    await safe_delete_message(message)
+
+    status, info = ctx.userbot.qr_login_status()
+    if status is LoginStatus.OK:
+        res = await ctx.userbot.finish_qr_login_if_scanned()
+        if res is not None and res.status is LoginStatus.OK:
+            await state.clear()
+            await message.answer(f"🎉 <b>{html.escape(res.message)}</b>")
+            await _show_ai_step(message, ctx, state)
+            return
+    if status is not LoginStatus.TWO_FA_REQUIRED:
+        await message.answer(
+            f"⏳ {html.escape(info)}\n\nScan the QR code first, then send your 2FA password."
+        )
+        return
+
+    res = await ctx.userbot.submit_qr_2fa(password)
+    if res.status is not LoginStatus.OK:
+        await message.answer(f"{res.message}\n\nTry the 2FA password again:")
+        return
+
+    await state.clear()
+    await message.answer(f"🎉 <b>{html.escape(res.message)}</b>")
+    await _show_ai_step(message, ctx, state)
 
 
 async def _show_no_code_help(
@@ -765,3 +970,131 @@ async def cb_wiz_finish(callback: CallbackQuery, ctx: AppContext, state: FSMCont
         "to save your login &amp; groups across restarts!</i>"
     )
     await safe_edit_text(callback, text, reply_markup=main_dashboard_kb(True, notify_on))
+
+
+# ----------------------------------------------------------------------
+# Catch-all: never leave the owner in silence
+# ----------------------------------------------------------------------
+# Every state-specific message handler above requires an exact FSM state. If the
+# state is lost (process restart, duplicate instance, or the owner just types
+# something unexpected) aiogram silently drops the update: the bot looks dead.
+# This handler guarantees a reply that explains what to do next.
+
+
+@router.message()
+async def msg_any_fallback(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    current = await state.get_state()
+    has_session = bool(await ctx.db.get_setting("tg_session"))
+    text = (message.text or "").strip()
+
+    if current is None:
+        hint = (
+            "Send /start to open the dashboard."
+            if has_session
+            else "Send /start to open the setup wizard."
+        )
+        await message.answer(
+            "🤔 I am not waiting for any input right now, so I did not act on that message.\n\n"
+            f"{hint}\n"
+            "<i>(If you were mid-setup, the conversation had reset — /start resumes it.)</i>"
+        )
+        return
+
+    # A state is set but no handler matched: show where we are and how to continue.
+    await message.answer(
+        f"⚠️ I am waiting for a different kind of input right now "
+        f"(step: <code>{html.escape(str(current).split(':')[-1])}</code>).\n\n"
+        f"You sent: <code>{html.escape(text[:80]) or '(empty)'}</code>\n\n"
+        "• Tap the buttons on my last message, or\n"
+        "• Send /cancel then /start to restart the wizard."
+    )
+
+
+# ----------------------------------------------------------------------
+# /logindiagnose — one-shot report of exactly what Telegram is doing
+# ----------------------------------------------------------------------
+
+
+@router.message(Command("logindiagnose"))
+async def cmd_login_diagnose(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    """Report the real state of the Telegram login pipeline.
+
+    ``send_code_request`` is the last step that can fail silently from the
+    owner's point of view, so this prints the raw Telegram response type,
+    whether a code was actually delivered, and any active flood wait.
+    """
+    data = await state.get_data()
+    api_id = data.get("api_id") or ctx.env.tg_api_id or await ctx.db.get_setting("tg_api_id")
+    api_hash = data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
+
+    lines = ["🩺 <b>Telegram Login Diagnostics</b>", ""]
+    lines.append(f"• API ID: <code>{api_id or 'MISSING'}</code>")
+    lines.append(f"• API Hash: <code>{'set' if api_hash else 'MISSING'}</code>")
+    lines.append(f"• Wizard state: <code>{await state.get_state() or 'none'}</code>")
+    lines.append(f"• Phone: <code>{ctx.userbot.pending_phone or '—'}</code>")
+    session = await ctx.db.get_setting("tg_session")
+    lines.append(f"• Saved session: {'yes' if session else 'no'}")
+    lines.append(f"• Userbot connected: {ctx.userbot.is_connected}")
+
+    if not (api_id and api_hash):
+        lines += ["", "❌ No API credentials — send /start to run Step 1."]
+        await message.answer("\n".join(lines))
+        return
+
+    # Probe Telegram directly so the answer is authoritative.
+    from telethon.sessions import StringSession as _SS
+
+    from ...userbot.login import describe_delivery, make_login_client
+
+    probe_phone = ctx.userbot.pending_phone or ""
+    client = make_login_client(int(api_id), str(api_hash), session=_SS())
+    try:
+        await client.connect()
+        lines.append("• Telegram connection: ✅ reachable")
+        if probe_phone:
+            try:
+                sent = await client.send_code_request(probe_phone)
+                delivery = describe_delivery(sent)
+                lines += [
+                    "",
+                    f"📨 <b>Telegram answered with:</b> "
+                    f"<code>{type(getattr(sent, 'type', sent)).__name__}</code>",
+                    f"• Delivered via: <b>{delivery.title}</b>",
+                    f"• Code length: {delivery.length or 'unknown'}",
+                ]
+                if delivery.channel.value == "setup_required":
+                    lines.append(
+                        "• ⚠️ <b>BLOCKED</b>: no code will ever arrive until a login email "
+                        "is set up (button below works)."
+                    )
+                else:
+                    lines.append(
+                        "• ✅ Telegram <b>did</b> dispatch a code. If you cannot find it, it is "
+                        "in the Telegram app's service chat (or the SMS/call channel above)."
+                    )
+            except Exception as exc:
+                lines.append(f"• ⚠️ send_code_request failed: <code>{html.escape(str(exc)[:200])}</code>")
+        else:
+            lines.append("• No phone number in progress — send one in Step 2 to probe delivery.")
+    except Exception as exc:
+        lines += ["", f"❌ <b>Cannot reach Telegram:</b> <code>{html.escape(str(exc)[:200])}</code>", ""]
+        lines.append(
+            "This is a network problem, not a code problem. On Render Free the service "
+            "sleeps after 15 min idle — keep it awake with an uptime monitor on /health."
+        )
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    lines += ["", "<i>Send /start to continue, or tap a button below.</i>"]
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📷 QR Login (no code)", callback_data="wiz:login_qr")],
+                [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+            ]
+        ),
+    )
