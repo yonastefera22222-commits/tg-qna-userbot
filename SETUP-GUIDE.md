@@ -1,0 +1,220 @@
+# Setting Up the Bot for Another Account — Step by Step
+
+This is the complete path from an empty Render account to a working bot answering giveaways, **for a second account of your own**. It is written against the current code, so every button name and env var below is exactly what you will see.
+
+Two things are decided per account and cannot be reused:
+
+| Per account | Why |
+|---|---|
+| **`BOT_TOKEN`** | Each bot needs its *own* @BotFather bot. Two deployments sharing one token fight over the same Telegram update stream — both look flaky. |
+| **Telegram login** (`api_id`/`api_hash` + a logged-in account) | The bot answers *as whoever is logged in*. That is the whole point of a userbot. |
+
+Everything else (which groups, detection mode, cooldowns, keywords) can be carried over with the **Share** button.
+
+---
+
+## Step 1 — Get a separate bot token
+
+1. In Telegram, open **@BotFather**.
+2. Send `/newbot`, choose a name and a username ending in `bot`.
+3. Copy the **token** it returns (`123456789:AAE...`).
+
+> **Do not reuse your existing bot's token.** If both deployments poll the same token, Telegram delivers each update to only one of them, and answers appear to fire at random.
+
+---
+
+## Step 2 — Get the new account's numeric Telegram ID
+
+1. In Telegram, open **@userinfobot** and send `/start`.
+2. It replies with an **`Id:`** number, e.g. `987654321`.
+
+This is the `OWNER_ID`. It locks the dashboard to that person — without it, anyone who finds your bot can take it over. Save this number.
+
+---
+
+## Step 3 — Fork the repository
+
+Your repo: `github.com/yonastefera22222-commits/tg-qna-userbot` → click **Fork** → create it under the target account (or your own, it does not matter who) — you just need your own copy so Render can read it.
+
+**Do not fork if you can avoid it?** You can also point a new Render service at your existing repo. Render allows multiple services from one repo, but keep them in **separate services**, never two instances of the same service.
+
+---
+
+## Step 4 — Create the Render service
+
+### Option A — Blueprint (recommended, uses `render.yaml`)
+
+1. Go to [dashboard.render.com](https://dashboard.render.com) → **New +** → **Blueprint**.
+2. Connect GitHub and select your forked repo.
+3. Render reads `render.yaml` and shows the service `tg-qna-bot` on the **Free** plan.
+4. It asks for the `sync: false` variables — enter **`BOT_TOKEN`** and **`OWNER_ID`** now (from Steps 1–2).
+5. Click **Apply** / **Create**.
+
+### Option B — Web Service (manual)
+
+**New +** → **Web Service** → pick the repo, then set exactly:
+
+| Setting | Value |
+|---|---|
+| Runtime | `Python 3` |
+| Instance Type | **Free** |
+| Build Command | `pip install --upgrade pip && pip install -r requirements.txt` |
+| Start Command | `PYTHONPATH=src python -m qna_bot` |
+| Health Check Path | `/health` |
+
+Then under **Environment**, add:
+
+| Key | Value |
+|---|---|
+| `PYTHON_VERSION` | `3.12.7` |
+| `BOT_TOKEN` | the token from Step 1 |
+| `OWNER_ID` | the id from Step 2 |
+| `LOG_LEVEL` | `INFO` |
+
+Click **Create Web Service** and wait for the log to reach `Health HTTP server listening` and **Live**.
+
+> **Leave `BOT_STATE_B64` empty for now.** It is only for *restoring* a deployment. Filling it with an old snapshot is the most common way people accidentally import someone else's session. You will add it in Step 8.
+
+---
+
+## Step 5 — Open the dashboard bot
+
+1. In Telegram, open **your new bot** (the one from @BotFather) and send `/start`.
+2. Because `OWNER_ID` is set, it should greet **only** that account.
+
+If it instead asks for a **pairing code**, `OWNER_ID` did not take — open Render → **Logs** and look for:
+
+```
+PAIRING CODE:  A1B2C3
+```
+
+Send that code to the bot to claim ownership, then fix `OWNER_ID` in Render so it cannot happen again.
+
+---
+
+## Step 6 — Run the setup wizard (Steps 1–4 inside Telegram)
+
+On a fresh deployment `/start` opens the wizard **directly** — there is no "Run Setup Wizard" button until setup is finished. To restart it later, use `/setup` or **⚙️ Account & Setup → 🧭 Re-run Full Setup Wizard**.
+
+### Wizard Step 1 / 4 — Telegram API credentials
+
+The bot asks for an **API ID** and **API Hash**. These belong to the *new* account's Telegram developer app:
+
+1. Open [my.telegram.org](https://my.telegram.org) and log in **as the target account**.
+2. **API development tools** → fill in any app name/short name → **Create**.
+3. Copy **App api_id** (a number) and **App api_hash** (32 hex characters).
+4. Send the number first, then the hash, to the bot.
+
+> You *may* reuse the same `api_id`/`api_hash` for multiple accounts — they identify an *app*, not a user. Using a separate one per account is tidier and avoids rate-limit coupling.
+
+### Wizard Step 2 / 4 — Log in the Telegram account
+
+This is the account that will actually **type the answers in groups** — a normal user account, not a bot.
+
+You are offered three routes:
+
+| Route | When to use it |
+|---|---|
+| **Phone number** | Default. Send the number in international format, e.g. `+251912345678` (country code, no leading `0`). |
+| **QR code login** | Best when Telegram codes never arrive. Tap **📷 Login with QR Code**, then in the phone app: **Settings → Devices → Link Desktop Device**. The code auto-renews, so it stays scannable. |
+| **Paste StringSession** | Only if you already have a `Telethon` session string for that account. |
+
+If a code is required, the bot tells you **where** Telegram sent it (usually a service message *inside* the Telegram app, not SMS), then gives you an inline keypad. Tap **🔐** and enter **2FA** if the account has it.
+
+### Wizard Step 3 / 4 — AI provider and key
+
+1. Pick a provider. **⚡ Groq** is the fastest and has a free tier: [console.groq.com/keys](https://console.groq.com/keys).
+2. Paste **that account's own** API key. The bot tests it live and deletes your message.
+3. Choose a model — `openai/gpt-oss-120b` is the default and the right choice for speed.
+
+> **Use a separate AI key per account.** Sharing one key means one account's rate limits silently throttle the other, and you cannot tell whose usage is whose.
+
+### Wizard Step 4 / 4 — Pick groups
+
+The bot syncs the groups the logged-in account is in. Toggle **✅** on the giveaway groups to monitor. Tap **⚙️** on any group to set:
+
+- **Who triggers** — `👑 Admins Only` is safest (stops other members baiting the account)
+- **Detection mode** — `🔥 Giveaway Aggressive` for giveaways that skip the `?`
+- **Answer style**, **cooldown**, **reply to question**, **local math**, **📷 photo answers**
+
+Then tap **✅ Finish Setup & Open Dashboard**.
+
+---
+
+## Step 7 — Verify it works
+
+If a login code never arrives, send **`/logindiagnose`** — it prints where Telegram actually delivered the code and what to try next.
+
+1. Send a real question in one of the selected groups, or use the dashboard's **🧪 Live Q&A Simulator** to test without waiting for a giveaway.
+2. If nothing happens, send **`/diag`** to the bot. It prints, per group, exactly why each message was or was not answered, plus the last 8 decisions.
+3. **`/testanswer`** runs one question through the local filter *and* the AI stage and shows both results.
+
+---
+
+## Step 8 — Make it survive Render restarts (optional but important)
+
+Render Free wipes the local disk on every restart, which logs the userbot out. Fix:
+
+1. In the dashboard: **⚙️ Account & Setup** → **☁️ Backup This Deployment**.
+2. Copy the string.
+3. Render → your service → **Environment** → add `BOT_STATE_B64` = that string → **Save Changes**.
+
+> ⚠️ **That backup contains the account's Telegram session and AI keys.** Anyone holding it can log in as that account. Keep it in that service's own environment and never send it to anyone.
+
+To carry **group settings** to a *third* account later, use **🎁 Share Setup With Someone** instead — it contains no credentials at all.
+
+---
+
+## Step 9 — Keep it awake
+
+Render Free sleeps after **15 minutes** with no inbound HTTP traffic — the userbot stops answering while asleep.
+
+1. Sign up at [cron-job.org](https://cron-job.org) or [uptimerobot.com](https://uptimerobot.com) (free).
+2. Add an HTTP monitor for `https://<your-service-name>.onrender.com/health`.
+3. Set the interval to **5 minutes**.
+
+---
+
+## Running two accounts side by side
+
+| Do | Don't |
+|---|---|
+| Separate Render service per account | Two instances of the same service |
+| Separate `BOT_TOKEN` | One @BotFather bot shared by both |
+| Separate `OWNER_ID` | The same `OWNER_ID` on both |
+| Separate AI key | One key shared across both |
+| Separate `BOT_STATE_B64` | Copying a backup between deployments |
+
+The bot enforces the last one: importing a snapshot into a deployment that **already has an owner** silently refuses every credential and logs a warning, because importing a session would otherwise hijack that deployment.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Bot asks for a **pairing code** | `OWNER_ID` missing or wrong | Check Render env; read the code from Logs |
+| Dashboard says **⛔ Unauthorized** | You are messaging from a different Telegram account than `OWNER_ID` | Use the right account, or correct `OWNER_ID` |
+| Bot is **Live** but silent | Userbot not logged in, or paused | `/diag` → follow the verdict line |
+| Answers **never appear** in groups | Logged-in account is not an admin there, or group not enabled | `/diag` shows the per-group skip reason |
+| Logged out after every deploy | No `BOT_STATE_B64` | Step 8 |
+| Both deployments answer the same message | The **same Telegram user account** is logged into both (one account, two bots) | Log out one session in Telegram → Settings → Devices. Two *different* accounts can safely watch the same group — whoever is faster wins, which is not useful but is not broken. |
+| `model_not_found` | A retired model ID is saved | Pick a model again in the AI menu; the bot also auto-swaps known retired IDs |
+
+---
+
+## Quick reference — every env var
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | @BotFather token for *this* bot |
+| `OWNER_ID` | ✅ strongly | Numeric Telegram id allowed to use the dashboard |
+| `PYTHON_VERSION` | recommended | `3.12.7` |
+| `LOG_LEVEL` | optional | `INFO` (default) |
+| `BOT_STATE_B64` | optional | Restores login + settings after a restart |
+| `TG_API_ID` / `TG_API_HASH` | optional | Skips wizard Step 1 |
+| `TG_STRING_SESSION` | optional | Skips wizard Step 2 (advanced) |
+| `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | optional | Skips wizard Step 3 |
+| `ENCRYPTION_KEY` | optional | Encryption key for secrets at rest in SQLite. If unset, one is generated into `data/.secret.key` — which Render Free **wipes on every restart**, so set it if you want locally-stored secrets to survive. Not needed for `BOT_STATE_B64` restores (those carry plaintext through the export). |
+| `DATA_DIR` | optional | SQLite location (default `./data`) |
+| `PORT` | auto on Render | Enables the `/health` server |

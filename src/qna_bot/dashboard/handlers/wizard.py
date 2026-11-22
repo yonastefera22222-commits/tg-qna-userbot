@@ -1054,8 +1054,10 @@ async def cb_wiz_finish(callback: CallbackQuery, ctx: AppContext, state: FSMCont
     text = (
         "🎉 <b>Setup Complete — Your Q&amp;A Userbot is Live!</b>\n\n"
         + await ctx.render_dashboard_text()
-        + "\n\n☁️ <i>Using Render Free Tier? Open <b>⚙️ Account &amp; Setup → Export Render Config</b> "
-        "to save your login &amp; groups across restarts!</i>"
+        + "\n\n☁️ <i>Using Render Free Tier? Open <b>⚙️ Account &amp; Setup → "
+        "☁️ Backup This Deployment</b> to save your login &amp; groups across restarts!</i>"
+        "\n🎁 <i>Want to help someone else set up their own copy? Use "
+        "<b>Share Setup With Someone</b> — it never includes your credentials.</i>"
     )
     await safe_edit_text(callback, text, reply_markup=main_dashboard_kb(True, notify_on))
 
