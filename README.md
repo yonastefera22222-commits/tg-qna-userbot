@@ -85,7 +85,7 @@ git push -u origin main
 
 Because Render Free Tier wipes local container disk whenever the service restarts or redeploys:
 
-1. In your Dashboard Bot, tap **⚙️ Account & Setup** → **☁️ Export Render Config (`BOT_STATE_B64`)**.
+1. In your Dashboard Bot, tap **⚙️ Account & Setup** → **☁️ Backup This Deployment (`BOT_STATE_B64`)**.
 2. Copy the generated code string.
 3. In Render → your service → **Environment** → add:
    - Key: `BOT_STATE_B64`
@@ -94,6 +94,21 @@ Because Render Free Tier wipes local container disk whenever the service restart
 5. Tap **🗑 Delete Secret Message** in Telegram to keep your chat clean.
 
 *(Whenever you later enable new groups or add a fallback AI key, export `BOT_STATE_B64` again and update it in Render so changes persist across restarts.)*
+
+> **⚠️ Never send this backup to anyone.** It contains your Telegram **session string** (a complete account login) and your **AI API keys**. Use the Share option below instead.
+
+### Step 4b — Letting Someone Else Run Their Own Copy
+
+The code is fully per-deployment: every credential lives in that deployment's own Render environment or its own database. Nothing is baked into the repo, so anyone can run their own copy from the same source.
+
+1. Tap **⚙️ Account & Setup** → **🎁 Share Setup With Someone (no credentials)**.
+2. Send them the generated string — it contains your **groups and their settings only**. `tg_session`, `api_key_*`, `owner_id` and `tg_api_id` are excluded by design.
+3. They fork this repo, create their own Render service, and set **their own** `BOT_TOKEN` and `OWNER_ID` (from [@userinfobot](https://t.me/userinfobot)), then paste the string into `BOT_STATE_B64`.
+4. They deploy and log in **their own** Telegram account, and add **their own** AI key in the dashboard.
+
+**Why the credentials do not transfer:** they must not. A Telethon session string *is* an account — importing one would post from the wrong account and bill the wrong person. The bot enforces this: importing a snapshot into a deployment that already has an owner silently refuses every credential and logs a warning, and `OWNER_ID` / `GROQ_API_KEY` / `TG_API_HASH` set in Render always override whatever a pasted snapshot contains.
+
+**What does not travel with a share snapshot:** your Telegram login, your AI keys, your owner id, and any per-deployment secrets. Only group configuration (which groups, detection mode, answer style, cooldowns, keywords, toggles) moves across.
 
 ### Step 5 — Keep Render Free Awake 24/7 (Optional but Recommended)
 

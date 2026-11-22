@@ -313,7 +313,14 @@ def account_menu_kb(is_connected: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     if not is_connected:
         b.button(text="🔌 Reconnect Saved Session", callback_data="acc:reconnect")
-    b.button(text="☁️ Export Render Config (BOT_STATE_B64)", callback_data="acc:export_render")
+    b.button(
+        text="☁️ Backup This Deployment (BOT_STATE_B64)",
+        callback_data="acc:export_render",
+    )
+    b.button(
+        text="🎁 Share Setup With Someone (no credentials)",
+        callback_data="acc:export_share",
+    )
     b.button(text="🧭 Re-run Full Setup Wizard", callback_data="wiz:restart")
     b.button(text="🚪 Log Out Userbot Account", callback_data="acc:logout_confirm")
     b.button(text="⬅️ Dashboard", callback_data="dash:home")

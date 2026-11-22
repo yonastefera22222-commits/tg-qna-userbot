@@ -32,6 +32,14 @@ def _setup_logging(level: str) -> None:
 
 async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
     """Restore BOT_STATE_B64 (for Render Free ephemeral restarts) and seed optional .env keys."""
+    # The deployment's own env must claim ownership BEFORE any snapshot is
+    # imported. Otherwise an unclaimed deployment would adopt the snapshot's
+    # owner_id, and that stale id would then block this deployment's real
+    # OWNER_ID below (it is only seeded when unset).
+    if env.owner_id is not None and await db.get_setting("owner_id") is None:
+        await db.set_setting("owner_id", env.owner_id)
+        logger.info("Owner claimed from OWNER_ID=%s", env.owner_id)
+
     if env.bot_state_b64 and not await db.get_setting("tg_session"):
         try:
             n_settings, n_groups = await db.import_state_b64(env.bot_state_b64)
@@ -43,12 +51,11 @@ async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
         except Exception as exc:
             logger.error("Failed to import BOT_STATE_B64: %s", exc)
 
-    if env.owner_id is not None and await db.get_setting("owner_id") is None:
-        await db.set_setting("owner_id", env.owner_id)
-
-    if env.tg_api_id is not None and await db.get_setting("tg_api_id") is None:
+    # A session from the snapshot is refused above when this deployment already
+    # has an owner, so only fill these in when they are genuinely empty.
+    if env.tg_api_id is not None:
         await db.set_setting("tg_api_id", env.tg_api_id)
-    if env.tg_api_hash and await db.get_setting("tg_api_hash") is None:
+    if env.tg_api_hash:
         await db.set_setting("tg_api_hash", env.tg_api_hash)
     if env.tg_string_session and not await db.get_setting("tg_session"):
         await db.set_setting("tg_session", env.tg_string_session)
@@ -60,10 +67,22 @@ async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
     }
     first_seeded_provider: str | None = None
     for provider, key in env_keys.items():
-        if key and not await db.get_provider_key(provider):
+        if not key:
+            continue
+        # This deployment's own env wins over anything a pasted snapshot
+        # brought in. Otherwise someone sharing a host could silently be
+        # billed on the original owner's AI key.
+        existing = await db.get_provider_key(provider)
+        if existing and existing != key:
+            logger.info(
+                "Env %s_API_KEY overrides the value from the imported snapshot.",
+                provider.upper(),
+            )
             await db.set_provider_key(provider, key)
-            if first_seeded_provider is None:
-                first_seeded_provider = provider
+        elif not existing:
+            await db.set_provider_key(provider, key)
+        if first_seeded_provider is None:
+            first_seeded_provider = provider
 
     if first_seeded_provider and await db.get_setting("primary_provider") is None:
         await db.set_setting("primary_provider", first_seeded_provider)
