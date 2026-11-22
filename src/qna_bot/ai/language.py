@@ -87,7 +87,9 @@ def language_name(code: str) -> str:
 ANSWER_IN_LANGUAGE_INSTRUCTION = (
     "Always answer in the same language the question was asked in. "
     "Amharic question -> Amharic answer, English question -> English answer. "
-    "Never translate an answer into English unless the question was English."
+    "Never translate an answer into English unless the question was English.\n"
+    "Emoji and decoration around a question are not part of it: answer the "
+    "words. Never repeat the question's emoji in your answer."
 )
 
 #: Extra guidance used only when the question itself is in Amharic.
