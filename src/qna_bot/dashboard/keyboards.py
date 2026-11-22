@@ -47,6 +47,7 @@ def wizard_welcome_kb(has_env_creds: bool, is_connected: bool) -> InlineKeyboard
 def wizard_login_method_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📱 Login with Phone + OTP Keypad", callback_data="wiz:login_phone")
+    b.button(text="📷 Login with QR Code (no SMS needed)", callback_data="wiz:login_qr")
     b.button(text="🔑 Paste Existing StringSession", callback_data="wiz:login_session")
     b.button(text="⬅️ Re-enter API Credentials", callback_data="wiz:step1_creds")
     b.adjust(1)
