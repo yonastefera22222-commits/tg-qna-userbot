@@ -1,0 +1,25 @@
+"""FSM state definitions for the Dashboard Bot."""
+
+from aiogram.fsm.state import State, StatesGroup
+
+
+class WizardStates(StatesGroup):
+    waiting_api_id = State()
+    waiting_api_hash = State()
+    waiting_phone = State()
+    waiting_otp = State()
+    waiting_2fa = State()
+    waiting_string_session = State()
+    waiting_ai_key = State()
+    waiting_custom_model = State()
+
+
+class GroupStates(StatesGroup):
+    waiting_search_query = State()
+    waiting_trigger_keywords = State()
+
+
+class DashboardStates(StatesGroup):
+    waiting_sim_question = State()
+    waiting_ai_key_update = State()
+    waiting_custom_model_update = State()

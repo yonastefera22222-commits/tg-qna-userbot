@@ -1,0 +1,623 @@
+"""Guided 4-step Setup Wizard triggered on /start (or re-runnable anytime)."""
+
+from __future__ import annotations
+
+import html
+
+from aiogram import F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
+
+from ...ai.providers import PROVIDERS, fetch_live_models
+from ..context import AppContext, safe_delete_message, safe_edit_text
+from ..keyboards import (
+    groups_list_kb,
+    main_dashboard_kb,
+    model_picker_kb,
+    otp_keypad_kb,
+    provider_picker_kb,
+    wizard_login_method_kb,
+    wizard_welcome_kb,
+)
+from ..states import WizardStates
+
+router = Router(name="wizard")
+
+
+def _otp_prompt_text(phone: str, digits: str, note: str | None = None) -> str:
+    masked = " ".join(digits) if digits else "— — — — —"
+    extra = f"\n\n⚠️ {html.escape(note)}" if note else ""
+    return (
+        "<b>Step 2 / 4 — Enter Telegram Login Code</b>\n\n"
+        f"A login code was sent to <code>{html.escape(phone)}</code> via Telegram.\n\n"
+        f"🔢 <b>Entered code:</b> <code>{masked}</code>\n\n"
+        "💡 <i>Tap the keypad buttons below to enter your code!</i>\n"
+        "<i>(Using buttons prevents Telegram from invalidating a code pasted in chat. "
+        "If you prefer typing, add spaces between digits like <code>1 2 3 4 5</code>.)</i>"
+        f"{extra}"
+    )
+
+
+async def _show_wizard_welcome(target: Message | CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await state.clear()
+    has_env_creds = bool(ctx.env.tg_api_id and ctx.env.tg_api_hash)
+    text = (
+        "👋 <b>Welcome to Q&amp;A Giveaway Userbot Setup!</b>\n\n"
+        "I will walk you through connecting your Telegram account, setting up a fast free AI "
+        "provider, and selecting which group chats to monitor.\n\n"
+        "<b>What you'll set up (4 quick steps):</b>\n"
+        "1️⃣ Telegram API ID &amp; Hash (from <code>my.telegram.org</code>)\n"
+        "2️⃣ Connect your Telegram account (secure OTP keypad)\n"
+        "3️⃣ Pick a fast, free AI provider (Groq / Gemini / OpenRouter)\n"
+        "4️⃣ Select which group chats to answer questions in\n\n"
+        "🔒 <i>Sensitive messages (keys, passwords) are auto-deleted and encrypted at rest.</i>"
+    )
+    kb = wizard_welcome_kb(has_env_creds=has_env_creds, is_connected=ctx.userbot.is_connected)
+    if isinstance(target, CallbackQuery):
+        await safe_edit_text(target, text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def _show_ai_step(target: Message | CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await state.clear()
+    keys = await ctx.db.get_all_provider_keys()
+    text = (
+        "<b>Step 3 / 4 — Choose Your Fast &amp; Free AI Provider</b>\n\n"
+        "Pick which AI provider you want to power your Q&amp;A answers "
+        "(you can add a fallback provider and switch anytime later):\n\n"
+        "⚡ <b>Groq</b> — Fastest free inference (~200-400ms, best for speed giveaways)\n"
+        "🧠 <b>Google Gemini</b> — Very accurate free tier (Flash-Lite / Flash)\n"
+        "🌐 <b>OpenRouter</b> — Wide catalog of free models + auto-free router"
+    )
+    kb = provider_picker_kb("wiz_ai", configured_keys=keys)
+    if isinstance(target, CallbackQuery):
+        await safe_edit_text(target, text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def _show_group_step(target: Message | CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await state.clear()
+    if isinstance(target, CallbackQuery):
+        await safe_edit_text(target, "🔄 <b>Step 4 / 4</b> — Syncing your Telegram groups...")
+    else:
+        await target.answer("🔄 <b>Step 4 / 4</b> — Syncing your Telegram groups...")
+
+    try:
+        groups = await ctx.userbot.sync_groups()
+    except Exception as exc:
+        err_text = f"❌ Failed to fetch your groups: <code>{html.escape(str(exc))}</code>"
+        if isinstance(target, CallbackQuery):
+            await safe_edit_text(target, err_text)
+        else:
+            await target.answer(err_text)
+        return
+
+    enabled_count = sum(1 for g in groups if g.enabled)
+    text = (
+        "<b>Step 4 / 4 — Select Group Chats to Monitor</b>\n\n"
+        f"Found <b>{len(groups)}</b> groups ({enabled_count} enabled).\n"
+        "• Tap a group to toggle <b>✅ ON / ⬜ OFF</b>\n"
+        "• Tap <b>⚙️</b> next to any group to customize Admin-only, Answer Style, Cooldown, etc.\n"
+        "• By default, groups use <b>👑 Admins Only + ⚡ Giveaway Ultra-Short + ↩️ Reply to Question</b>."
+    )
+    kb = groups_list_kb(groups, page=0, wizard_mode=True)
+    if isinstance(target, CallbackQuery):
+        await safe_edit_text(target, text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+# ----------------------------------------------------------------------
+# Entry Commands: /start, /setup, /cancel
+# ----------------------------------------------------------------------
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    await state.clear()
+    if await ctx.is_setup_complete():
+        global_on = bool(await ctx.db.get_setting("global_enabled", True))
+        notify_on = bool(await ctx.db.get_setting("notify_on_answer", False))
+        text = await ctx.render_dashboard_text()
+        await message.answer(
+            text,
+            reply_markup=main_dashboard_kb(global_on, notify_on),
+            disable_web_page_preview=True,
+        )
+        return
+
+    await _show_wizard_welcome(message, ctx, state)
+
+
+@router.message(Command("setup"))
+async def cmd_setup(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    await _show_wizard_welcome(message, ctx, state)
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    await state.clear()
+    await ctx.userbot.cancel_pending_login()
+    if await ctx.is_setup_complete():
+        global_on = bool(await ctx.db.get_setting("global_enabled", True))
+        notify_on = bool(await ctx.db.get_setting("notify_on_answer", False))
+        await message.answer(
+            "Cancelled. Back to Dashboard:\n\n" + await ctx.render_dashboard_text(),
+            reply_markup=main_dashboard_kb(global_on, notify_on),
+        )
+    else:
+        await message.answer("Cancelled. Send /start anytime to resume setup.")
+
+
+@router.callback_query(F.data == "wiz:restart")
+async def cb_wiz_restart(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await callback.answer()
+    await _show_wizard_welcome(callback, ctx, state)
+
+
+# ----------------------------------------------------------------------
+# Step 1: API ID & API Hash
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data == "wiz:use_env_creds")
+async def cb_use_env_creds(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await callback.answer()
+    if not (ctx.env.tg_api_id and ctx.env.tg_api_hash):
+        await safe_edit_text(callback, "❌ No TG_API_ID / TG_API_HASH found in .env.")
+        return
+    await state.update_data(api_id=ctx.env.tg_api_id, api_hash=ctx.env.tg_api_hash)
+    await safe_edit_text(
+        callback,
+        f"✅ Loaded API ID <code>{ctx.env.tg_api_id}</code> from <code>.env</code>.\n\n"
+        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n"
+        "Choose how you want to log in:",
+        reply_markup=wizard_login_method_kb(),
+    )
+
+
+@router.callback_query(F.data == "wiz:step1_creds")
+async def cb_step1_creds(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(WizardStates.waiting_api_id)
+    await safe_edit_text(
+        callback,
+        "<b>Step 1 / 4 — Telegram API Credentials</b>\n\n"
+        "1. Open <a href='https://my.telegram.org'>my.telegram.org</a> and log in\n"
+        "2. Click <b>API development tools</b>\n"
+        "3. Copy your numeric <b>App api_id</b>\n\n"
+        "📥 Send your <b>API ID</b> (numbers only) now:",
+    )
+
+
+@router.message(WizardStates.waiting_api_id)
+async def msg_api_id(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    await safe_delete_message(message)
+    if not raw.isdigit():
+        await message.answer("❌ API ID must be a number (e.g. <code>12345678</code>). Try again:")
+        return
+    await state.update_data(api_id=int(raw))
+    await state.set_state(WizardStates.waiting_api_hash)
+    await message.answer(
+        f"✅ API ID saved (<code>{raw}</code>).\n\n"
+        "📥 Now send your <b>API Hash</b> (32-character hex string):"
+    )
+
+
+@router.message(WizardStates.waiting_api_hash)
+async def msg_api_hash(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    await safe_delete_message(message)
+    if len(raw) < 16:
+        await message.answer("❌ That API Hash looks too short. Please send the full API Hash:")
+        return
+    await state.update_data(api_hash=raw)
+    await state.set_state(None)
+    await message.answer(
+        "✅ API credentials saved!\n\n"
+        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n"
+        "Choose how you want to log in:",
+        reply_markup=wizard_login_method_kb(),
+    )
+
+
+# ----------------------------------------------------------------------
+# Step 2: Telegram Account Login (Phone + Inline OTP Keypad or StringSession)
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data == "wiz:login_method")
+async def cb_login_method(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await callback.answer()
+    await ctx.userbot.cancel_pending_login()
+    await state.set_state(None)
+    await safe_edit_text(
+        callback,
+        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n"
+        "Choose how you want to log in:",
+        reply_markup=wizard_login_method_kb(),
+    )
+
+
+@router.callback_query(F.data == "wiz:login_phone")
+async def cb_login_phone(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(WizardStates.waiting_phone)
+    await safe_edit_text(
+        callback,
+        "<b>Step 2 / 4 — Phone Number</b>\n\n"
+        "📥 Send your Telegram phone number in international format\n"
+        "(example: <code>+251912345678</code> or <code>+15551234567</code>):",
+    )
+
+
+@router.message(WizardStates.waiting_phone)
+async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    phone = (message.text or "").strip()
+    await safe_delete_message(message)
+    data = await state.get_data()
+    api_id = data.get("api_id") or ctx.env.tg_api_id or await ctx.db.get_setting("tg_api_id")
+    api_hash = data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
+
+    if not (api_id and api_hash):
+        await message.answer("❌ Missing API credentials. Send /setup to start Step 1 again.")
+        return
+
+    status_msg = await message.answer("📡 Requesting login code from Telegram...")
+    res = await ctx.userbot.start_phone_login(int(api_id), str(api_hash), phone)
+    if res.status != "code_sent":
+        await status_msg.edit_text(
+            f"❌ {html.escape(res.message)}\n\nPlease send your phone number again:"
+        )
+        return
+
+    await state.update_data(phone=phone, otp_digits="")
+    await state.set_state(WizardStates.waiting_otp)
+    await status_msg.edit_text(
+        _otp_prompt_text(phone, ""),
+        reply_markup=otp_keypad_kb(""),
+    )
+
+
+@router.callback_query(F.data.startswith("otp:"))
+async def cb_otp_keypad(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    data = await state.get_data()
+    digits = str(data.get("otp_digits", ""))
+    phone = str(data.get("phone", ""))
+
+    if action == "d" and len(parts) == 3:
+        if len(digits) < 8:
+            digits += parts[2]
+            await state.update_data(otp_digits=digits)
+        await callback.answer()
+        await safe_edit_text(
+            callback,
+            _otp_prompt_text(phone, digits),
+            reply_markup=otp_keypad_kb(digits),
+        )
+        return
+
+    if action == "back":
+        digits = digits[:-1]
+        await state.update_data(otp_digits=digits)
+        await callback.answer()
+        await safe_edit_text(
+            callback,
+            _otp_prompt_text(phone, digits),
+            reply_markup=otp_keypad_kb(digits),
+        )
+        return
+
+    if action == "clear":
+        await state.update_data(otp_digits="")
+        await callback.answer("Cleared")
+        await safe_edit_text(
+            callback,
+            _otp_prompt_text(phone, ""),
+            reply_markup=otp_keypad_kb(""),
+        )
+        return
+
+    if action == "resend":
+        await callback.answer("Resending code...")
+        res = await ctx.userbot.resend_phone_code()
+        await state.update_data(otp_digits="")
+        note = res.message if res.status != "code_sent" else "Fresh code sent!"
+        await safe_edit_text(
+            callback,
+            _otp_prompt_text(phone, "", note=note),
+            reply_markup=otp_keypad_kb(""),
+        )
+        return
+
+    if action == "submit":
+        if len(digits) < 4:
+            await callback.answer("Enter all digits first!", show_alert=True)
+            return
+        await callback.answer("Verifying code...")
+        await _process_otp_submission(callback, ctx, state, digits)
+
+
+@router.message(WizardStates.waiting_otp)
+async def msg_otp_fallback(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    """Allow spaced text fallback like '1 2 3 4 5' if the user types instead of using keypad."""
+    raw = (message.text or "").strip()
+    await safe_delete_message(message)
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 4:
+        await message.answer("⚠️ Please tap the keypad buttons above (or type digits separated by spaces).")
+        return
+    await _process_otp_submission(message, ctx, state, digits)
+
+
+async def _process_otp_submission(
+    target: Message | CallbackQuery,
+    ctx: AppContext,
+    state: FSMContext,
+    digits: str,
+) -> None:
+    res = await ctx.userbot.submit_otp_code(digits)
+    if res.status == "ok":
+        await state.set_state(None)
+        if isinstance(target, CallbackQuery):
+            await safe_edit_text(target, f"🎉 <b>{html.escape(res.message)}</b>")
+        else:
+            await target.answer(f"🎉 <b>{html.escape(res.message)}</b>")
+        await _show_ai_step(target if isinstance(target, Message) else target.message, ctx, state)  # type: ignore[arg-type]
+        return
+
+    if res.status == "2fa_required":
+        await state.set_state(WizardStates.waiting_2fa)
+        msg_text = (
+            "🔐 <b>Two-Step Verification (2FA) Required</b>\n\n"
+            "📥 Please send your Telegram 2FA cloud password.\n"
+            "<i>(Your message will be deleted immediately after reading.)</i>"
+        )
+        if isinstance(target, CallbackQuery):
+            await safe_edit_text(target, msg_text)
+        else:
+            await target.answer(msg_text)
+        return
+
+    # Error -> reset digits and let user retry
+    data = await state.get_data()
+    phone = str(data.get("phone", ""))
+    await state.update_data(otp_digits="")
+    err_prompt = _otp_prompt_text(phone, "", note=res.message)
+    if isinstance(target, CallbackQuery):
+        await safe_edit_text(target, err_prompt, reply_markup=otp_keypad_kb(""))
+    else:
+        await target.answer(err_prompt, reply_markup=otp_keypad_kb(""))
+
+
+@router.message(WizardStates.waiting_2fa)
+async def msg_2fa_password(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    password = message.text or ""
+    await safe_delete_message(message)
+    res = await ctx.userbot.submit_2fa_password(password)
+    if res.status != "ok":
+        await message.answer(f"❌ {html.escape(res.message)}\n\nPlease try your 2FA password again:")
+        return
+
+    await message.answer(f"🎉 <b>{html.escape(res.message)}</b>")
+    await _show_ai_step(message, ctx, state)
+
+
+@router.callback_query(F.data == "wiz:login_session")
+async def cb_login_session(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(WizardStates.waiting_string_session)
+    await safe_edit_text(
+        callback,
+        "<b>Step 2 / 4 — Paste Telethon StringSession</b>\n\n"
+        "📥 Send your Telethon <code>StringSession</code> string now.\n"
+        "<i>(It will be deleted immediately and stored encrypted.)</i>",
+    )
+
+
+@router.message(WizardStates.waiting_string_session)
+async def msg_string_session(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    session_str = (message.text or "").strip()
+    await safe_delete_message(message)
+    data = await state.get_data()
+    api_id = data.get("api_id") or ctx.env.tg_api_id or await ctx.db.get_setting("tg_api_id")
+    api_hash = data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
+    if not (api_id and api_hash):
+        await message.answer("❌ Missing API ID / API Hash. Send /setup to restart.")
+        return
+
+    wait_msg = await message.answer("🔌 Connecting with StringSession...")
+    res = await ctx.userbot.login_with_string_session(int(api_id), str(api_hash), session_str)
+    if res.status != "ok":
+        await wait_msg.edit_text(f"❌ {html.escape(res.message)}\n\nPaste a valid StringSession:")
+        return
+
+    await wait_msg.edit_text(f"🎉 <b>{html.escape(res.message)}</b>")
+    await _show_ai_step(message, ctx, state)
+
+
+# ----------------------------------------------------------------------
+# Step 3: AI Provider + Key + Model
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data == "wiz:ai_step")
+async def cb_wiz_ai_step(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await callback.answer()
+    await _show_ai_step(callback, ctx, state)
+
+
+@router.callback_query(F.data.startswith("wiz_ai:"))
+async def cb_wiz_pick_provider(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await callback.answer()
+    provider = (callback.data or "").split(":")[1]
+    spec = PROVIDERS[provider]
+    await state.update_data(wiz_provider=provider)
+
+    existing_key = await ctx.db.get_provider_key(provider)
+    if existing_key:
+        await _prompt_wizard_model(callback, ctx, state, provider)
+        return
+
+    await state.set_state(WizardStates.waiting_ai_key)
+    await safe_edit_text(
+        callback,
+        f"<b>Step 3 / 4 — {spec.emoji} {spec.name} API Key</b>\n\n"
+        f"Get a free API key here: <a href='{spec.signup_url}'>{spec.signup_url}</a>\n\n"
+        f"📥 Paste your <b>{spec.name} API Key</b> now.\n"
+        "<i>(I'll test its speed immediately and delete your message.)</i>",
+    )
+
+
+@router.message(WizardStates.waiting_ai_key)
+async def msg_wiz_ai_key(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    api_key = (message.text or "").strip()
+    await safe_delete_message(message)
+    data = await state.get_data()
+    provider = str(data.get("wiz_provider", "groq"))
+    spec = PROVIDERS[provider]
+
+    testing_msg = await message.answer(f"⚡ Testing {spec.name} API key & measuring speed...")
+    ok, latency_ms, detail = await ctx.ai.test_connection(provider, spec.default_model, api_key)
+    if not ok:
+        await testing_msg.edit_text(
+            f"❌ <b>{spec.name} key test failed</b> ({latency_ms}ms):\n"
+            f"<code>{html.escape(detail)}</code>\n\n"
+            "Please paste a valid API key (or send /setup to pick another provider):"
+        )
+        return
+
+    await ctx.db.set_provider_key(provider, api_key)
+    await ctx.db.set_setting("primary_provider", provider)
+    await ctx.db.set_setting("primary_model", spec.default_model)
+    await state.set_state(None)
+
+    kb, model_ids = model_picker_kb(
+        provider=provider,
+        prefix="wiz_m",
+        active_model=spec.default_model,
+        back_cb="wiz:ai_step",
+    )
+    await state.update_data(wiz_model_choices=model_ids, wiz_provider=provider)
+    await testing_msg.edit_text(
+        f"✅ <b>{spec.name} connected!</b>\n"
+        f"⚡ Test answer: <code>{html.escape(detail)}</code> in <b>{latency_ms}ms</b>\n\n"
+        "Choose a model (or keep the recommended default):",
+        reply_markup=kb,
+    )
+
+
+async def _prompt_wizard_model(
+    target: CallbackQuery,
+    ctx: AppContext,
+    state: FSMContext,
+    provider: str,
+    extra_models: list[str] | None = None,
+) -> None:
+    spec = PROVIDERS[provider]
+    current_model = str(await ctx.db.get_setting("primary_model", spec.default_model))
+    kb, model_ids = model_picker_kb(
+        provider=provider,
+        prefix="wiz_m",
+        active_model=current_model,
+        extra_models=extra_models,
+        back_cb="wiz:ai_step",
+    )
+    await state.update_data(wiz_model_choices=model_ids, wiz_provider=provider)
+    await safe_edit_text(
+        target,
+        f"<b>Step 3 / 4 — Choose {spec.emoji} {spec.name} Model</b>\n\n"
+        f"Current: <code>{html.escape(current_model)}</code>\n"
+        "Select a model to continue to Group Selection:",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("wiz_m:"))
+async def cb_wiz_model(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    data = await state.get_data()
+    provider = str(data.get("wiz_provider", "groq"))
+
+    if action == "idx":
+        idx = int(parts[2])
+        choices: list[str] = data.get("wiz_model_choices") or []
+        if idx < 0 or idx >= len(choices):
+            await callback.answer("Please pick again", show_alert=True)
+            return
+        model_id = choices[idx]
+        await ctx.db.set_setting("primary_provider", provider)
+        await ctx.db.set_setting("primary_model", model_id)
+        await callback.answer(f"Selected {model_id}")
+        await _show_group_step(callback, ctx, state)
+        return
+
+    if action == "live":
+        await callback.answer("Fetching live models...")
+        api_key = await ctx.db.get_provider_key(provider)
+        if not api_key:
+            await callback.answer("Missing API key", show_alert=True)
+            return
+        try:
+            models = await fetch_live_models(provider, api_key, ctx.ai.client)
+        except Exception as exc:
+            await callback.answer(f"Fetch failed: {exc}", show_alert=True)
+            return
+        if not models:
+            await callback.answer("No models returned", show_alert=True)
+            return
+        await _prompt_wizard_model(callback, ctx, state, provider, extra_models=models)
+        return
+
+    if action == "custom":
+        await callback.answer()
+        await state.set_state(WizardStates.waiting_custom_model)
+        await safe_edit_text(
+            callback,
+            f"✏️ Send the exact model ID for <b>{PROVIDERS[provider].name}</b>:",
+        )
+
+
+@router.message(WizardStates.waiting_custom_model)
+async def msg_wiz_custom_model(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    model_id = (message.text or "").strip()
+    if not model_id:
+        await message.answer("❌ Please send a non-empty model ID.")
+        return
+    data = await state.get_data()
+    provider = str(data.get("wiz_provider", "groq"))
+    await ctx.db.set_setting("primary_provider", provider)
+    await ctx.db.set_setting("primary_model", model_id)
+    await state.set_state(None)
+    await message.answer(f"✅ Model set to <code>{html.escape(model_id)}</code>!")
+    await _show_group_step(message, ctx, state)
+
+
+# ----------------------------------------------------------------------
+# Step 4 Completion
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data == "wiz:finish")
+async def cb_wiz_finish(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    await state.clear()
+    await ctx.db.set_setting("setup_completed", True)
+    await ctx.db.set_setting("global_enabled", True)
+    await ctx.userbot.reload_cache()
+
+    await callback.answer("🎉 Setup complete! Userbot is LIVE.")
+    notify_on = bool(await ctx.db.get_setting("notify_on_answer", False))
+    text = (
+        "🎉 <b>Setup Complete — Your Q&amp;A Userbot is Live!</b>\n\n"
+        + await ctx.render_dashboard_text()
+        + "\n\n☁️ <i>Using Render Free Tier? Open <b>⚙️ Account &amp; Setup → Export Render Config</b> "
+        "to save your login &amp; groups across restarts!</i>"
+    )
+    await safe_edit_text(callback, text, reply_markup=main_dashboard_kb(True, notify_on))

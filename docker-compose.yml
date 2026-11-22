@@ -1,0 +1,16 @@
+services:
+  tg-qna-userbot:
+    build: .
+    container_name: tg-qna-userbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

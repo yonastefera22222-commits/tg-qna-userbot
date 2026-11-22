@@ -1,0 +1,23 @@
+[Unit]
+Description=Telegram Q&A Userbot + Dashboard Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/tg-qna-userbot
+EnvironmentFile=/opt/tg-qna-userbot/.env
+Environment=PYTHONPATH=/opt/tg-qna-userbot/src
+ExecStart=/opt/tg-qna-userbot/.venv/bin/python -m qna_bot
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

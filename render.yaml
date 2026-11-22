@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: tg-qna-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=src python -m qna_bot
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: BOT_STATE_B64
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO

@@ -1,0 +1,8 @@
+aiogram>=3.17.0,<4.0.0
+telethon>=1.39.0,<2.0.0
+aiosqlite>=0.20.0,<1.0.0
+httpx[http2]>=0.28.0,<1.0.0
+cryptography>=44.0.0
+python-dotenv>=1.0.1
+pydantic>=2.10.0
+
