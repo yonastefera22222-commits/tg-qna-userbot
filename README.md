@@ -8,6 +8,8 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
 
 - **🧭 Full In-Bot Setup Wizard (`/start`)**: Walks you step-by-step inside Telegram through API credentials, logging in your Telegram account, adding an AI key, and picking which group chats to monitor.
 - **🔢 Anti-Invalidation Inline OTP Keypad**: Enter your Telegram login code by tapping inline keypad buttons (so Telegram never invalidates your login code). Supports 2FA passwords and `StringSession` paste.
+- **📨 Tells You Exactly Where the Code Went**: Telegram rarely sends login codes by SMS — for most accounts the code arrives as a **service message inside the Telegram app**, or by email/call/confirmation prompt. The wizard now reports the real delivery channel (and code length) Telegram chose, instead of always claiming "sent via Telegram".
+- **🩺 Login Troubleshooting Built In**: A **❓ No code received?** button gives a step-by-step checklist (service chat, SMS/email, country code format, alternate channel, flood limits). Common failures are translated into plain instructions: `FloodWait` shows the exact seconds, a bad number tells you the correct `+251...` format, a rejected API Hash links back to `my.telegram.org`, and a dead login attempt offers a one-tap retry instead of an opaque error.
 - **☁️ Render Free Tier Ready**:
   - Built-in async HTTP `/health` endpoint binding `0.0.0.0:$PORT` (required by Render Free Web Services).
   - Includes **`render.yaml`** for 1-click Blueprint deployment.
@@ -64,7 +66,7 @@ git push -u origin main
    - *(If you skipped `OWNER_ID`, check Render's **Logs** tab for the 6-character `PAIRING CODE` and send it to the bot first.)*
 2. Follow the 4 steps right inside Telegram:
    - **Step 1**: Enter your Telegram `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) → *API development tools*.
-   - **Step 2**: Send your phone number (e.g. `+251...`), then tap your Telegram login code on the **inline numeric keypad** (+ 2FA password if enabled).
+   - **Step 2**: Send your phone number in **international format** (e.g. `+251912345678` — country code, no leading `0`). The bot then tells you **where Telegram sent the code** (usually a service message *inside* the Telegram app, not an SMS), then tap the digits on the **inline numeric keypad** (+ 2FA password if enabled). No code? Tap **❓ No code received?**, then **🔄 Resend Code** — Telegram switches channel (app message → SMS → call).
    - **Step 3**: Pick a free AI provider (recommended: **⚡ Groq** from [console.groq.com/keys](https://console.groq.com/keys)), paste your API key (tested live with ms speed!), and choose a model.
    - **Step 4**: Toggle `✅` on the giveaway groups you want to monitor, tap `⚙️` on any group to customize rules, and tap **✅ Finish Setup & Open Dashboard**.
 
