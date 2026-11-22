@@ -421,9 +421,33 @@ def _qr_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 I Scanned It — Continue", callback_data="wiz:qr_check")],
-            [InlineKeyboardButton(text="🔁 New QR Code", callback_data="wiz:login_qr")],
+            [InlineKeyboardButton(text="♻️ Refresh QR Image", callback_data="wiz:qr_refresh")],
+            [InlineKeyboardButton(text="🔁 Start Over", callback_data="wiz:login_qr")],
             [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
         ]
+    )
+
+
+def _qr_caption(url: str, snapshot: dict | None = None) -> str:
+    """Caption for the QR image, explaining that it renews itself."""
+    renewed = ""
+    if snapshot and snapshot.get("refreshes"):
+        renewed = (
+            f"\n♻️ <i>Auto-renewed {snapshot['refreshes']}× — the code stays valid while "
+            "this screen is open.</i>"
+        )
+    return (
+        "📷 <b>QR Code Login — no SMS, no code needed</b>\n\n"
+        "On the phone that is <b>already logged in</b> to Telegram:\n"
+        "1️⃣ Open <b>Telegram → Settings → Devices</b>\n"
+        "2️⃣ Tap <b>Link Desktop Device</b>\n"
+        "3️⃣ Point the camera at the code above\n\n"
+        f"🔗 Or open this link on the phone: <a href='{html.escape(url)}'>tap here</a>\n\n"
+        "♾ <b>This code refreshes itself automatically</b>, so there is no rush — "
+        "Telegram's codes live ~30 seconds but a new one is issued the moment the old "
+        "one lapses.\n"
+        "If your phone shows “code expired”, just scan again (or tap ♻️ Refresh QR Image)."
+        f"{renewed}"
     )
 
 
@@ -444,64 +468,109 @@ async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContex
         return
 
     await state.set_state(WizardStates.waiting_qr_2fa)
-    text = (
-        "📷 <b>QR Code Login — no SMS, no code needed</b>\n\n"
-        "On the phone that is <b>already logged in</b> to Telegram:\n"
-        "1️⃣ Open <b>Telegram → Settings → Devices</b>\n"
-        "2️⃣ Tap <b>Link Desktop Device</b>\n"
-        "3️⃣ Point the camera at the code below\n\n"
-        f"🔗 Or open this link on the phone: <a href='{html.escape(url)}'>tap here</a>\n\n"
-        "<i>The code expires in a couple of minutes. Tap 🔄 New QR Code if it does.</i>"
-    )
+    await state.update_data(qr_generation=1)
     if callback.message is None:
         return
-    try:
-        # Render a real scannable QR image (falls back to text if qrcode is missing).
-        import io
 
-        import qrcode
-
-        img = qrcode.make(url)
-        buf = io.BytesIO()
-        buf.name = "login_qr.png"
-        img.save(buf)
-        buf.seek(0)
+    caption = _qr_caption(url)
+    png = ctx.userbot.qr_code()
+    if png is not None:
         from aiogram.types import BufferedInputFile
 
         await callback.message.answer_photo(
-            BufferedInputFile(buf.read(), filename="login_qr.png"),
-            caption=text,
+            BufferedInputFile(png, filename="login_qr.png"),
+            caption=caption,
             reply_markup=_qr_kb(),
         )
-    except Exception as exc:  # pragma: no cover - optional dependency
-        import logging
+    else:
+        await safe_edit_text(callback, caption, reply_markup=_qr_kb())
 
-        logging.getLogger(__name__).debug("Could not render QR image: %s", exc)
-        await safe_edit_text(callback, text, reply_markup=_qr_kb())
+
+@router.callback_query(F.data == "wiz:qr_refresh")
+async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    """Swap the on-screen QR for the current (auto-renewed) token."""
+    snapshot = ctx.userbot.qr_snapshot()
+    if snapshot is None:
+        await callback.answer("No QR login in progress — tap 🔁 Start Over.", show_alert=True)
+        return
+    if snapshot["status"] is LoginStatus.ERROR:
+        await callback.answer(str(snapshot["message"])[:190], show_alert=True)
+        return
+
+    png = ctx.userbot.qr_code()
+    if png is None or callback.message is None:
+        await callback.answer("Could not render the QR image.", show_alert=True)
+        return
+
+    from aiogram.types import BufferedInputFile, InputMediaPhoto
+
+    caption = _qr_caption(str(snapshot["url"]), snapshot)
+    try:
+        # Replace the photo in place so the chat does not fill with images.
+        await callback.message.edit_media(
+            media=InputMediaPhoto(
+                media=BufferedInputFile(png, filename="login_qr.png"),
+                caption=caption,
+            ),
+            reply_markup=_qr_kb(),
+        )
+        await callback.answer("QR refreshed")
+    except Exception:
+        # edit_media can fail on some clients; fall back to a new message.
+        await callback.message.answer_photo(
+            BufferedInputFile(png, filename="login_qr.png"),
+            caption=caption,
+            reply_markup=_qr_kb(),
+        )
+        await callback.answer("QR refreshed")
 
 
 @router.callback_query(F.data == "wiz:qr_check")
 async def cb_qr_check(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    status, message = ctx.userbot.qr_login_status()
+
+    # Check 2FA *before* finalising: otherwise the "2FA required" state is
+    # reported as a generic error and the owner never gets to type their password.
+    if status is LoginStatus.TWO_FA_REQUIRED:
+        await callback.answer("QR approved — 2FA needed")
+        await state.set_state(WizardStates.waiting_qr_2fa)
+        await safe_edit_text(
+            callback,
+            "🔐 <b>QR approved — 2FA Required</b>\n\nThis account has a Telegram "
+            "cloud password. Send it now:\n"
+            "<i>(Your message is deleted immediately after it is read.)</i>",
+        )
+        return
+
+    if status is LoginStatus.ERROR:
+        await callback.answer(message[:190], show_alert=True)
+        return
+
+    if status is not LoginStatus.OK:
+        snapshot = ctx.userbot.qr_snapshot() or {}
+        left = snapshot.get("seconds_left")
+        hint = (
+            f"Current code is valid ~{left}s and renews itself — scan it whenever "
+            "you are ready."
+            if left
+            else "Waiting for your phone to approve the QR code."
+        )
+        await callback.answer(hint[:190], show_alert=True)
+        return
+
     res = await ctx.userbot.finish_qr_login_if_scanned()
-    if res is None:
-        await callback.answer("Not scanned yet — waiting for your phone.", show_alert=True)
-        status, message = ctx.userbot.qr_login_status()
-        if status is LoginStatus.TWO_FA_REQUIRED:
-            await state.set_state(WizardStates.waiting_qr_2fa)
-            await safe_edit_text(
-                callback,
-                "🔐 <b>2FA Required</b>\n\nThe QR was approved, but this account has a "
-                "cloud password. Send your 2FA password now:",
-            )
+    if res is None or res.status is not LoginStatus.OK:
+        await callback.answer(
+            (res.message if res is not None else "QR login session was lost.")[:190],
+            show_alert=True,
+        )
         return
-    if res.status is LoginStatus.OK:
-        await callback.answer("Logged in!")
-        await state.clear()
-        if callback.message is not None:
-            await safe_edit_text(callback, f"🎉 <b>{html.escape(res.message)}</b>")
-            await _show_ai_step(callback.message, ctx, state)
-        return
-    await callback.answer(res.message[:190], show_alert=True)
+
+    await callback.answer("Logged in!")
+    await state.clear()
+    if callback.message is not None:
+        await safe_edit_text(callback, f"🎉 <b>{html.escape(res.message)}</b>")
+        await _show_ai_step(callback.message, ctx, state)
 
 
 @router.message(WizardStates.waiting_qr_2fa)

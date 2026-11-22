@@ -29,6 +29,7 @@ from .login import (
     PhoneLoginSession,
     QrLoginSession,
     make_login_client,
+    render_qr_png,
     translate_send_error,
 )
 
@@ -271,6 +272,31 @@ class UserbotManager:
         if state is None:
             return LoginStatus.ERROR, "No QR login in progress."
         return state.status, state.message
+
+    def qr_snapshot(self) -> dict[str, object] | None:
+        """Current QR state for the UI (url, generation counter, seconds left).
+
+        ``generation`` increases every time Telegram's short-lived token is
+        renewed, which tells the wizard its on-screen image is stale.
+        """
+        state = self._qr.poll()
+        if state is None:
+            return None
+        return {
+            "url": state.url,
+            "generation": state.generation,
+            "refreshes": state.refreshes,
+            "seconds_left": state.seconds_left,
+            "status": state.status,
+            "message": state.message,
+        }
+
+    def qr_code(self) -> bytes | None:
+        """Render the *current* token as a PNG, so the image can be swapped in place."""
+        state = self._qr.poll()
+        if state is None:
+            return None
+        return render_qr_png(state.url)
 
     async def submit_qr_2fa(self, password: str) -> LoginResult:
         result = await self._qr.submit_password(password)
