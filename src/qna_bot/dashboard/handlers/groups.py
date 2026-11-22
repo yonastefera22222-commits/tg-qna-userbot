@@ -249,6 +249,8 @@ async def cb_group_cfg_update(
         group.reply_to_message = not group.reply_to_message
     elif field == "math":
         group.local_math_enabled = not group.local_math_enabled
+    elif field == "vision":
+        group.vision_enabled = not group.vision_enabled
     elif field == "cooldown":
         group.cooldown_seconds = _next_in_cycle(_COOLDOWN_CYCLE, group.cooldown_seconds)
     elif field == "delay":

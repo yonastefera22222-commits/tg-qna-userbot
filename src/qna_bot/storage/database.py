@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any
 import aiosqlite
 
 from .crypto import SecretCipher
+
+logger = logging.getLogger(__name__)
 
 SECRET_SETTING_KEYS = frozenset(
     {
@@ -48,6 +51,9 @@ class GroupConfig:
     reply_to_message: bool = True
     trigger_keywords: str = ""
     context_messages: int = 0
+    #: Answer questions that are asked as an image (screenshot of a quiz, photo
+    #: of a question). Requires a vision-capable model.
+    vision_enabled: bool = True
 
     def trigger_keyword_list(self) -> list[str]:
         if not self.trigger_keywords.strip():
@@ -116,7 +122,8 @@ class Database:
                 human_delay_ms INTEGER NOT NULL DEFAULT 0,
                 reply_to_message INTEGER NOT NULL DEFAULT 1,
                 trigger_keywords TEXT NOT NULL DEFAULT '',
-                context_messages INTEGER NOT NULL DEFAULT 0
+                context_messages INTEGER NOT NULL DEFAULT 0,
+                vision_enabled INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS answer_logs (
@@ -135,6 +142,26 @@ class Database:
                 ON answer_logs (created_at DESC);
             """
         )
+        await self.conn.commit()
+        await self._migrate_schema()
+
+    async def _migrate_schema(self) -> None:
+        """Additive migrations for databases created by older versions.
+
+        ``CREATE TABLE IF NOT EXISTS`` never adds columns to an existing table,
+        so without this an upgraded bot would hit "no such column" on every group
+        query. Each step is idempotent.
+        """
+        cursor = await self.conn.execute("PRAGMA table_info(groups)")
+        existing = {str(row["name"]) for row in await cursor.fetchall()}
+
+        additions = {
+            "vision_enabled": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for column, ddl in additions.items():
+            if column not in existing:
+                logger.info("Migrating groups table: adding column %s", column)
+                await self.conn.execute(f"ALTER TABLE groups ADD COLUMN {column} {ddl}")
         await self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -182,6 +209,36 @@ class Database:
     async def set_provider_key(self, provider: str, api_key: str | None) -> None:
         await self.set_setting(f"api_key_{provider}", api_key)
 
+    async def get_settings(self, keys: tuple[str, ...]) -> dict[str, Any]:
+        """Fetch several settings in one query (one await instead of N).
+
+        Every group message used to issue six separate SELECTs before the AI
+        call could even start. Reading them together removes that serialised
+        database round-tripping from the hot path.
+        """
+        if not keys:
+            return {}
+        placeholders = ",".join("?" for _ in keys)
+        cursor = await self.conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})", keys
+        )
+        rows = await cursor.fetchall()
+        found = {row["key"]: row["value"] for row in rows}
+
+        result: dict[str, Any] = {}
+        for key in keys:
+            if key not in found:
+                continue
+            raw_val = found[key]
+            if key in SECRET_SETTING_KEYS:
+                result[key] = self._cipher.decrypt(raw_val)
+                continue
+            try:
+                result[key] = json.loads(raw_val)
+            except (json.JSONDecodeError, TypeError):
+                result[key] = raw_val
+        return result
+
     async def get_all_provider_keys(self) -> dict[str, str]:
         keys: dict[str, str] = {}
         for provider in ("groq", "gemini", "openrouter"):
@@ -210,6 +267,7 @@ class Database:
             reply_to_message=bool(row["reply_to_message"]),
             trigger_keywords=str(row["trigger_keywords"]),
             context_messages=int(row["context_messages"]),
+            vision_enabled=bool(row["vision_enabled"]) if "vision_enabled" in row.keys() else True,
         )
 
     async def upsert_group_metadata(
@@ -238,11 +296,13 @@ class Database:
             INSERT INTO groups (
                 chat_id, title, username, enabled, sender_filter, answer_style,
                 detection_mode, local_math_enabled, cooldown_seconds,
-                human_delay_ms, reply_to_message, trigger_keywords, context_messages
+                human_delay_ms, reply_to_message, trigger_keywords, context_messages,
+                vision_enabled
             ) VALUES (
                 :chat_id, :title, :username, :enabled, :sender_filter, :answer_style,
                 :detection_mode, :local_math_enabled, :cooldown_seconds,
-                :human_delay_ms, :reply_to_message, :trigger_keywords, :context_messages
+                :human_delay_ms, :reply_to_message, :trigger_keywords, :context_messages,
+                :vision_enabled
             )
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
@@ -256,13 +316,15 @@ class Database:
                 human_delay_ms = excluded.human_delay_ms,
                 reply_to_message = excluded.reply_to_message,
                 trigger_keywords = excluded.trigger_keywords,
-                context_messages = excluded.context_messages
+                context_messages = excluded.context_messages,
+                vision_enabled = excluded.vision_enabled
             """,
             {
                 **data,
                 "enabled": int(group.enabled),
                 "local_math_enabled": int(group.local_math_enabled),
                 "reply_to_message": int(group.reply_to_message),
+                "vision_enabled": int(group.vision_enabled),
             },
         )
         await self.conn.commit()

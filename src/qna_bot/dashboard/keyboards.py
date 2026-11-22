@@ -254,6 +254,10 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
         callback_data=f"gcfg:{cid}:math:{back_page}:{mode_flag}",
     )
     b.button(
+        text=f"📷 Answer Photo Questions: {'ON' if group.vision_enabled else 'OFF'}",
+        callback_data=f"gcfg:{cid}:vision:{back_page}:{mode_flag}",
+    )
+    b.button(
         text=f"⏱ Cooldown: {group.cooldown_seconds:g}s",
         callback_data=f"gcfg:{cid}:cooldown:{back_page}:{mode_flag}",
     )
@@ -282,10 +286,18 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
     return b.as_markup()
 
 
-def ai_menu_kb(has_fallback: bool) -> InlineKeyboardMarkup:
+_SPEED_LABELS = {"fast": "⚡ Fastest", "balanced": "⚖️ Balanced", "smart": "🧠 Smart"}
+SPEED_CYCLE = ("fast", "balanced", "smart")
+
+
+def ai_menu_kb(has_fallback: bool, speed_mode: str = "fast") -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Switch Primary Provider", callback_data="ai:pick_primary")
     b.button(text="🧠 Change Primary Model", callback_data="ai:pick_primary_model")
+    b.button(
+        text=f"🚀 Response Speed: {_SPEED_LABELS.get(speed_mode, speed_mode)}",
+        callback_data="ai:speed",
+    )
     b.button(
         text="🛡 Change Fallback Provider" if has_fallback else "🛡 Add Fallback Provider",
         callback_data="ai:pick_fallback",

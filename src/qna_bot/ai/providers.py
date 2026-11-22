@@ -12,6 +12,8 @@ class ModelPreset:
     model_id: str
     label: str
     note: str
+    #: True when the model accepts image input (needed to answer photo questions).
+    supports_vision: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ModelPreset(
                 "qwen/qwen3.8-27b",
                 "Qwen 3.8 27B",
-                "Strong reasoning + multilingual trivia (preview)",
+                "Strong reasoning + reads images (only Groq model with vision)",
+                supports_vision=True,
             ),
             ModelPreset(
                 "openai/gpt-oss-safeguard-20b",
@@ -73,22 +76,26 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ModelPreset(
                 "gemini-3.5-flash-lite",
                 "Gemini 3.5 Flash-Lite",
-                "Highest free daily quota + ultra-fast",
+                "Highest free daily quota + ultra-fast + reads images",
+                supports_vision=True,
             ),
             ModelPreset(
                 "gemini-3.8-flash",
                 "Gemini 3.8 Flash",
-                "Newest Flash model, highest trivia accuracy",
+                "Newest Flash model, highest trivia accuracy + reads images",
+                supports_vision=True,
             ),
             ModelPreset(
                 "gemini-3.6-flash",
                 "Gemini 3.6 Flash",
-                "Stable Flash model on the free tier",
+                "Stable Flash model on the free tier + reads images",
+                supports_vision=True,
             ),
             ModelPreset(
                 "gemini-3.1-flash-lite",
                 "Gemini 3.1 Flash-Lite",
-                "Lightweight & very quick responses",
+                "Lightweight & very quick responses + reads images",
+                supports_vision=True,
             ),
         ),
     ),
@@ -150,6 +157,99 @@ RETIRED_MODELS: dict[str, dict[str, str]] = {
         "gemini-2.5-pro": "gemini-3.8-flash",
     },
 }
+
+
+#: The model to use when an image must be read and the configured model
+#: cannot see. Groq only serves vision through one model; Gemini Flash models
+#: are all multimodal.
+VISION_MODEL: dict[str, str] = {
+    "groq": "qwen/qwen3.8-27b",
+    "gemini": "gemini-3.5-flash-lite",
+}
+
+
+def supports_vision(provider: str, model: str) -> bool:
+    """True when this provider+model pair can accept an image input."""
+    spec = PROVIDERS.get(provider)
+    if spec is None:
+        return False
+    for preset in spec.presets:
+        if preset.model_id == model and preset.supports_vision:
+            return True
+    # Custom/unknown model IDs: trust the provider-level known vision families.
+    if provider == "gemini":
+        lowered = model.lower()
+        return "flash" in lowered or "gemma" in lowered or "pro" in lowered
+    if provider == "groq":
+        return "qwen3.8" in model.lower() or "vision" in model.lower()
+    if provider == "openrouter":
+        # OpenRouter varies by route; let the request try and fall back on error.
+        return True
+    return False
+
+
+def vision_model_for(provider: str, model: str) -> str | None:
+    """Pick a vision-capable model for this provider, preferring the current one."""
+    if supports_vision(provider, model):
+        return model
+    return VISION_MODEL.get(provider)
+
+
+#: Reasoning-capable models grouped by the effort vocabulary they accept.
+#: Groq rejects any value outside a model's documented set with a 400, so the
+#: two families cannot share one setting:
+#:   * gpt-oss  -> low | medium | high   (defaults to MEDIUM, i.e. slow)
+#:   * Qwen 3.8 -> none | low | medium | high
+#: Leaving this unset is the single biggest source of "sometimes it lags": the
+#: default is medium, so the model thinks before answering every giveaway.
+GROQ_GRADED_EFFORT_MODELS = ("openai/gpt-oss",)
+GROQ_QWEN_EFFORT_MODELS = ("qwen/qwen3",)
+
+
+def reasoning_effort_for(provider: str, model: str, effort: str) -> str | None:
+    """Map a generic speed/smart effort onto what this model actually accepts.
+
+    Returns ``None`` when the model is not a reasoning model, so callers omit
+    the parameter entirely instead of sending one that would 400.
+    """
+    lowered = (model or "").lower()
+
+    if provider == "groq":
+        if any(tag in lowered for tag in GROQ_GRADED_EFFORT_MODELS):
+            # gpt-oss 400s on "none"; "low" is the fastest value it accepts.
+            return {"fast": "low", "balanced": "medium"}.get(effort, "high")
+        if any(tag in lowered for tag in GROQ_QWEN_EFFORT_MODELS):
+            return "none" if effort == "fast" else ("low" if effort == "balanced" else "high")
+        return None
+
+    if provider == "gemini":
+        # Gemini 3.x thinks dynamically at its default level. Which level is
+        # *legal* varies by model, and an unsupported value is a hard 400:
+        #   * gemini-3.8-flash      -> "minimal" is NOT supported (error)
+        #   * gemini-3.6-flash      -> "minimal" supported
+        #   * *-flash-lite          -> "minimal" is the default
+        #   * gemma / pro           -> no useful "faster" setting
+        # "low" is accepted everywhere in the Flash family, so it is the safe
+        # fallback for any model we do not recognise.
+        if "gemma" in lowered or "pro" in lowered or "thinking" in lowered:
+            return None
+        if "flash" not in lowered:
+            return None
+        if effort == "smart":
+            return None  # leave the model's own default alone
+        if "3.8" in lowered:
+            return "low"  # "minimal" would be rejected outright
+        if "flash-lite" in lowered or "3.6" in lowered:
+            return "minimal" if effort == "fast" else "low"
+        return "low"
+
+    # OpenRouter free routes vary; leave their defaults alone.
+    return None
+
+
+#: How a provider request should be shaped for lowest latency.
+SPEED_MODES = ("fast", "balanced", "smart")
+DEFAULT_SPEED_MODE = "fast"
 
 
 def retired_model_replacement(provider: str, model: str) -> str | None:

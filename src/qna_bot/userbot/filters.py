@@ -89,19 +89,35 @@ class FilterDecision:
     reason: str
 
 
-def should_evaluate_message(text: str, group: GroupConfig) -> FilterDecision:
-    """Decide in <0.1ms whether a message should be forwarded to local-math / AI."""
+def should_evaluate_message(
+    text: str, group: GroupConfig, *, has_image: bool = False
+) -> FilterDecision:
+    """Decide in <0.1ms whether a message should be forwarded to local-math / AI.
+
+    When ``has_image`` is set the message carries a photo, which changes the
+    rules: a photo with no caption is a perfectly normal way to ask a giveaway
+    question ("solve this", a screenshot of a quiz), so empty text is no longer a
+    reason to skip it.
+    """
     cleaned = (text or "").strip()
+
     if not cleaned:
+        if has_image:
+            if not getattr(group, "vision_enabled", True):
+                return FilterDecision(False, "vision_disabled")
+            return FilterDecision(True, "image_only")
         return FilterDecision(False, "empty")
 
     # Ignore bot slash-commands (e.g. /start, /help@somebot)
     if cleaned.startswith("/"):
         return FilterDecision(False, "command")
 
-    # Ignore pure URLs or emoji-only messages
-    if _URL_ONLY_RE.match(cleaned) or not _HAS_ALNUM_RE.search(cleaned):
+    # Ignore pure URLs or emoji-only messages (an image counts as content)
+    if not has_image and (_URL_ONLY_RE.match(cleaned) or not _HAS_ALNUM_RE.search(cleaned)):
         return FilterDecision(False, "non_text")
+
+    if has_image and not getattr(group, "vision_enabled", True):
+        return FilterDecision(False, "vision_disabled")
 
     # Ignore overly long essays/announcements (>600 chars usually aren't quick Q&A giveaways)
     if len(cleaned) > 600:
@@ -175,6 +191,8 @@ REASON_TEXT: dict[str, str] = {
     "giveaway_signal": "it contains a question or trivia keyword",
     "giveaway_candidate": "it has 3+ words (aggressive mode)",
     "too_short_non_question": "it is too short and not a question (aggressive mode)",
+    "image_only": "it is a photo (no caption) and photo answers are enabled",
+    "vision_disabled": "it is a photo but photo answers are disabled for this group",
 }
 
 
