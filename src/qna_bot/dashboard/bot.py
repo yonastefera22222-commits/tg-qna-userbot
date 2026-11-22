@@ -118,6 +118,8 @@ def create_dashboard_bot(ctx: AppContext) -> tuple[Bot, Dispatcher]:
                 BotCommand(command="setup", description="Re-run guided setup wizard"),
                 BotCommand(command="cancel", description="Cancel current input step"),
                 BotCommand(command="logindiagnose", description="Diagnose why no login code arrives"),
+                BotCommand(command="diag", description="Diagnose why the account is not replying"),
+                BotCommand(command="testanswer", description="Test the Q&A pipeline end-to-end"),
             ]
         )
         me = await bot.get_me()

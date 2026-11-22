@@ -1056,9 +1056,41 @@ class PhoneLoginSession:
 # ---------------------------------------------------------------------------
 
 
+def render_qr_png(url: str, *, box_size: int = 8, border: int = 2) -> bytes | None:
+    """Render a ``tg://login`` URL as a PNG QR code.
+
+    Returns ``None`` when the optional ``qrcode`` dependency is unavailable so
+    callers can fall back to showing the raw link.
+    """
+    try:
+        import io
+
+        import qrcode
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+    try:
+        img = qrcode.make(url, box_size=box_size, border=border)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not render QR PNG: %s", exc)
+        return None
+
+
+
+
 @dataclass
 class QrLoginState:
-    """A live QR login attempt (no SMS/app code is ever sent)."""
+    """A live QR login attempt (no SMS/app code is ever sent).
+
+    Telegram's ``tg://login`` token is valid for only ~30 seconds, and that TTL
+    is enforced server-side -- a client cannot ask for a longer one. To stop the
+    owner from constantly racing an expiry, the session keeps a *live* QR
+    indefinitely: each expiring token is automatically replaced via
+    ``QRLogin.recreate()`` on the same Telegram connection, and the bump counter
+    lets the UI update the image in place.
+    """
 
     client: TelegramClient
     api_id: int
@@ -1069,22 +1101,38 @@ class QrLoginState:
     task: asyncio.Task | None = None
     status: LoginStatus = LoginStatus.CODE_SENT
     message: str = ""
+    #: Incremented every time a fresh token is generated, so the UI can tell
+    #: that the scanned image is stale and should be replaced.
+    generation: int = 0
+    #: How many automatic refreshes have happened (diagnostics/UI wording).
+    refreshes: int = 0
+    #: Set when refreshing permanently failed (e.g. flood wait).
+    fatal_error: str | None = None
+
+    @property
+    def seconds_left(self) -> int:
+        return max(0, int(self.expires_at - time.time()))
 
 
 class QrLoginSession:
-    """QR-code login: scan with the Telegram app and approve on the phone.
+    """QR-code login that stays valid until it is approved.
 
-    This exists because it removes the *entire* code-delivery problem: no SMS,
-    no service message, no email, no flood wait on code requests. If the owner is
-    already logged in on a phone (which is how they are talking to the bot), this
-    is the most reliable possible path.
-
-    ``wait()`` is driven by a background task so the FastAPI-style handler does
-    not block; the wizard polls :meth:`poll`.
+    Why this exists: it removes the *entire* code-delivery problem (no SMS, no
+    service message, no email, no flood wait). The one weakness was that
+    Telegram's QR token lives ~30 seconds, so a slow scan failed. This session
+    now renews the token automatically for as long as the owner is on the
+    screen, which is why "the QR expired" is no longer a failure mode.
     """
 
-    def __init__(self, *, poll_timeout: float = 120.0) -> None:
+    #: How many consecutive automatic renewals before we give up. Each token is
+    #: ~30s, so this covers hours of waiting without hammering Telegram.
+    MAX_REFRESHES = 480
+    #: Renew slightly before Telegram's own expiry to avoid a dead image.
+    REFRESH_MARGIN = 6.0
+
+    def __init__(self, *, poll_timeout: float = 300.0) -> None:
         self._state: QrLoginState | None = None
+        #: Kept for compatibility: the session now outlives the initial window.
         self._poll_timeout = poll_timeout
 
     @property
@@ -1096,7 +1144,7 @@ class QrLoginSession:
         return self._state is not None
 
     async def start(self, api_id: int, api_hash: str) -> tuple[LoginResult, str | None]:
-        """Begin a QR login. Returns (result, otpauth_url_to_render_as_QR)."""
+        """Begin a QR login. Returns (result, tg://login url to render as a QR)."""
         await self.close()
         client = make_login_client(api_id, api_hash)
         try:
@@ -1110,22 +1158,22 @@ class QrLoginSession:
             logger.warning("qr_login could not start: %s", exc)
             return translate_send_error(exc, "your account"), None
 
-        expires = getattr(qr, "expires", None)
-        expires_at = (
-            expires.timestamp()
-            if expires is not None
-            else time.time() + self._poll_timeout
-        )
-        self._state = QrLoginState(
+        expires_at = self._expiry_of(qr, fallback_seconds=30.0)
+        state = QrLoginState(
             client=client,
             api_id=int(api_id),
             api_hash=api_hash.strip(),
             url=qr.url,
             expires_at=expires_at,
             login=qr,
+            generation=1,
         )
-        self._state.task = asyncio.create_task(self._wait_for_scan(qr, client))
-        logger.info("QR login started (url expires at %s)", expires_at)
+        self._state = state
+        state.task = asyncio.create_task(self._drive(qr, client, state))
+        logger.info(
+            "QR login started (token renews automatically every ~%ds)",
+            max(1, int(expires_at - time.time())),
+        )
         return (
             LoginResult(
                 LoginStatus.CODE_SENT,
@@ -1134,30 +1182,95 @@ class QrLoginSession:
             qr.url,
         )
 
-    async def _wait_for_scan(self, qr: object, client: TelegramClient) -> None:
-        state = self._state
-        if state is None:
-            return
-        try:
-            await qr.wait(timeout=self._poll_timeout)  # type: ignore[attr-defined]
-        except SessionPasswordNeededError:
-            state.status = LoginStatus.TWO_FA_REQUIRED
-            state.message = "QR scanned — this account has 2FA. Send your cloud password."
-            return
-        except TimeoutError:
-            state.status = LoginStatus.ERROR
-            state.message = "The QR code expired before it was scanned. Tap 🔄 New QR Code."
-            return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("QR login wait failed: %s", exc)
-            state.status = LoginStatus.ERROR
-            state.message = f"QR login failed: {exc}"
+    @staticmethod
+    def _expiry_of(qr: object, *, fallback_seconds: float) -> float:
+        expires = getattr(qr, "expires", None)
+        if expires is not None:
+            try:
+                return float(expires.timestamp())
+            except Exception:  # pragma: no cover - exotic tz objects
+                pass
+        return time.time() + fallback_seconds
+
+    async def _drive(self, qr: object, client: TelegramClient, state: QrLoginState) -> None:
+        """Wait for a scan, renewing the token before each expiry.
+
+        This replaces the old one-shot ``wait(timeout=120)``: instead of dying
+        when the 30-second token lapses, the loop asks Telegram for a new token
+        on the *same* connection and keeps going until the QR is approved.
+        """
+        token = qr
+        while True:
+            wait_for = max(5.0, state.seconds_left - self.REFRESH_MARGIN)
+            try:
+                await token.wait(timeout=wait_for)  # type: ignore[attr-defined]
+            except SessionPasswordNeededError:
+                state.status = LoginStatus.TWO_FA_REQUIRED
+                state.message = "QR scanned — this account has 2FA. Send your cloud password."
+                return
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                # Expected: the token lapsed. Renew it and keep listening.
+                if not await self._renew(state):
+                    return
+                token = state.login
+                continue
+            except Exception as exc:
+                # A transient RPC/network error is not fatal -- renew and retry.
+                logger.warning("QR wait error (%s); renewing token", exc)
+                if not await self._renew(state):
+                    return
+                token = state.login
+                continue
+
+            # wait() only returns (without raising) once Telegram confirms a scan.
+            state.status = LoginStatus.OK
+            state.message = "QR code scanned and approved — logging in."
             return
 
-        state.status = LoginStatus.OK
-        state.message = "QR code scanned and approved — logging in."
+    async def _renew(self, state: QrLoginState) -> bool:
+        """Fetch a fresh token on the existing connection. False if unrecoverable."""
+        if state.refreshes >= self.MAX_REFRESHES:
+            state.status = LoginStatus.ERROR
+            state.message = "The QR code was not scanned for a very long time. Tap 🔄 New QR Code."
+            state.fatal_error = state.message
+            return False
+
+        if not state.client.is_connected():
+            try:
+                await state.client.connect()
+            except Exception as exc:
+                state.status = LoginStatus.ERROR
+                state.message = f"Lost the Telegram connection: {exc}. Tap 🔄 New QR Code."
+                state.fatal_error = state.message
+                return False
+
+        try:
+            await state.login.recreate()  # type: ignore[attr-defined]
+        except FloodWaitError as exc:
+            state.status = LoginStatus.ERROR
+            state.message = (
+                f"Telegram asked us to wait {exc.seconds}s before issuing another QR code. "
+                "Tap 🔄 New QR Code after that."
+            )
+            state.fatal_error = state.message
+            return False
+        except Exception as exc:
+            logger.warning("Could not renew QR token: %s", exc)
+            state.status = LoginStatus.ERROR
+            state.message = f"Could not refresh the QR code: {exc}. Tap 🔄 New QR Code."
+            state.fatal_error = state.message
+            return False
+
+        state.url = state.login.url  # type: ignore[attr-defined]
+        state.expires_at = self._expiry_of(state.login, fallback_seconds=30.0)
+        state.generation += 1
+        state.refreshes += 1
+        logger.debug(
+            "QR token renewed (#%d), valid for ~%ds", state.refreshes, state.seconds_left
+        )
+        return True
 
     async def submit_password(self, password: str) -> LoginResult:
         """Complete a QR login on accounts with 2FA."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 from telethon.tl.types import auth as auth_types
@@ -184,16 +185,34 @@ def test_email_detection(value: str, expected: bool) -> None:
 
 
 class _FakeQr:
-    def __init__(self, *, raise_on_wait: Exception | None = None) -> None:
+    """Minimal stand-in for telethon's QRLogin, including token renewal."""
+
+    def __init__(self, *, raise_on_wait: Exception | None = None, renew_ok: bool = True) -> None:
         self.url = "tg://login?token=abc123"
         self.expires = None
         self._raise = raise_on_wait
+        self._renew_ok = renew_ok
         self.waited = False
+        self.renew_count = 0
 
     async def wait(self, timeout: float | None = None) -> None:
+        """Model real Telethon semantics.
+
+        ``wait()`` blocks on the *current* token. After ``recreate()`` there is a
+        brand-new token that nobody has scanned, so it must block again (in tests
+        it blocks forever and is cancelled by ``close()``).
+        """
         self.waited = True
         if self._raise is not None:
-            raise self._raise
+            exc, self._raise = self._raise, None  # a timeout happens once
+            raise exc
+        await asyncio.Event().wait()  # renewed token: block until scanned/cancelled
+
+    async def recreate(self) -> None:
+        if not self._renew_ok:
+            raise RuntimeError("telegram refused")
+        self.renew_count += 1
+        self.url = f"tg://login?token=renewed{self.renew_count}"
 
 
 @pytest.mark.asyncio
@@ -233,10 +252,32 @@ async def test_qr_login_2fa_is_surfaced(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_qr_login_expiry_is_explained(monkeypatch) -> None:
+async def test_qr_login_auto_renews_instead_of_expiring(monkeypatch) -> None:
+    """Telegram's QR token lives ~30s. It must renew, not fail."""
     session = QrLoginSession()
     client = _client(auth_types.SentCode(type=auth_types.SentCodeTypeApp(5), phone_code_hash="h"))
-    client.qr_login = _async_return(_FakeQr(raise_on_wait=TimeoutError()))
+    fake_qr = _FakeQr(raise_on_wait=TimeoutError())
+    client.qr_login = _async_return(fake_qr)
+    monkeypatch.setattr("qna_bot.userbot.login.make_login_client", lambda *a, **k: client)
+
+    try:
+        await session.start(1234, "abc")
+        await asyncio.sleep(0.05)  # let the driver hit the timeout and renew
+        state = session.poll()
+        assert fake_qr.renew_count >= 1, "the token must be renewed after expiring"
+        assert state.status is LoginStatus.CODE_SENT, "an expiry is not a failure any more"
+        assert state.generation >= 2, "UI must be told the image is stale"
+        assert "renewed" in state.url
+        assert state.refreshes >= 1
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_qr_login_renewal_failure_is_explained(monkeypatch) -> None:
+    session = QrLoginSession()
+    client = _client(auth_types.SentCode(type=auth_types.SentCodeTypeApp(5), phone_code_hash="h"))
+    client.qr_login = _async_return(_FakeQr(raise_on_wait=TimeoutError(), renew_ok=False))
     monkeypatch.setattr("qna_bot.userbot.login.make_login_client", lambda *a, **k: client)
 
     try:
@@ -244,7 +285,7 @@ async def test_qr_login_expiry_is_explained(monkeypatch) -> None:
         await asyncio.sleep(0.05)
         state = session.poll()
         assert state.status is LoginStatus.ERROR
-        assert "expired" in state.message.lower()
+        assert "new qr code" in state.message.lower()
     finally:
         await session.close()
 
@@ -268,3 +309,86 @@ def _async_return(value):
     from unittest.mock import AsyncMock
 
     return AsyncMock(return_value=value)
+
+
+# ---------------------------------------------------------------------------
+# QR auto-renewal: Telegram's token is ~30s, the session must outlive it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_qr_renews_repeatedly_and_then_completes(monkeypatch) -> None:
+    """A slow scan (several expiries) must still end in a successful login."""
+    session = QrLoginSession()
+
+    class SlowScanQr:
+        """Expires 3 times, then Telegram reports the 4th token as scanned."""
+
+        def __init__(self) -> None:
+            self.url = "tg://login?t=0"
+            self.expires = None
+            self.expiries = 0
+            self.renewed = 0
+
+        async def wait(self, timeout=None) -> None:
+            if self.expiries >= 3:
+                return  # scanned
+            self.expiries += 1
+            raise TimeoutError()
+
+        async def recreate(self) -> None:
+            self.renewed += 1
+            self.url = f"tg://login?t={self.renewed}"
+
+    client = _client(auth_types.SentCode(type=auth_types.SentCodeTypeApp(5), phone_code_hash="h"))
+    qr = SlowScanQr()
+    client.qr_login = _async_return(qr)
+    monkeypatch.setattr("qna_bot.userbot.login.make_login_client", lambda *a, **k: client)
+
+    try:
+        await session.start(1234, "abc")
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if session.poll().status is LoginStatus.OK:
+                break
+        state = session.poll()
+        assert state.status is LoginStatus.OK
+        assert qr.renewed == 3
+        assert state.refreshes == 3
+        assert state.generation == 4
+        assert state.url == "tg://login?t=3"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_qr_renders_png_and_changes_when_token_changes() -> None:
+    from qna_bot.userbot.login import render_qr_png
+
+    a = render_qr_png("tg://login?token=AAA")
+    b = render_qr_png("tg://login?token=BBB")
+    assert a and b
+    assert a.startswith(b"\x89PNG")
+    assert a != b, "a renewed token must produce a visibly different image"
+
+
+@pytest.mark.asyncio
+async def test_qr_renewal_survives_a_dropped_connection(monkeypatch) -> None:
+    """Render can drop the socket; renewal must reconnect rather than die."""
+    session = QrLoginSession()
+    client = _client(auth_types.SentCode(type=auth_types.SentCodeTypeApp(5), phone_code_hash="h"))
+    connected = {"v": True}
+    client.is_connected = MagicMock(side_effect=lambda: connected["v"])
+
+    fake = _FakeQr(raise_on_wait=TimeoutError())
+    client.qr_login = _async_return(fake)
+    monkeypatch.setattr("qna_bot.userbot.login.make_login_client", lambda *a, **k: client)
+
+    try:
+        await session.start(1234, "abc")
+        connected["v"] = False  # socket dropped before renewal
+        await asyncio.sleep(0.05)
+        assert client.connect.await_count >= 2, "must reconnect before renewing"
+        assert fake.renew_count >= 1
+    finally:
+        await session.close()

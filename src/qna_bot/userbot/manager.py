@@ -21,7 +21,7 @@ from telethon.tl.types import ChannelParticipantsAdmins, PeerChannel, User
 from ..ai.engine import AIEngine, AnswerResult
 from ..ai.providers import PROVIDERS
 from ..storage.database import Database, GroupConfig
-from .filters import should_evaluate_message
+from .filters import describe_reason, should_evaluate_message
 from .login import (
     CodeDelivery,
     LoginResult,
@@ -29,6 +29,7 @@ from .login import (
     PhoneLoginSession,
     QrLoginSession,
     make_login_client,
+    render_qr_png,
     translate_send_error,
 )
 
@@ -58,7 +59,15 @@ class UserbotManager:
         # Fast in-memory runtime caches for sub-millisecond giveaway handling
         self._enabled_groups: dict[int, GroupConfig] = {}
         self._global_enabled: bool = True
-        self._admin_cache: dict[int, tuple[float, set[int]]] = {}
+        # chat_id -> (fetched_at, admin_ids, verified). ``verified`` is False when
+        # Telegram refused/failed to answer; an unverified empty set must never
+        # be treated as "nobody is an admin".
+        self._admin_cache: dict[int, tuple[float, set[int], bool]] = {}
+        # Recent skip reasons, exposed to /diag so silent drops are visible.
+        self._last_decisions: deque[dict[str, object]] = deque(maxlen=40)
+        # Live counters for /diag and /health.
+        self._seen_count = 0
+        self._answered_count = 0
         self._last_reply_ts: dict[int, float] = {}
         self._recent_msg_ids: deque[tuple[int, int]] = deque(maxlen=500)
         self._recent_context: dict[int, deque[str]] = {}
@@ -264,6 +273,31 @@ class UserbotManager:
             return LoginStatus.ERROR, "No QR login in progress."
         return state.status, state.message
 
+    def qr_snapshot(self) -> dict[str, object] | None:
+        """Current QR state for the UI (url, generation counter, seconds left).
+
+        ``generation`` increases every time Telegram's short-lived token is
+        renewed, which tells the wizard its on-screen image is stale.
+        """
+        state = self._qr.poll()
+        if state is None:
+            return None
+        return {
+            "url": state.url,
+            "generation": state.generation,
+            "refreshes": state.refreshes,
+            "seconds_left": state.seconds_left,
+            "status": state.status,
+            "message": state.message,
+        }
+
+    def qr_code(self) -> bytes | None:
+        """Render the *current* token as a PNG, so the image can be swapped in place."""
+        state = self._qr.poll()
+        if state is None:
+            return None
+        return render_qr_png(state.url)
+
     async def submit_qr_2fa(self, password: str) -> LoginResult:
         result = await self._qr.submit_password(password)
         if result.status is LoginStatus.OK:
@@ -391,25 +425,68 @@ class UserbotManager:
         return await self._db.list_groups()
 
     async def refresh_group_admins(self, chat_id: int) -> set[int]:
-        """Fetch and cache admin user IDs for a group to keep giveaway checks O(1)."""
+        """Fetch and cache admin user IDs for a group to keep giveaway checks O(1).
+
+        ``iter_participants(filter=ChannelParticipantsAdmins)`` only works for
+        channels/supergroups, and needs the account to be allowed to list
+        members. It raises for basic groups and for groups where member listing
+        is restricted. Previously that failure was logged at DEBUG (invisible in
+        Render's INFO logs) and returned an empty set, which — combined with the
+        default ``admins`` sender filter — silently dropped *every* message.
+        Now failures are recorded as *unverified* so the caller can fail open.
+        """
         if not self.is_connected or self._client is None:
+            self._cache_admins(chat_id, set(), verified=False)
             return set()
+
         admin_ids: set[int] = set()
+        verified = False
         try:
             async for user in self._client.iter_participants(
                 chat_id, filter=ChannelParticipantsAdmins
             ):
                 if getattr(user, "id", None):
                     admin_ids.add(int(user.id))
-            self._admin_cache[chat_id] = (time.monotonic(), admin_ids)
+            verified = True
         except Exception as exc:
-            logger.debug("Could not fetch admins for chat %s: %s", chat_id, exc)
+            logger.warning(
+                "Could not list admins for chat %s (%s: %s). Admin-only filtering will "
+                "fail open for this group until it can be fetched.",
+                chat_id,
+                type(exc).__name__,
+                exc,
+            )
+            # Retry without the filter for basic groups (Chat), where the
+            # ChannelParticipantsAdmins filter is not valid.
+            try:
+                participants = await self._client.get_participants(chat_id, limit=200)
+                admin_ids = {
+                    int(p.id)
+                    for p in participants
+                    if getattr(p, "id", None) and getattr(p, "participant", None) is not None
+                }
+                verified = bool(admin_ids)
+            except Exception as exc2:
+                logger.debug("Fallback participant fetch failed for %s: %s", chat_id, exc2)
+
+        self._cache_admins(chat_id, admin_ids, verified=verified)
         return admin_ids
+
+    def _cache_admins(self, chat_id: int, admin_ids: set[int], *, verified: bool) -> None:
+        self._admin_cache[chat_id] = (time.monotonic(), admin_ids, verified)
 
     async def _prewarm_admin_caches(self) -> None:
         for chat_id, group in list(self._enabled_groups.items()):
             if group.sender_filter == "admins":
-                await self.refresh_group_admins(chat_id)
+                admins = await self.refresh_group_admins(chat_id)
+                entry = self._admin_cache.get(chat_id)
+                verified = bool(entry and entry[2])
+                logger.info(
+                    "Admin cache for '%s': %d admins (%s)",
+                    group.title,
+                    len(admins),
+                    "verified" if verified else "UNVERIFIED - admin filter will fail open",
+                )
                 await asyncio.sleep(0.2)
 
     async def _is_admin(self, chat_id: int, event: events.NewMessage.Event) -> bool:
@@ -426,16 +503,62 @@ class UserbotManager:
         now = time.monotonic()
         if cached is None or (now - cached[0]) > self.ADMIN_CACHE_TTL:
             admins = await self.refresh_group_admins(chat_id)
+            entry = self._admin_cache.get(chat_id)
+            verified = bool(entry and entry[2])
         else:
             admins = cached[1]
-        return int(sender_id) in admins
+            verified = cached[2]
+
+        if int(sender_id) in admins:
+            return True
+
+        if not verified:
+            # We could not determine who the admins are (basic group, restricted
+            # member list, temporary API error). Refusing the message here is what
+            # made the userbot look completely dead, so fail open and answer.
+            logger.info(
+                "Admin list unavailable for chat %s; allowing message from %s through "
+                "(fail-open).",
+                chat_id,
+                sender_id,
+            )
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Real-Time Group Q&A Handler
     # ------------------------------------------------------------------
 
+    def _record(self, chat_id: int | None, sender_id: int | None, text: str, outcome: str,
+                detail: str = "") -> None:
+        """Keep a short in-memory trail of why a message was or was not answered."""
+        self._last_decisions.append(
+            {
+                "chat_id": chat_id,
+                "sender_id": sender_id,
+                "text": (text or "")[:80],
+                "outcome": outcome,
+                "detail": detail,
+                "at": time.strftime("%H:%M:%S"),
+            }
+        )
+
+    @property
+    def recent_decisions(self) -> list[dict[str, object]]:
+        return list(self._last_decisions)
+
+    @property
+    def counters(self) -> dict[str, int]:
+        return {
+            "messages_seen": self._seen_count,
+            "answers_sent": self._answered_count,
+            "active_groups": len(self._enabled_groups),
+        }
+
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
         if not self._global_enabled:
+            self._record(event.chat_id, event.sender_id, event.raw_text, "skip:global_paused")
             return
         if event.out or event.is_private:
             return
@@ -444,12 +567,22 @@ class UserbotManager:
         if chat_id is None:
             return
 
+        self._seen_count += 1
+
         group = self._enabled_groups.get(int(chat_id))
         if group is None or not group.enabled:
+            self._record(
+                chat_id,
+                event.sender_id,
+                event.raw_text,
+                "skip:group_not_enabled",
+                f"chat not in the enabled list ({len(self._enabled_groups)} enabled)",
+            )
             return
 
         text = (event.raw_text or "").strip()
         if not text:
+            self._record(chat_id, event.sender_id, "", "skip:no_text")
             return
 
         # Keep rolling message context if enabled for this group
@@ -472,10 +605,18 @@ class UserbotManager:
             if not await self._is_admin(int(chat_id), event):
                 if buf is not None:
                     buf.append(text[:200])
+                self._record(
+                    chat_id,
+                    event.sender_id,
+                    text,
+                    "skip:not_admin",
+                    "sender is not an admin and admins WERE verified",
+                )
                 return
         elif group.sender_filter == "humans":
             sender = await event.get_sender()
             if isinstance(sender, User) and sender.bot:
+                self._record(chat_id, event.sender_id, text, "skip:is_bot")
                 return
 
         # Local pre-filter (runs in <0.1ms before any AI call)
@@ -483,12 +624,21 @@ class UserbotManager:
         if not decision.should_process:
             if buf is not None:
                 buf.append(text[:200])
+            self._record(
+                chat_id,
+                event.sender_id,
+                text,
+                "skip:prefilter",
+                f"{decision.reason} -> {describe_reason(decision.reason)} "
+                f"(detection={group.detection_mode})",
+            )
             return
 
         # Per-group cooldown check
         now = time.monotonic()
         last_ts = self._last_reply_ts.get(int(chat_id), 0.0)
         if group.cooldown_seconds > 0 and (now - last_ts) < group.cooldown_seconds:
+            self._record(chat_id, event.sender_id, text, "skip:cooldown")
             return
 
         # Gather optional short context before appending current message
@@ -522,9 +672,17 @@ class UserbotManager:
 
         if result.error:
             logger.warning("AI error in group '%s': %s", group.title, result.error)
+            self._record(chat_id, event.sender_id, text, "skip:ai_error", str(result.error))
             return
 
         if not result.answered or not result.answer:
+            self._record(
+                chat_id,
+                event.sender_id,
+                text,
+                "skip:ai_declined",
+                "the model judged this not to be a question (SKIP)",
+            )
             return
 
         # Optional human-like delay (0ms by default for maximum giveaway speed)
@@ -564,6 +722,15 @@ class UserbotManager:
         except Exception as exc:
             logger.exception("Failed sending reply in %s: %s", group.title, exc)
             return
+
+        self._answered_count += 1
+        self._record(
+            chat_id,
+            event.sender_id,
+            text,
+            "answered",
+            f"{result.provider}/{result.model} in {result.latency_ms}ms",
+        )
 
         # Record log in SQLite
         await self._db.log_answer(

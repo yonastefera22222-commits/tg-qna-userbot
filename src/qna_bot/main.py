@@ -93,6 +93,7 @@ async def async_main() -> None:
             status_provider=lambda: {
                 "userbot_connected": userbot.is_connected,
                 "active_groups": len(userbot._enabled_groups),
+                **userbot.counters,
             },
         )
         await health_server.start()
