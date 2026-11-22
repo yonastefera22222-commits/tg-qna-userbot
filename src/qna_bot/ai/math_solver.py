@@ -13,6 +13,7 @@ import re
 from collections.abc import Callable
 
 from .language import AMHARIC_NUMERAL_CHARS, has_amharic_numerals, parse_amharic_numeral
+from .text_cleanup import prepare_incoming
 
 # Strip common giveaway prefixes/suffixes around math expressions
 _PREFIX_RE = re.compile(
@@ -92,6 +93,9 @@ def _convert_ethiopic_numerals(text: str) -> str:
 
 def _normalize_expression(text: str) -> str:
     expr = text.strip()
+    # Emoji first: "🎯 47 * 83 ✅" and "2️⃣ + 3️⃣" must become plain arithmetic.
+    # Keycap emoji turn back into their digit rather than being deleted.
+    expr = prepare_incoming(expr).strip()
     expr = _AMHARIC_PREFIX_RE.sub("", expr).strip()
     expr = _convert_ethiopic_numerals(expr)
     expr = _PREFIX_RE.sub("", expr).strip()

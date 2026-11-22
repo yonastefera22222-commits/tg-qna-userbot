@@ -27,6 +27,7 @@ from telethon.tl.types import (
 
 from ..ai.engine import AIEngine, AnswerResult
 from ..ai.providers import DEFAULT_SPEED_MODE, PROVIDERS
+from ..ai.text_cleanup import prepare_incoming
 from ..storage.database import Database, GroupConfig
 from .filters import describe_reason, should_evaluate_message
 from .login import (
@@ -703,10 +704,15 @@ class UserbotManager:
 
         text = (event.raw_text or "").strip()
 
+        # Giveaway questions are decorated with emoji and invisible bidi marks.
+        # Normalise before the filter, so "🎯 47 * 83 ✅" is arithmetic rather
+        # than "unparseable text", and send the model the words, not the noise.
+        clean_text = prepare_incoming(text)
+
         # A photo is content too: giveaway questions are often a screenshot or a
         # picture of the question. Only text-less messages with no image are useless.
         has_image = self._message_has_image(event)
-        if not text and not has_image:
+        if not text.strip() and not has_image:
             self._record(chat_id, event.sender_id, "", "skip:no_text")
             return
 
@@ -745,10 +751,10 @@ class UserbotManager:
                 return
 
         # Local pre-filter (runs in <0.1ms before any AI call)
-        decision = should_evaluate_message(text, group, has_image=has_image)
+        decision = should_evaluate_message(clean_text, group, has_image=has_image)
         if not decision.should_process:
             if buf is not None:
-                buf.append(text[:200])
+                buf.append(clean_text[:200])
             self._record(
                 chat_id,
                 event.sender_id,
@@ -769,7 +775,7 @@ class UserbotManager:
         # Gather optional short context before appending current message
         context_lines = list(buf)[-group.context_messages :] if (buf and group.context_messages > 0) else None
         if buf is not None:
-            buf.append(text[:200])
+            buf.append(clean_text[:200])
 
         # Load active AI settings in two queries rather than eight. On every
         # answered message this used to be ~8 serialised SQLite round-trips
@@ -811,7 +817,7 @@ class UserbotManager:
                 return
 
         result: AnswerResult = await self._ai.answer_question(
-            text=text,
+            text=clean_text,
             answer_style=group.answer_style,
             primary_provider=primary_provider,
             primary_model=primary_model,

@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from ..ai.math_solver import try_solve_math
+from ..ai.text_cleanup import has_text_content, strip_emoji
 from ..storage.database import GroupConfig
 
 # Common casual chat messages that are never giveaway questions
@@ -64,6 +65,11 @@ _TRIVIAL_CHAT = frozenset(
 
 _URL_ONLY_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _HAS_ALNUM_RE = re.compile(r"[A-Za-z0-9\u00C0-\u024F\u0400-\u04FF\u0600-\u06FF\u1200-\u137F]")
+
+#: Emoji spam like "🔥🔥🔥" is not a question. Only *emoji* are removed for this
+#: check: stripping all symbols would also drop the ＋ ✕ ⁄ an arithmetic
+#: question is written with, and turn "47 * 83" into plain words.
+_EMOJI_ONLY_SYMBOLS = {".", ",", "!", "?", ";", ":", "'", '"', "-", "_", "*", "~", "`"}
 
 # Question & giveaway trigger patterns
 _QUESTION_WORD_RE = re.compile(
@@ -125,8 +131,12 @@ def should_evaluate_message(
         return FilterDecision(False, "command")
 
     # Ignore pure URLs or emoji-only messages (an image counts as content)
-    if not has_image and (_URL_ONLY_RE.match(cleaned) or not _HAS_ALNUM_RE.search(cleaned)):
+    if not has_image and _URL_ONLY_RE.match(cleaned):
         return FilterDecision(False, "non_text")
+    if not has_image and not has_text_content(cleaned):
+        # Nothing but emoji and punctuation is decoration, never a question.
+        if strip_emoji(cleaned).strip(" \t".join(_EMOJI_ONLY_SYMBOLS)) == "":
+            return FilterDecision(False, "non_text")
 
     if has_image and not getattr(group, "vision_enabled", True):
         return FilterDecision(False, "vision_disabled")

@@ -20,6 +20,7 @@ from .providers import (
     retired_model_replacement,
     vision_model_for,
 )
+from .text_cleanup import collapse_emoji_runs, strip_emoji, strip_leading_emoji
 
 logger = logging.getLogger(__name__)
 
@@ -436,9 +437,13 @@ class AIEngine:
         if not text:
             return None
 
-        # Detect SKIP decision cleanly
+        # Detect SKIP decision cleanly. Models decorate the token ("SKIP 🔥"),
+        # and a decorated SKIP must never be posted into a group as an answer.
         normalized = text.strip(" .!\"'`").upper()
         if normalized == SKIP_TOKEN or normalized.startswith(f"{SKIP_TOKEN}\n"):
+            return None
+        emoji_free = strip_emoji(text).strip(" .!\"'`*“”‘’").upper()
+        if emoji_free == SKIP_TOKEN or emoji_free.startswith(f"{SKIP_TOKEN}\n"):
             return None
 
         if answer_style == "giveaway":
@@ -448,6 +453,8 @@ class AIEngine:
             text = _ANSWER_PREFIX_RE.sub("", text).strip()
             # Amharic answers sometimes lead with their own label.
             text = _AMHARIC_ANSWER_PREFIX_RE.sub("", text).strip()
+            # "🎯 Nairobi" -> "Nairobi"; a whole-emoji answer is left alone.
+            text = strip_leading_emoji(text)
             text = text.strip('"`*“”‘’')
             # ። is the Ethiopic full stop, ፡ the Ethiopic word space.
             for stop in (".", "።"):
@@ -456,7 +463,9 @@ class AIEngine:
                     break
             text = text.rstrip("፡").strip()
 
-        return text or None
+        # A host's answer never has "🔥🔥🔥🔥🔥"; models echo the question's
+        # emoji anyway, so collapse runs for every answer style.
+        return collapse_emoji_runs(text) or None
 
     async def _post_with_speed_fallback(
         self,
