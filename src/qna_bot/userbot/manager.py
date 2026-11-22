@@ -26,7 +26,7 @@ from telethon.tl.types import (
 )
 
 from ..ai.engine import AIEngine, AnswerResult
-from ..ai.providers import PROVIDERS
+from ..ai.providers import DEFAULT_SPEED_MODE, PROVIDERS
 from ..storage.database import Database, GroupConfig
 from .filters import describe_reason, should_evaluate_message
 from .login import (
@@ -51,6 +51,7 @@ class UserbotManager:
     """Manages the connected Telegram user account (Telethon) and real-time Q&A pipeline."""
 
     ADMIN_CACHE_TTL = 600.0  # 10 minutes
+    ADMIN_REFRESH_INTERVAL = 240.0  # refresh in the background every 4 minutes
 
     def __init__(self, db: Database, ai_engine: AIEngine) -> None:
         self._db = db
@@ -70,6 +71,8 @@ class UserbotManager:
         # Telegram refused/failed to answer; an unverified empty set must never
         # be treated as "nobody is an admin".
         self._admin_cache: dict[int, tuple[float, set[int], bool]] = {}
+        self._admin_refreshing: set[int] = set()
+        self._admin_refresher: asyncio.Task | None = None
         # Recent skip reasons, exposed to /diag so silent drops are visible.
         self._last_decisions: deque[dict[str, object]] = deque(maxlen=40)
         # Live counters for /diag and /health.
@@ -150,6 +153,7 @@ class UserbotManager:
             return False
 
     async def stop(self) -> None:
+        await self._stop_admin_refresher()
         await self._login.close()
         await self._qr.close()
         if self._client is not None:
@@ -162,6 +166,7 @@ class UserbotManager:
 
     async def logout(self) -> None:
         """Log out and clear the stored session from SQLite."""
+        await self._stop_admin_refresher()
         await self.cancel_pending_login()
         if self._client is not None:
             try:
@@ -404,8 +409,10 @@ class UserbotManager:
         await self.reload_cache()
         logger.info("Userbot attached and listening as %s (id=%s)", self.account_display, self._me_id)
 
-        # Pre-warm admin caches in the background for enabled groups
+        # Pre-warm admin caches in the background for enabled groups, then keep
+        # them warm off the hot path.
         asyncio.create_task(self._prewarm_admin_caches())
+        self._start_admin_refresher()
 
     # ------------------------------------------------------------------
     # Group Sync & Admin Caching
@@ -479,8 +486,60 @@ class UserbotManager:
         self._cache_admins(chat_id, admin_ids, verified=verified)
         return admin_ids
 
+    async def _refresh_admins_quietly(self, chat_id: int) -> None:
+        """Refresh an admin list in the background, one scan per group at a time."""
+        if chat_id in self._admin_refreshing:
+            return
+        self._admin_refreshing.add(chat_id)
+        try:
+            await self.refresh_group_admins(chat_id)
+        except Exception as exc:  # never let a background task raise
+            logger.debug("Background admin refresh failed for %s: %s", chat_id, exc)
+        finally:
+            self._admin_refreshing.discard(chat_id)
+
     def _cache_admins(self, chat_id: int, admin_ids: set[int], *, verified: bool) -> None:
         self._admin_cache[chat_id] = (time.monotonic(), admin_ids, verified)
+
+    async def _admin_refresher_loop(self) -> None:
+        """Refresh admin lists in the background, one group at a time.
+
+        Previously the *message handler* refreshed the list inline whenever the
+        10-minute TTL expired. That is a full Telegram participant scan - the
+        single slowest thing in the pre-AI path - and because every enabled
+        group expired together, the first question after each window was
+        answered seconds late. Refreshing off the hot path removes that stall.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.ADMIN_REFRESH_INTERVAL)
+                for chat_id, group in list(self._enabled_groups.items()):
+                    if group.sender_filter != "admins":
+                        continue
+                    entry = self._admin_cache.get(chat_id)
+                    if entry is not None and (time.monotonic() - entry[0]) < self.ADMIN_CACHE_TTL / 2:
+                        continue
+                    await self.refresh_group_admins(chat_id)
+                    # Space the scans out so a big group list never hammers the API.
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # keep the responder alive no matter what
+                logger.debug("Admin cache refresher error: %s", exc)
+
+    def _start_admin_refresher(self) -> None:
+        if self._admin_refresher is not None and not self._admin_refresher.done():
+            return
+        self._admin_refresher = asyncio.create_task(self._admin_refresher_loop())
+
+    async def _stop_admin_refresher(self) -> None:
+        task, self._admin_refresher = self._admin_refresher, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def _prewarm_admin_caches(self) -> None:
         for chat_id, group in list(self._enabled_groups.items()):
@@ -508,13 +567,21 @@ class UserbotManager:
 
         cached = self._admin_cache.get(chat_id)
         now = time.monotonic()
-        if cached is None or (now - cached[0]) > self.ADMIN_CACHE_TTL:
-            admins = await self.refresh_group_admins(chat_id)
+        if cached is None:
+            # First sighting of this group: there is nothing to decide with, so
+            # a one-off fetch is unavoidable.
+            await self.refresh_group_admins(chat_id)
             entry = self._admin_cache.get(chat_id)
+            admins = entry[1] if entry else set()
             verified = bool(entry and entry[2])
         else:
             admins = cached[1]
             verified = cached[2]
+            if (now - cached[0]) > self.ADMIN_CACHE_TTL:
+                # Stale list: answer with what we already have and refresh in
+                # the background. Blocking here is what made a giveaway answer
+                # arrive seconds late once every 10 minutes.
+                asyncio.create_task(self._refresh_admins_quietly(chat_id))
 
         if int(sender_id) in admins:
             return True
@@ -704,15 +771,29 @@ class UserbotManager:
         if buf is not None:
             buf.append(text[:200])
 
-        # Load active AI settings
+        # Load active AI settings in two queries rather than eight. On every
+        # answered message this used to be ~8 serialised SQLite round-trips
+        # before the request could even be built.
         provider_keys = await self._db.get_all_provider_keys()
-        primary_provider = str(await self._db.get_setting("primary_provider", "groq"))
+        settings = await self._db.get_settings(
+            (
+                "primary_provider",
+                "primary_model",
+                "fallback_provider",
+                "fallback_model",
+                "ai_temperature",
+                "ai_max_tokens",
+                "ai_speed_mode",
+            )
+        )
+        primary_provider = str(settings.get("primary_provider", "groq"))
         default_model = PROVIDERS.get(primary_provider, PROVIDERS["groq"]).default_model
-        primary_model = str(await self._db.get_setting("primary_model", default_model))
-        fallback_provider = await self._db.get_setting("fallback_provider")
-        fallback_model = await self._db.get_setting("fallback_model")
-        temperature = float(await self._db.get_setting("ai_temperature", 0.1))
-        max_tokens = int(await self._db.get_setting("ai_max_tokens", 120))
+        primary_model = str(settings.get("primary_model", default_model))
+        fallback_provider = settings.get("fallback_provider")
+        fallback_model = settings.get("fallback_model")
+        temperature = float(settings.get("ai_temperature", 0.1))
+        max_tokens = int(settings.get("ai_max_tokens", 120))
+        speed_mode = str(settings.get("ai_speed_mode", DEFAULT_SPEED_MODE))
 
         # Fetch the photo (bounded) only after every cheap gate has passed.
         image_bytes: bytes | None = None
@@ -743,6 +824,7 @@ class UserbotManager:
             max_tokens=max_tokens,
             image=image_bytes,
             image_mime=mime,
+            speed_mode=speed_mode,
         )
 
         if result.error:

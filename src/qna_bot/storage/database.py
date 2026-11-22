@@ -209,6 +209,36 @@ class Database:
     async def set_provider_key(self, provider: str, api_key: str | None) -> None:
         await self.set_setting(f"api_key_{provider}", api_key)
 
+    async def get_settings(self, keys: tuple[str, ...]) -> dict[str, Any]:
+        """Fetch several settings in one query (one await instead of N).
+
+        Every group message used to issue six separate SELECTs before the AI
+        call could even start. Reading them together removes that serialised
+        database round-tripping from the hot path.
+        """
+        if not keys:
+            return {}
+        placeholders = ",".join("?" for _ in keys)
+        cursor = await self.conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})", keys
+        )
+        rows = await cursor.fetchall()
+        found = {row["key"]: row["value"] for row in rows}
+
+        result: dict[str, Any] = {}
+        for key in keys:
+            if key not in found:
+                continue
+            raw_val = found[key]
+            if key in SECRET_SETTING_KEYS:
+                result[key] = self._cipher.decrypt(raw_val)
+                continue
+            try:
+                result[key] = json.loads(raw_val)
+            except (json.JSONDecodeError, TypeError):
+                result[key] = raw_val
+        return result
+
     async def get_all_provider_keys(self) -> dict[str, str]:
         keys: dict[str, str] = {}
         for provider in ("groq", "gemini", "openrouter"):

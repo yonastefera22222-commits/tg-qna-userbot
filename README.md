@@ -35,6 +35,7 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
   - **🧠 Google Gemini** (high accuracy free tier — Flash-Lite / Flash).
   - **🌐 OpenRouter** (`openrouter/free` auto-router + free model catalog).
   - Single-shot classification + answering over persistent HTTP/2 connection pooling + automatic failover on HTTP 429/errors.
+- **🚀 Response Speed Control**: A per-account `⚡ Fastest / ⚖️ Balanced / 🧠 Smart` toggle. Reasoning models think *before* they answer, and both Groq's `gpt-oss` and Gemini 3.x default to **medium** reasoning — that hidden step is the usual cause of a laggy giveaway answer. **Fastest** (the default) turns it off or down to the minimum each model accepts, so the answer arrives in one shot. **Smart** hands the model its full reasoning budget for tricky questions.
 - **📷 Photo Questions (Vision)**: Screenshots and photos are answered like text questions. If your configured model cannot read images, the bot **automatically switches to a vision-capable model just for that message** and switches back afterwards — Groq `gpt-oss` → `qwen/qwen3.8-27b`, and every Gemini Flash model reads images natively. The instant local math solver is bypassed for photos (the arithmetic is *inside* the image).
 - **🧪 Live Q&A Simulator & Speed Benchmark**: Test sample giveaway questions and benchmark your providers right inside the dashboard bot.
 
@@ -125,6 +126,7 @@ docker compose logs -f
 | **Instant Local Math** | `ON` | Solves arithmetic giveaways in `<1ms` locally |
 | **Reply to Question** | `ON` | Replies directly to the host's question message |
 | **📷 Answer Photo Questions** | `ON` | Answers screenshot/photo quizzes — turn **off** to save paid vision credits |
+| **🚀 Response Speed** | `⚡ Fastest` | Turns off the model's hidden reasoning step — the #1 cause of slow answers |
 
 ---
 

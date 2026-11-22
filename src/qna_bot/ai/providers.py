@@ -195,6 +195,63 @@ def vision_model_for(provider: str, model: str) -> str | None:
     return VISION_MODEL.get(provider)
 
 
+#: Reasoning-capable models grouped by the effort vocabulary they accept.
+#: Groq rejects any value outside a model's documented set with a 400, so the
+#: two families cannot share one setting:
+#:   * gpt-oss  -> low | medium | high   (defaults to MEDIUM, i.e. slow)
+#:   * Qwen 3.8 -> none | low | medium | high
+#: Leaving this unset is the single biggest source of "sometimes it lags": the
+#: default is medium, so the model thinks before answering every giveaway.
+GROQ_GRADED_EFFORT_MODELS = ("openai/gpt-oss",)
+GROQ_QWEN_EFFORT_MODELS = ("qwen/qwen3",)
+
+
+def reasoning_effort_for(provider: str, model: str, effort: str) -> str | None:
+    """Map a generic speed/smart effort onto what this model actually accepts.
+
+    Returns ``None`` when the model is not a reasoning model, so callers omit
+    the parameter entirely instead of sending one that would 400.
+    """
+    lowered = (model or "").lower()
+
+    if provider == "groq":
+        if any(tag in lowered for tag in GROQ_GRADED_EFFORT_MODELS):
+            # gpt-oss 400s on "none"; "low" is the fastest value it accepts.
+            return {"fast": "low", "balanced": "medium"}.get(effort, "high")
+        if any(tag in lowered for tag in GROQ_QWEN_EFFORT_MODELS):
+            return "none" if effort == "fast" else ("low" if effort == "balanced" else "high")
+        return None
+
+    if provider == "gemini":
+        # Gemini 3.x thinks dynamically at its default level. Which level is
+        # *legal* varies by model, and an unsupported value is a hard 400:
+        #   * gemini-3.8-flash      -> "minimal" is NOT supported (error)
+        #   * gemini-3.6-flash      -> "minimal" supported
+        #   * *-flash-lite          -> "minimal" is the default
+        #   * gemma / pro           -> no useful "faster" setting
+        # "low" is accepted everywhere in the Flash family, so it is the safe
+        # fallback for any model we do not recognise.
+        if "gemma" in lowered or "pro" in lowered or "thinking" in lowered:
+            return None
+        if "flash" not in lowered:
+            return None
+        if effort == "smart":
+            return None  # leave the model's own default alone
+        if "3.8" in lowered:
+            return "low"  # "minimal" would be rejected outright
+        if "flash-lite" in lowered or "3.6" in lowered:
+            return "minimal" if effort == "fast" else "low"
+        return "low"
+
+    # OpenRouter free routes vary; leave their defaults alone.
+    return None
+
+
+#: How a provider request should be shaped for lowest latency.
+SPEED_MODES = ("fast", "balanced", "smart")
+DEFAULT_SPEED_MODE = "fast"
+
+
 def retired_model_replacement(provider: str, model: str) -> str | None:
     """Return the live replacement for a retired model ID, if we know it."""
     return RETIRED_MODELS.get(provider, {}).get(model)

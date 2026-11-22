@@ -10,7 +10,7 @@ from aiogram.types import CallbackQuery, Message
 
 from ...ai.providers import PROVIDERS, fetch_live_models
 from ..context import AppContext, safe_delete_message, safe_edit_text
-from ..keyboards import ai_menu_kb, model_picker_kb, provider_picker_kb
+from ..keyboards import SPEED_CYCLE, ai_menu_kb, model_picker_kb, provider_picker_kb
 from ..states import DashboardStates
 
 router = Router(name="ai_settings")
@@ -24,6 +24,7 @@ async def _render_ai_menu(target: CallbackQuery | Message, ctx: AppContext) -> N
 
     fb_p = await ctx.db.get_setting("fallback_provider")
     fb_m = await ctx.db.get_setting("fallback_model")
+    speed_mode = str(await ctx.db.get_setting("ai_speed_mode", "fast"))
     fb_line = (
         f"{PROVIDERS[str(fb_p)].emoji} {PROVIDERS[str(fb_p)].name} · <code>{html.escape(str(fb_m))}</code>"
         if (fb_p and fb_m and str(fb_p) in PROVIDERS)
@@ -42,9 +43,12 @@ async def _render_ai_menu(target: CallbackQuery | Message, ctx: AppContext) -> N
         f"🛡 <b>Fallback:</b> {fb_line}\n\n"
         "<b>Configured Providers:</b>\n"
         + "\n".join(configured_lines)
-        + "\n\n💡 <i>Tip: Use Groq as Primary for lowest latency and Gemini as Fallback if you hit rate limits!</i>"
+        + f"\n\n🚀 <b>Response speed:</b> <code>{speed_mode}</code>"
+        "\n<i>Fastest turns off the model's hidden reasoning step — the usual "
+        "cause of a laggy answer. Smart lets it think before replying.</i>"
+        "\n\n💡 <i>Tip: Use Groq as Primary for lowest latency and Gemini as Fallback if you hit rate limits!</i>"
     )
-    kb = ai_menu_kb(has_fallback=bool(fb_p and fb_m))
+    kb = ai_menu_kb(has_fallback=bool(fb_p and fb_m), speed_mode=speed_mode)
     if isinstance(target, CallbackQuery):
         await safe_edit_text(target, text, reply_markup=kb)
     else:
@@ -331,6 +335,19 @@ async def msg_custom_model_update(
 # ----------------------------------------------------------------------
 
 
+@router.callback_query(F.data == "ai:speed")
+async def cb_ai_speed(callback: CallbackQuery, ctx: AppContext) -> None:
+    current = str(await ctx.db.get_setting("ai_speed_mode", "fast"))
+    try:
+        idx = SPEED_CYCLE.index(current)
+    except ValueError:
+        idx = -1
+    new_mode = SPEED_CYCLE[(idx + 1) % len(SPEED_CYCLE)]
+    await ctx.db.set_setting("ai_speed_mode", new_mode)
+    await callback.answer(f"Response speed: {new_mode}")
+    await _render_ai_menu(callback, ctx)
+
+
 @router.callback_query(F.data == "ai:benchmark")
 async def cb_ai_benchmark(callback: CallbackQuery, ctx: AppContext) -> None:
     await callback.answer("Running speed benchmark...")
@@ -345,7 +362,11 @@ async def cb_ai_benchmark(callback: CallbackQuery, ctx: AppContext) -> None:
         await ctx.db.get_setting("primary_model", PROVIDERS[primary_p].default_model)
     )
 
-    lines = ["⚡ <b>Provider Speed Benchmark</b>\n<i>Prompt: 'What is the capital of France?'</i>\n"]
+    speed_mode = str(await ctx.db.get_setting("ai_speed_mode", "fast"))
+    lines = [
+        "⚡ <b>Provider Speed Benchmark</b>\n"
+        f"<i>Prompt: 'What is the capital of France?' · mode: {speed_mode}</i>\n"
+    ]
     for slug, api_key in keys.items():
         spec = PROVIDERS[slug]
         model = primary_m if slug == primary_p else spec.default_model
@@ -365,5 +386,5 @@ async def cb_ai_benchmark(callback: CallbackQuery, ctx: AppContext) -> None:
     await safe_edit_text(
         callback,
         "\n".join(lines),
-        reply_markup=ai_menu_kb(has_fallback=bool(fb_p and fb_m)),
+        reply_markup=ai_menu_kb(has_fallback=bool(fb_p and fb_m), speed_mode=speed_mode),
     )

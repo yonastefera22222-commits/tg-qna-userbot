@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import time
@@ -11,8 +12,10 @@ import httpx
 
 from .math_solver import try_solve_math
 from .providers import (
+    DEFAULT_SPEED_MODE,
     PROVIDERS,
     get_provider_spec,
+    reasoning_effort_for,
     retired_model_replacement,
     vision_model_for,
 )
@@ -20,6 +23,18 @@ from .providers import (
 logger = logging.getLogger(__name__)
 
 SKIP_TOKEN = "SKIP"
+
+#: Reasoning models bill their "thinking" against the completion budget. A
+#: giveaway answer is capped at 48 tokens, which leaves nothing for the model to
+#: think with, so answers came back empty and the bot looked like it had stalled.
+#: Give the thought process room without letting the visible answer grow.
+REASONING_HEADROOM_TOKENS = 256
+
+#: How long a pooled TLS connection survives an idle spell. httpx defaults to
+#: 5s, which is shorter than the gap between giveaway questions, so the next
+#: message after every pause paid a fresh handshake.
+KEEPALIVE_EXPIRY_SECONDS = 120.0
+_GRADED_EFFORTS = ("low", "medium", "high")
 
 #: Provider error bodies that mean "this model ID is gone", never "bad key".
 _MODEL_GONE_MARKERS = (
@@ -56,6 +71,26 @@ def _gemini_parts(prompt: str, image: bytes | None, mime: str) -> list[dict]:
             {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode("ascii")}}
         )
     return parts
+
+
+#: Error bodies that mean our *speed* parameters were rejected, not the request.
+_SPEED_REJECTION_MARKERS = (
+    "reasoning_effort",
+    "thinking_level",
+    "thinkingconfig",
+    "thinkingconfig.thinkinglevel",
+)
+
+
+def _is_speed_rejection(detail: str) -> bool:
+    """True when the API refused because of the reasoning/thinking parameter.
+
+    Model families disagree on the vocabulary ("minimal" vs "low", "none" vs
+    "low"), and an unsupported value is a hard 400. That must cost one retry,
+    never the answer.
+    """
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in _SPEED_REJECTION_MARKERS)
 
 
 def _is_model_not_found(detail: str) -> bool:
@@ -118,7 +153,15 @@ class AIEngine:
             self._client = httpx.AsyncClient(
                 http2=True,
                 timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
-                limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+                limits=httpx.Limits(
+                    max_connections=30,
+                    max_keepalive_connections=15,
+                    # Giveaway questions arrive in bursts separated by quiet
+                    # spells. The default 5s expiry dropped the pooled TLS
+                    # connection after every pause, so the next question paid a
+                    # fresh handshake - the "sometimes it lags" report.
+                    keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
+                ),
             )
 
     async def close(self) -> None:
@@ -148,6 +191,7 @@ class AIEngine:
         max_tokens: int = 120,
         image: bytes | None = None,
         image_mime: str = "image/jpeg",
+        speed_mode: str = DEFAULT_SPEED_MODE,
     ) -> AnswerResult:
         t0 = time.perf_counter()
 
@@ -222,6 +266,7 @@ class AIEngine:
                     max_tokens=effective_max_tokens,
                     image=image,
                     image_mime=image_mime,
+                    speed_mode=speed_mode,
                 )
                 elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
                 cleaned = self._clean_output(raw_text, answer_style)
@@ -265,6 +310,7 @@ class AIEngine:
                             max_tokens=effective_max_tokens,
                             image=image,
                             image_mime=image_mime,
+                            speed_mode=speed_mode,
                         )
                         elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
                         cleaned = self._clean_output(raw_text, answer_style)
@@ -382,6 +428,41 @@ class AIEngine:
 
         return text or None
 
+    async def _post_with_speed_fallback(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict,
+        drop_paths: tuple[str, ...],
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """POST, retrying once without the speed knobs if the API rejects them.
+
+        A rejected ``reasoning_effort``/``thinkingConfig`` must not cost the
+        user an answer, and must not fall through to a slower fallback provider.
+        """
+        resp = await self.client.post(url, headers=headers, json=payload, params=params)
+        if resp.status_code != 400 or not _is_speed_rejection(resp.text):
+            return resp
+
+        retry_payload = copy.deepcopy(payload)
+        for path in drop_paths:
+            node: dict = retry_payload
+            *parents, leaf = path.split(".")
+            try:
+                for key in parents:
+                    node = node[key]
+                node.pop(leaf, None)
+            except (KeyError, TypeError):
+                continue
+
+        logger.info(
+            "Provider rejected the speed parameter (%s); retrying at its default. %s",
+            ", ".join(drop_paths),
+            resp.text[:160],
+        )
+        return await self.client.post(url, headers=headers, json=retry_payload, params=params)
+
     async def _call_provider(
         self,
         *,
@@ -394,8 +475,10 @@ class AIEngine:
         max_tokens: int,
         image: bytes | None = None,
         image_mime: str = "image/jpeg",
+        speed_mode: str = DEFAULT_SPEED_MODE,
     ) -> str:
         spec = get_provider_spec(provider)
+        effort = reasoning_effort_for(provider, model, speed_mode)
 
         if provider in ("groq", "openrouter"):
             headers = {
@@ -415,14 +498,15 @@ class AIEngine:
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }
-            # Disable hidden chain-of-thought reasoning on Qwen3 models on Groq for speed
-            if provider == "groq" and "qwen3" in model.lower():
-                payload["reasoning_effort"] = "none"
+            if effort:
+                payload["reasoning_effort"] = effort
+                if effort in _GRADED_EFFORTS:
+                    # Reasoning is billed as output tokens: without headroom the
+                    # answer gets cut off and comes back empty.
+                    payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
 
-            resp = await self.client.post(
-                f"{spec.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
+            resp = await self._post_with_speed_fallback(
+                f"{spec.base_url}/chat/completions", headers, payload, ("reasoning_effort",)
             )
             resp.raise_for_status()
             data = resp.json()
@@ -441,11 +525,17 @@ class AIEngine:
                     "maxOutputTokens": max_tokens,
                 },
             }
-            resp = await self.client.post(
+            if effort:
+                # Gemini 3.x thinks dynamically at its default level, which is
+                # where multi-second giveaways came from. Levels below "medium"
+                # are pure latency savings for one-word trivia answers.
+                payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": effort}
+            resp = await self._post_with_speed_fallback(
                 url,
+                {"Content-Type": "application/json"},
+                payload,
+                ("generationConfig.thinkingConfig",),
                 params={"key": api_key},
-                headers={"Content-Type": "application/json"},
-                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()
