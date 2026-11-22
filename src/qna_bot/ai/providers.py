@@ -12,6 +12,8 @@ class ModelPreset:
     model_id: str
     label: str
     note: str
+    #: True when the model accepts image input (needed to answer photo questions).
+    supports_vision: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ModelPreset(
                 "qwen/qwen3.8-27b",
                 "Qwen 3.8 27B",
-                "Strong reasoning + multilingual trivia (preview)",
+                "Strong reasoning + reads images (only Groq model with vision)",
+                supports_vision=True,
             ),
             ModelPreset(
                 "openai/gpt-oss-safeguard-20b",
@@ -73,22 +76,26 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ModelPreset(
                 "gemini-3.5-flash-lite",
                 "Gemini 3.5 Flash-Lite",
-                "Highest free daily quota + ultra-fast",
+                "Highest free daily quota + ultra-fast + reads images",
+                supports_vision=True,
             ),
             ModelPreset(
                 "gemini-3.8-flash",
                 "Gemini 3.8 Flash",
-                "Newest Flash model, highest trivia accuracy",
+                "Newest Flash model, highest trivia accuracy + reads images",
+                supports_vision=True,
             ),
             ModelPreset(
                 "gemini-3.6-flash",
                 "Gemini 3.6 Flash",
-                "Stable Flash model on the free tier",
+                "Stable Flash model on the free tier + reads images",
+                supports_vision=True,
             ),
             ModelPreset(
                 "gemini-3.1-flash-lite",
                 "Gemini 3.1 Flash-Lite",
-                "Lightweight & very quick responses",
+                "Lightweight & very quick responses + reads images",
+                supports_vision=True,
             ),
         ),
     ),
@@ -150,6 +157,42 @@ RETIRED_MODELS: dict[str, dict[str, str]] = {
         "gemini-2.5-pro": "gemini-3.8-flash",
     },
 }
+
+
+#: The model to use when an image must be read and the configured model
+#: cannot see. Groq only serves vision through one model; Gemini Flash models
+#: are all multimodal.
+VISION_MODEL: dict[str, str] = {
+    "groq": "qwen/qwen3.8-27b",
+    "gemini": "gemini-3.5-flash-lite",
+}
+
+
+def supports_vision(provider: str, model: str) -> bool:
+    """True when this provider+model pair can accept an image input."""
+    spec = PROVIDERS.get(provider)
+    if spec is None:
+        return False
+    for preset in spec.presets:
+        if preset.model_id == model and preset.supports_vision:
+            return True
+    # Custom/unknown model IDs: trust the provider-level known vision families.
+    if provider == "gemini":
+        lowered = model.lower()
+        return "flash" in lowered or "gemma" in lowered or "pro" in lowered
+    if provider == "groq":
+        return "qwen3.8" in model.lower() or "vision" in model.lower()
+    if provider == "openrouter":
+        # OpenRouter varies by route; let the request try and fall back on error.
+        return True
+    return False
+
+
+def vision_model_for(provider: str, model: str) -> str | None:
+    """Pick a vision-capable model for this provider, preferring the current one."""
+    if supports_vision(provider, model):
+        return model
+    return VISION_MODEL.get(provider)
 
 
 def retired_model_replacement(provider: str, model: str) -> str | None:

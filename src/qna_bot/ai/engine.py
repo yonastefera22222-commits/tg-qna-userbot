@@ -10,7 +10,12 @@ from dataclasses import dataclass
 import httpx
 
 from .math_solver import try_solve_math
-from .providers import PROVIDERS, get_provider_spec, retired_model_replacement
+from .providers import (
+    PROVIDERS,
+    get_provider_spec,
+    retired_model_replacement,
+    vision_model_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +31,31 @@ _MODEL_GONE_MARKERS = (
     "not found",
     "unsupported model",
 )
+
+
+def _user_content(prompt: str, image: bytes | None, mime: str) -> object:
+    """Build an OpenAI-style ``content`` value (string or multimodal parts)."""
+    if not image:
+        return prompt
+    import base64
+
+    encoded = base64.b64encode(image).decode("ascii")
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+    ]
+
+
+def _gemini_parts(prompt: str, image: bytes | None, mime: str) -> list[dict]:
+    """Build Gemini ``parts``, adding inline image data when present."""
+    parts: list[dict] = [{"text": prompt}]
+    if image:
+        import base64
+
+        parts.append(
+            {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode("ascii")}}
+        )
+    return parts
 
 
 def _is_model_not_found(detail: str) -> bool:
@@ -116,11 +146,14 @@ class AIEngine:
         context_lines: list[str] | None = None,
         temperature: float = 0.1,
         max_tokens: int = 120,
+        image: bytes | None = None,
+        image_mime: str = "image/jpeg",
     ) -> AnswerResult:
         t0 = time.perf_counter()
 
-        # 1. Sub-millisecond local math fast-path for giveaway arithmetic
-        if local_math_enabled:
+        # 1. Sub-millisecond local math fast-path for giveaway arithmetic.
+        #    Skipped for photos: the arithmetic is inside the image, not the text.
+        if local_math_enabled and not image:
             math_answer = try_solve_math(text)
             if math_answer is not None:
                 elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
@@ -142,6 +175,24 @@ class AIEngine:
             fb_key = provider_keys.get(fallback_provider)
             if fb_key:
                 attempts.append((fallback_provider, fallback_model, fb_key))
+
+        if image:
+            # A photo question can only be answered by a model that can see it.
+            # Switch each provider to its vision model; drop attempts that cannot.
+            vision_attempts: list[tuple[str, str, str]] = []
+            for prov, mdl, key in attempts:
+                chosen = vision_model_for(prov, mdl)
+                if chosen is None:
+                    logger.warning(
+                        "Skipping %s/%s for an image question: no vision model available",
+                        prov,
+                        mdl,
+                    )
+                    continue
+                if chosen != mdl:
+                    logger.info("Image question: using %s/%s instead of %s", prov, chosen, mdl)
+                vision_attempts.append((prov, chosen, key))
+            attempts = vision_attempts
 
         if not attempts:
             return AnswerResult(
@@ -169,6 +220,8 @@ class AIEngine:
                     user_prompt=user_prompt,
                     temperature=temperature,
                     max_tokens=effective_max_tokens,
+                    image=image,
+                    image_mime=image_mime,
                 )
                 elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
                 cleaned = self._clean_output(raw_text, answer_style)
@@ -210,6 +263,8 @@ class AIEngine:
                             user_prompt=user_prompt,
                             temperature=temperature,
                             max_tokens=effective_max_tokens,
+                            image=image,
+                            image_mime=image_mime,
                         )
                         elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
                         cleaned = self._clean_output(raw_text, answer_style)
@@ -337,6 +392,8 @@ class AIEngine:
         user_prompt: str,
         temperature: float,
         max_tokens: int,
+        image: bytes | None = None,
+        image_mime: str = "image/jpeg",
     ) -> str:
         spec = get_provider_spec(provider)
 
@@ -353,7 +410,7 @@ class AIEngine:
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "user", "content": _user_content(user_prompt, image, image_mime)},
                 ],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -378,7 +435,7 @@ class AIEngine:
             url = f"{spec.base_url}/models/{model}:generateContent"
             payload = {
                 "system_instruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "contents": [{"role": "user", "parts": _gemini_parts(user_prompt, image, image_mime)}],
                 "generationConfig": {
                     "temperature": temperature,
                     "maxOutputTokens": max_tokens,

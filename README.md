@@ -28,12 +28,14 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
     - **Detection Mode**: `🔥 Giveaway Aggressive` / `⚖️ Balanced` / `🔒 Strict (? required)`.
     - **↩️ Reply to Question**: Replies directly to the question message (`event.reply`).
     - **🧮 Instant Local Math Solver**: Solves arithmetic giveaways (`47 * 83`, `15% of 240`, `sqrt(144)`, `(12 + 8) × 5`) in **<1ms** locally with zero API latency!
+    - **📷 Answer Photo Questions**: Answers questions sent as a **picture** — a screenshot of a quiz, a photographed handwritten problem, or an image with a caption. Works even when the photo has **no text at all**. Photos up to **4 MB** are downloaded and passed to a vision model.
     - **⏱ Cooldown**, **⏳ Optional Human Delay**, **🏷 Custom Trigger Keywords**, and **🧠 Context Messages**.
 - **🤖 Multi-Provider Fast & Free AI + Automatic Fallback**:
   - **⚡ Groq** (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`, ~500–1000 tok/s — ideal primary for speed giveaways). Retired model IDs are detected automatically and swapped for the live replacement, so a stale model never looks like a bad API key.
   - **🧠 Google Gemini** (high accuracy free tier — Flash-Lite / Flash).
   - **🌐 OpenRouter** (`openrouter/free` auto-router + free model catalog).
   - Single-shot classification + answering over persistent HTTP/2 connection pooling + automatic failover on HTTP 429/errors.
+- **📷 Photo Questions (Vision)**: Screenshots and photos are answered like text questions. If your configured model cannot read images, the bot **automatically switches to a vision-capable model just for that message** and switches back afterwards — Groq `gpt-oss` → `qwen/qwen3.8-27b`, and every Gemini Flash model reads images natively. The instant local math solver is bypassed for photos (the arithmetic is *inside* the image).
 - **🧪 Live Q&A Simulator & Speed Benchmark**: Test sample giveaway questions and benchmark your providers right inside the dashboard bot.
 
 ---
@@ -122,6 +124,7 @@ docker compose logs -f
 | **Detection Mode** | `🔥 Giveaway Aggressive` | Catches prompts without `?` like `Capital of Kenya` |
 | **Instant Local Math** | `ON` | Solves arithmetic giveaways in `<1ms` locally |
 | **Reply to Question** | `ON` | Replies directly to the host's question message |
+| **📷 Answer Photo Questions** | `ON` | Answers screenshot/photo quizzes — turn **off** to save paid vision credits |
 
 ---
 

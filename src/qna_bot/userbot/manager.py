@@ -16,7 +16,14 @@ from telethon.errors import (
     UserBannedInChannelError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.types import ChannelParticipantsAdmins, PeerChannel, User
+from telethon.tl.types import (
+    ChannelParticipantsAdmins,
+    Document,
+    MessageMediaPhoto,
+    PeerChannel,
+    Photo,
+    User,
+)
 
 from ..ai.engine import AIEngine, AnswerResult
 from ..ai.providers import PROVIDERS
@@ -530,6 +537,53 @@ class UserbotManager:
     # Real-Time Group Q&A Handler
     # ------------------------------------------------------------------
 
+    #: Hard cap so a huge photo can never stall the responder or the AI bill.
+    MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+    @staticmethod
+    def _message_has_image(event: events.NewMessage.Event) -> bool:
+        """True when the message carries a real photo or image document.
+
+        The types are checked explicitly rather than using truthiness: Telegram
+        sets ``photo=None``/``document=None`` for plain text, and a loose check
+        would misclassify text messages as images.
+        """
+        message = getattr(event, "message", None)
+        if message is None:
+            return False
+        if isinstance(getattr(message, "photo", None), MessageMediaPhoto | Photo):
+            return True
+        document = getattr(message, "document", None)
+        if isinstance(document, Document):
+            return str(getattr(document, "mime_type", "") or "").startswith("image/")
+        return False
+
+    async def _download_image(self, event: events.NewMessage.Event) -> tuple[bytes | None, str]:
+        """Download the photo for vision models, rejecting anything too large."""
+        message = getattr(event, "message", None)
+        mime = "image/jpeg"
+        document = getattr(message, "document", None)
+        if isinstance(document, Document) and str(
+            getattr(document, "mime_type", "") or ""
+        ).startswith("image/"):
+            mime = str(document.mime_type)
+        try:
+            size = getattr(getattr(message, "file", None), "size", None)
+            if size and size > self.MAX_IMAGE_BYTES:
+                logger.info("Skipping photo: %d bytes exceeds the size cap", size)
+                return None, mime
+            data = await event.download_media(file=bytes)
+            if not data:
+                return None, mime
+            payload = bytes(data)
+            if len(payload) > self.MAX_IMAGE_BYTES:
+                logger.info("Skipping photo: %d bytes exceeds the size cap", len(payload))
+                return None, mime
+            return payload, mime
+        except Exception as exc:
+            logger.warning("Could not download photo for vision: %s", exc)
+            return None, mime
+
     def _record(self, chat_id: int | None, sender_id: int | None, text: str, outcome: str,
                 detail: str = "") -> None:
         """Keep a short in-memory trail of why a message was or was not answered."""
@@ -581,7 +635,11 @@ class UserbotManager:
             return
 
         text = (event.raw_text or "").strip()
-        if not text:
+
+        # A photo is content too: giveaway questions are often a screenshot or a
+        # picture of the question. Only text-less messages with no image are useless.
+        has_image = self._message_has_image(event)
+        if not text and not has_image:
             self._record(chat_id, event.sender_id, "", "skip:no_text")
             return
 
@@ -620,7 +678,7 @@ class UserbotManager:
                 return
 
         # Local pre-filter (runs in <0.1ms before any AI call)
-        decision = should_evaluate_message(text, group)
+        decision = should_evaluate_message(text, group, has_image=has_image)
         if not decision.should_process:
             if buf is not None:
                 buf.append(text[:200])
@@ -656,6 +714,21 @@ class UserbotManager:
         temperature = float(await self._db.get_setting("ai_temperature", 0.1))
         max_tokens = int(await self._db.get_setting("ai_max_tokens", 120))
 
+        # Fetch the photo (bounded) only after every cheap gate has passed.
+        image_bytes: bytes | None = None
+        mime = "image/jpeg"
+        if has_image:
+            image_bytes, mime = await self._download_image(event)
+            if image_bytes is None:
+                self._record(
+                    chat_id,
+                    event.sender_id,
+                    text,
+                    "skip:image_unavailable",
+                    "could not download or the photo exceeded the size cap",
+                )
+                return
+
         result: AnswerResult = await self._ai.answer_question(
             text=text,
             answer_style=group.answer_style,
@@ -668,6 +741,8 @@ class UserbotManager:
             context_lines=context_lines,
             temperature=temperature,
             max_tokens=max_tokens,
+            image=image_bytes,
+            image_mime=mime,
         )
 
         if result.error:
