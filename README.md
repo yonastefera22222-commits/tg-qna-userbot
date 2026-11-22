@@ -19,7 +19,7 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
 - **☁️ Render Free Tier Ready**:
   - Built-in async HTTP `/health` endpoint binding `0.0.0.0:$PORT` (required by Render Free Web Services).
   - Includes **`render.yaml`** for 1-click Blueprint deployment.
-  - **1-Tap `☁️ Export Render Config (`BOT_STATE_B64`)`** button in the Dashboard Bot so your Telegram login, AI keys, and selected groups survive Render Free's ephemeral disk restarts automatically!
+  - **1-tap `☁️ Backup This Deployment`** button in the Dashboard Bot so your Telegram login, AI keys, and selected groups survive Render Free's ephemeral disk restarts automatically — plus **`🎁 Share Setup With Someone`**, which exports groups and settings only and never your session or API keys.
 - **👥 Interactive Group Selector & Per-Group Giveaway Rules**:
   - Paginated `✅ / ⬜` checklist synced straight from your Telegram account + instant group search.
   - Per-group toggles:
@@ -44,6 +44,8 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
 ---
 
 ## ☁️ Deploying to Render Free Tier (Step-by-Step)
+
+> **Setting up a second account?** See **[SETUP-GUIDE.md](SETUP-GUIDE.md)** for the full walkthrough — separate bot token, separate `OWNER_ID`, what must not be shared between deployments, and a troubleshooting table.
 
 ### Step 1 — Push this repo to your GitHub (`tg-qna-bot`)
 
