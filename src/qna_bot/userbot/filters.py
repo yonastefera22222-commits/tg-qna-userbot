@@ -76,9 +76,21 @@ _QUESTION_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Amharic (Ethiopic script) question and trivia markers. Without these, an
+#: Amharic question has no "?" of its own and was skipped as non-question chat.
+#: ማን who · ምን what · የት where · መቼ when · ለምን why · እንዴት how · ስንት how many ·
+#: የቱ which · ማንኛው which one · ስም name · ዋና ከተማ capital · ሀገር country.
+_AMHARIC_QUESTION_RE = re.compile(
+    r"(?:ማን|ምን|የት|መቼ|ለምን|እንዴት|ስንት|ስንቱ|የቱ|የትኛው|ማንኛው|ማንኛችሁ|"
+    r"ስም|ስሙ|ዋና\s*ከተማ|ዋና\s*ከተማዋ|ሀገር|አገር|ፈጣሪ|ተፈጥሮ|ምርጫ|ትርጉም|"
+    r"ስንተኛ|ስንት\s*ነው|ምን\s*ይባላል|ማን\s*ይባላል|ምን\s*ይሆናል)"
+)
+
 _QUIZ_FORMAT_RE = re.compile(
     r"(?:^q\d*\s*[:.)\-]|^question\s*\d*\s*[:.)\-]|_{2,}|"
-    r"\ba\)\s*.+\bb\)|^\d+\s*[+\-*/×÷^]\s*\d+)",
+    r"\ba\)\s*.+\bb\)|^\d+\s*[+\-*/×÷^]\s*\d+|"
+    # Amharic quiz prefixes: "ጥያቄ 1፦" (question 1:) and "ሀ) ... ለ)" options
+    r"^ጥያቄ\s*[\d፩፪፫፬፭፮፯፰፱፲፳፴፵፶፷፸፹፺፻፼]*\s*[:፦.\-]|\bሀ\)\s*.+\bለ\))",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -141,8 +153,10 @@ def should_evaluate_message(
     if stripped_punct in _TRIVIAL_CHAT:
         return FilterDecision(False, "trivial_chat")
 
-    has_question_mark = "?" in cleaned
-    has_q_word = bool(_QUESTION_WORD_RE.search(cleaned))
+    has_question_mark = "?" in cleaned or "፧" in cleaned  # ፧ is the Amharic question mark
+    has_q_word = bool(_QUESTION_WORD_RE.search(cleaned)) or bool(
+        _AMHARIC_QUESTION_RE.search(cleaned)
+    )
     has_quiz_fmt = bool(_QUIZ_FORMAT_RE.search(cleaned))
 
     mode = group.detection_mode
@@ -193,6 +207,7 @@ REASON_TEXT: dict[str, str] = {
     "too_short_non_question": "it is too short and not a question (aggressive mode)",
     "image_only": "it is a photo (no caption) and photo answers are enabled",
     "vision_disabled": "it is a photo but photo answers are disabled for this group",
+    "amharic_question": "it is an Amharic question (Ethiopic script marker found)",
 }
 
 

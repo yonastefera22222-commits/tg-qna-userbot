@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
 from .math_solver import try_solve_math
 from .providers import (
     DEFAULT_SPEED_MODE,
@@ -125,6 +126,9 @@ _SYSTEM_PROMPTS: dict[str, str] = {
 }
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+#: Amharic answer labels: "መልስ፦" / "መልሱ፦" / "መልስ -" (answer:) at the start.
+_AMHARIC_ANSWER_PREFIX_RE = re.compile(r"^(?:መልሱ|መልስ|መልስህ)\s*[:፦\-–]\s*")
 _ANSWER_PREFIX_RE = re.compile(
     r"^(?:answer\s*[:\-]\s*|the\s+answer\s+is\s*[:\-]?\s*)",
     re.IGNORECASE,
@@ -140,6 +144,8 @@ class AnswerResult:
     latency_ms: int
     used_fallback: bool = False
     error: str | None = None
+    #: "am" when the question was Amharic, "en" otherwise. Drives /diag output.
+    language: str = "en"
 
 
 class AIEngine:
@@ -198,6 +204,7 @@ class AIEngine:
         # 1. Sub-millisecond local math fast-path for giveaway arithmetic.
         #    Skipped for photos: the arithmetic is inside the image, not the text.
         if local_math_enabled and not image:
+            # numeral_style="auto" answers ፵፫ questions with ፺፭ instead of 95.
             math_answer = try_solve_math(text)
             if math_answer is not None:
                 elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
@@ -207,6 +214,7 @@ class AIEngine:
                     provider="local_math",
                     model="ast-instant",
                     latency_ms=elapsed_ms,
+                    language=detect_language(text),
                 )
 
         # Build provider attempt list (primary + optional fallback)
@@ -248,7 +256,7 @@ class AIEngine:
                 error="No API key configured for the selected AI provider.",
             )
 
-        system_prompt = _SYSTEM_PROMPTS.get(answer_style, _SYSTEM_PROMPTS["giveaway"])
+        system_prompt = self._build_system_prompt(answer_style, text)
         user_prompt = self._build_user_prompt(text, context_lines)
         effective_max_tokens = min(max_tokens, 48) if answer_style == "giveaway" else max_tokens
 
@@ -286,6 +294,7 @@ class AIEngine:
                     model=model,
                     latency_ms=elapsed_ms,
                     used_fallback=idx > 0,
+                    language=detect_language(text),
                 )
             except Exception as exc:
                 last_error = f"{provider}/{model}: {exc}"
@@ -322,6 +331,7 @@ class AIEngine:
                                 model=replacement,
                                 latency_ms=elapsed_ms,
                                 used_fallback=idx > 0,
+                                language=detect_language(text),
                             )
                     except Exception as retry_exc:
                         last_error = f"{provider}/{replacement}: {retry_exc}"
@@ -400,6 +410,20 @@ class AIEngine:
             return False, elapsed_ms, str(exc)
 
     @staticmethod
+    def _build_system_prompt(answer_style: str, text: str) -> str:
+        """Base prompt + language rules.
+
+        The always-on rule is a constant so the provider's prompt cache keeps
+        hitting; only genuinely Amharic questions add a second block.
+        """
+        base = _SYSTEM_PROMPTS.get(answer_style, _SYSTEM_PROMPTS["giveaway"])
+        prompt = f"{base}\n{ANSWER_IN_LANGUAGE_INSTRUCTION}"
+        guidance = prompt_guidance(text)
+        if guidance:
+            prompt = f"{prompt}\n{guidance}"
+        return prompt
+
+    @staticmethod
     def _build_user_prompt(text: str, context_lines: list[str] | None) -> str:
         if not context_lines:
             return text.strip()
@@ -422,9 +446,15 @@ class AIEngine:
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             text = lines[0] if lines else text
             text = _ANSWER_PREFIX_RE.sub("", text).strip()
-            text = text.strip('"`*')
-            if text.endswith(".") and len(text) < 60 and "..." not in text:
-                text = text[:-1].strip()
+            # Amharic answers sometimes lead with their own label.
+            text = _AMHARIC_ANSWER_PREFIX_RE.sub("", text).strip()
+            text = text.strip('"`*“”‘’')
+            # ። is the Ethiopic full stop, ፡ the Ethiopic word space.
+            for stop in (".", "።"):
+                if text.endswith(stop) and len(text) < 60 and "..." not in text:
+                    text = text[:-1].strip()
+                    break
+            text = text.rstrip("፡").strip()
 
         return text or None
 
