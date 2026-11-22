@@ -32,32 +32,31 @@ PROVIDERS: dict[str, ProviderSpec] = {
         emoji="⚡",
         signup_url="https://console.groq.com/keys",
         base_url="https://api.groq.com/openai/v1",
-        default_model="llama-3.3-70b-versatile",
+        # Groq retired every Llama model from the free/developer tiers on
+        # 2026-08-16 (llama-3.3-70b-versatile and llama-3.1-8b-instant are now
+        # Enterprise-only), and shut down Llama 4 Scout and Qwen3 32B on
+        # 2026-07-17. The free plan today is gpt-oss + Qwen3.8.
+        default_model="openai/gpt-oss-120b",
         presets=(
             ModelPreset(
-                "llama-3.3-70b-versatile",
-                "Llama 3.3 70B Versatile",
-                "Best accuracy + ~300 tok/s (Recommended)",
-            ),
-            ModelPreset(
-                "llama-3.1-8b-instant",
-                "Llama 3.1 8B Instant",
-                "Ultra-fast ~800+ tok/s for speed giveaways",
-            ),
-            ModelPreset(
-                "meta-llama/llama-4-scout-17b-16e-instruct",
-                "Llama 4 Scout 17B",
-                "Very fast MoE model with strong trivia accuracy",
-            ),
-            ModelPreset(
-                "qwen/qwen3-32b",
-                "Qwen 3 32B",
-                "Strong reasoning & multilingual Q&A",
+                "openai/gpt-oss-120b",
+                "GPT-OSS 120B",
+                "Groq's flagship free model — best accuracy, ~500 tok/s (Recommended)",
             ),
             ModelPreset(
                 "openai/gpt-oss-20b",
                 "GPT-OSS 20B",
-                "Blazing speed on Groq LPUs",
+                "Fastest free model (~1000 tok/s) — ideal for speed giveaways",
+            ),
+            ModelPreset(
+                "qwen/qwen3.8-27b",
+                "Qwen 3.8 27B",
+                "Strong reasoning + multilingual trivia (preview)",
+            ),
+            ModelPreset(
+                "openai/gpt-oss-safeguard-20b",
+                "GPT-OSS Safeguard 20B",
+                "Free preview; fallback if the others are rate-limited",
             ),
         ),
     ),
@@ -67,6 +66,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         emoji="🧠",
         signup_url="https://aistudio.google.com/apikey",
         base_url="https://generativelanguage.googleapis.com/v1beta",
+        # Free-tier Flash / Flash-Lite IDs as of late 2026. 2.0 Flash was shut
+        # down on 2026-06-01 and 2.5 access is restricted to older projects.
         default_model="gemini-3.5-flash-lite",
         presets=(
             ModelPreset(
@@ -82,7 +83,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ModelPreset(
                 "gemini-3.6-flash",
                 "Gemini 3.6 Flash",
-                "Stable Flash model on free tier",
+                "Stable Flash model on the free tier",
             ),
             ModelPreset(
                 "gemini-3.1-flash-lite",
@@ -127,6 +128,33 @@ PROVIDERS: dict[str, ProviderSpec] = {
         ),
     ),
 }
+
+
+#: Models that providers have retired. Used to explain a ``model_not_found``
+#: error as "our default moved on" instead of blaming the owner's API key.
+RETIRED_MODELS: dict[str, dict[str, str]] = {
+    "groq": {
+        "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+        "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+        "meta-llama/llama-4-scout-17b-16e-instruct": "openai/gpt-oss-120b",
+        "qwen/qwen3-32b": "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b": "qwen/qwen3.8-27b",
+        "llama3-70b-8192": "openai/gpt-oss-120b",
+        "llama3-8b-8192": "openai/gpt-oss-20b",
+        "deepseek-r1-distill-llama-70b": "openai/gpt-oss-120b",
+    },
+    "gemini": {
+        "gemini-2.0-flash": "gemini-3.5-flash-lite",
+        "gemini-2.0-flash-lite": "gemini-3.1-flash-lite",
+        "gemini-2.5-flash": "gemini-3.5-flash-lite",
+        "gemini-2.5-pro": "gemini-3.8-flash",
+    },
+}
+
+
+def retired_model_replacement(provider: str, model: str) -> str | None:
+    """Return the live replacement for a retired model ID, if we know it."""
+    return RETIRED_MODELS.get(provider, {}).get(model)
 
 
 def get_provider_spec(slug: str) -> ProviderSpec:

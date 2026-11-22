@@ -28,7 +28,7 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
     - **🧮 Instant Local Math Solver**: Solves arithmetic giveaways (`47 * 83`, `15% of 240`, `sqrt(144)`, `(12 + 8) × 5`) in **<1ms** locally with zero API latency!
     - **⏱ Cooldown**, **⏳ Optional Human Delay**, **🏷 Custom Trigger Keywords**, and **🧠 Context Messages**.
 - **🤖 Multi-Provider Fast & Free AI + Automatic Fallback**:
-  - **⚡ Groq** (fastest free inference ~200–400ms — ideal primary for speed giveaways).
+  - **⚡ Groq** (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`, ~500–1000 tok/s — ideal primary for speed giveaways). Retired model IDs are detected automatically and swapped for the live replacement, so a stale model never looks like a bad API key.
   - **🧠 Google Gemini** (high accuracy free tier — Flash-Lite / Flash).
   - **🌐 OpenRouter** (`openrouter/free` auto-router + free model catalog).
   - Single-shot classification + answering over persistent HTTP/2 connection pooling + automatic failover on HTTP 429/errors.
@@ -113,7 +113,7 @@ docker compose logs -f
 
 | Setting | Recommended Value | Why |
 |---|---|---|
-| **Primary AI** | Groq · `llama-3.3-70b-versatile` (or `llama-3.1-8b-instant`) | Lowest latency (~200–400ms) |
+| **Primary AI** | Groq · `openai/gpt-oss-120b` (or `openai/gpt-oss-20b`) | Groq's live free models — Llama was retired from the free tier on 2026-08-16 |
 | **Fallback AI** | Google Gemini · `gemini-3.5-flash-lite` | Auto-failover if Groq hits free RPM limits |
 | **Who Triggers** | `👑 Admins Only` *(or `🌐 Everyone (+Bots)` if a bot asks)* | Stops other participants from baiting your account |
 | **Answer Style** | `⚡ Giveaway (Ultra-Short)` | Bare exact answers (`Paris`, `42`) with zero fluff |

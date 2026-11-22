@@ -834,29 +834,48 @@ async def msg_wiz_ai_key(message: Message, ctx: AppContext, state: FSMContext) -
 
     testing_msg = await message.answer(f"⚡ Testing {spec.name} API key & measuring speed...")
     ok, latency_ms, detail = await ctx.ai.test_connection(provider, spec.default_model, api_key)
+
+    # The engine may have recovered from a retired model ID; use whatever worked.
+    chosen_model = spec.default_model
+    fallback_note = ""
+    if "__MODEL_FALLBACK__:" in detail:
+        detail, _, fallback = detail.partition("\n__MODEL_FALLBACK__:")
+        old_model, _, new_model = fallback.partition("->")
+        chosen_model = new_model or chosen_model
+        fallback_note = (
+            f"\n\nℹ️ <i><code>{html.escape(old_model)}</code> was retired by "
+            f"{spec.name}; automatically switched to "
+            f"<code>{html.escape(chosen_model)}</code>.</i>"
+        )
+
     if not ok:
         await testing_msg.edit_text(
             f"❌ <b>{spec.name} key test failed</b> ({latency_ms}ms):\n"
             f"<code>{html.escape(detail)}</code>\n\n"
-            "Please paste a valid API key (or send /setup to pick another provider):"
+            "This usually means the <b>key itself</b> is wrong, expired, or lacks access.\n"
+            "• Check the key was copied completely (no spaces)\n"
+            "• Make a fresh key at "
+            f"<a href='{spec.signup_url}'>{spec.signup_url}</a>\n"
+            "• Or send /setup to pick another provider",
         )
         return
 
     await ctx.db.set_provider_key(provider, api_key)
     await ctx.db.set_setting("primary_provider", provider)
-    await ctx.db.set_setting("primary_model", spec.default_model)
+    await ctx.db.set_setting("primary_model", chosen_model)
     await state.set_state(None)
 
     kb, model_ids = model_picker_kb(
         provider=provider,
         prefix="wiz_m",
-        active_model=spec.default_model,
+        active_model=chosen_model,
         back_cb="wiz:ai_step",
     )
     await state.update_data(wiz_model_choices=model_ids, wiz_provider=provider)
     await testing_msg.edit_text(
         f"✅ <b>{spec.name} connected!</b>\n"
-        f"⚡ Test answer: <code>{html.escape(detail)}</code> in <b>{latency_ms}ms</b>\n\n"
+        f"⚡ Test answer: <code>{html.escape(detail)}</code> in <b>{latency_ms}ms</b>\n"
+        f"🧠 Model: <code>{html.escape(chosen_model)}</code>{fallback_note}\n\n"
         "Choose a model (or keep the recommended default):",
         reply_markup=kb,
     )
