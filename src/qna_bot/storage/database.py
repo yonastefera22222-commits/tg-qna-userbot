@@ -24,6 +24,11 @@ SECRET_SETTING_KEYS = frozenset(
     }
 )
 
+#: Settings that must never be copied into the portable BOT_STATE_B64 snapshot.
+#: ``tg_pending_login`` records an in-progress phone login so a restart mid-login
+#: can be detected; it is worthless after the process dies and stays out of exports.
+EPHEMERAL_SETTING_KEYS = frozenset({"tg_pending_login"})
+
 
 @dataclass
 class GroupConfig:
@@ -385,6 +390,8 @@ class Database:
         settings_dump: dict[str, Any] = {}
         for row in rows:
             key = str(row["key"])
+            if key in EPHEMERAL_SETTING_KEYS:
+                continue
             settings_dump[key] = await self.get_setting(key)
 
         enabled_groups = await self.list_groups(only_enabled=True)

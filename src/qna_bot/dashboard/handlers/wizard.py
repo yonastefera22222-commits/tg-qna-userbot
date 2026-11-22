@@ -7,9 +7,10 @@ import html
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ...ai.providers import PROVIDERS, fetch_live_models
+from ...userbot.login import CodeDelivery, LoginStatus
 from ..context import AppContext, safe_delete_message, safe_edit_text
 from ..keyboards import (
     groups_list_kb,
@@ -25,16 +26,42 @@ from ..states import WizardStates
 router = Router(name="wizard")
 
 
-def _otp_prompt_text(phone: str, digits: str, note: str | None = None) -> str:
-    masked = " ".join(digits) if digits else "— — — — —"
-    extra = f"\n\n⚠️ {html.escape(note)}" if note else ""
+def _otp_prompt_text(
+    phone: str,
+    digits: str,
+    note: str | None = None,
+    delivery: CodeDelivery | None = None,
+) -> str:
+    """Render the code-entry prompt, stating exactly where Telegram put the code.
+
+    The old prompt always claimed "sent via Telegram", which left owners who got
+    an SMS/email/call (or an in-app confirmation prompt) waiting for a message
+    that was never going to arrive.
+    """
+    if digits:
+        masked = " ".join(digits)
+    else:
+        slots = (delivery.length or 5) if delivery is not None else 5
+        masked = " ".join("—" for _ in range(slots))
+
+    if delivery is not None:
+        where = f"<b>{delivery.title}</b>\n{delivery.detail}"
+        if delivery.length:
+            where += f"\n\n🔢 The code has <b>{delivery.length} digits</b>."
+    else:
+        where = (
+            "Telegram accepted the request. Depending on your account the code is delivered as a "
+            "<b>service message inside the Telegram app</b>, by <b>SMS</b>, or by <b>call</b>."
+        )
+
+    extra = f"\n\n⚠️ {note}" if note else ""
     return (
         "<b>Step 2 / 4 — Enter Telegram Login Code</b>\n\n"
-        f"A login code was sent to <code>{html.escape(phone)}</code> via Telegram.\n\n"
+        f"📞 Number: <code>{html.escape(phone)}</code>\n\n"
+        f"📨 {where}\n\n"
         f"🔢 <b>Entered code:</b> <code>{masked}</code>\n\n"
-        "💡 <i>Tap the keypad buttons below to enter your code!</i>\n"
-        "<i>(Using buttons prevents Telegram from invalidating a code pasted in chat. "
-        "If you prefer typing, add spaces between digits like <code>1 2 3 4 5</code>.)</i>"
+        "💡 <i>Tap the keypad buttons below to enter your code.</i>\n"
+        "<i>(Type digits spaced like <code>1 2 3 4 5</code> if you prefer.)</i>"
         f"{extra}"
     )
 
@@ -250,8 +277,14 @@ async def cb_login_phone(callback: CallbackQuery, state: FSMContext) -> None:
     await safe_edit_text(
         callback,
         "<b>Step 2 / 4 — Phone Number</b>\n\n"
-        "📥 Send your Telegram phone number in international format\n"
-        "(example: <code>+251912345678</code> or <code>+15551234567</code>):",
+        "📥 Send your Telegram phone number in <b>international format</b> "
+        "(country code, <u>no</u> leading 0):\n"
+        "• ✅ <code>+251912345678</code>\n"
+        "• ✅ <code>+15551234567</code>\n"
+        "• ❌ <code>0912345678</code> (missing country code)\n\n"
+        "ℹ️ <i>Telegram usually delivers the login code as a message inside the "
+        "Telegram app for this number, not by SMS. I will tell you exactly where "
+        "it went after you send the number.</i>",
     )
 
 
@@ -269,18 +302,92 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
 
     status_msg = await message.answer("📡 Requesting login code from Telegram...")
     res = await ctx.userbot.start_phone_login(int(api_id), str(api_hash), phone)
-    if res.status != "code_sent":
+    if res.status is not LoginStatus.CODE_SENT:
+        # Show Telegram's real reason (flood wait, bad number, bad API hash, ...)
+        # and offer a retry button instead of dumping the user back to Step 1.
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔁 Try Again", callback_data="wiz:login_phone")],
+                [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+            ]
+        )
         await status_msg.edit_text(
-            f"❌ {html.escape(res.message)}\n\nPlease send your phone number again:"
+            f"{res.message}\n\n<i>Tap 🔁 Try Again and re-send your number.</i>",
+            reply_markup=cancel_kb,
         )
         return
 
-    await state.update_data(phone=phone, otp_digits="")
+    delivery = res.delivery or ctx.userbot.last_code_delivery
+    # Show the normalised E.164 number Telegram actually used (e.g. "+2519...").
+    display_phone = ctx.userbot.pending_phone or phone
+    await state.update_data(phone=display_phone, otp_digits="")
     await state.set_state(WizardStates.waiting_otp)
     await status_msg.edit_text(
-        _otp_prompt_text(phone, ""),
+        _otp_prompt_text(display_phone, "", delivery=delivery),
         reply_markup=otp_keypad_kb(""),
     )
+
+
+async def _show_no_code_help(
+    callback: CallbackQuery,
+    ctx: AppContext,
+    state: FSMContext,
+) -> None:
+    """Troubleshooting checklist for "I did not get any Telegram code".
+
+    This is the exact complaint the wizard used to be unable to answer: it kept
+    saying "code sent via Telegram" while Telegram had actually delivered it
+    somewhere else (or blocked delivery entirely).
+    """
+    data = await state.get_data()
+    phone = str(data.get("phone", "")) or (ctx.userbot.pending_phone or "")
+    delivery = ctx.userbot.last_code_delivery
+
+    if delivery is not None:
+        where = f"📨 <b>Telegram says the code went to:</b> {delivery.title}\n{delivery.detail}"
+    else:
+        where = (
+            "ℹ️ No login request is active right now. Send your phone number again "
+            "first (or tap ⬅️ Login Options)."
+        )
+
+    text = (
+        "❓ <b>No code received — checklist</b>\n\n"
+        f"📞 Number used: <code>{html.escape(phone) or '—'}</code>\n\n"
+        f"{where}\n\n"
+        "<b>1. Check inside Telegram first (most common)</b>\n"
+        "Telegram sends login codes as a <b>service message from “Telegram”</b> "
+        "(blue shield ✓) at the very top of your chat list — <b>not</b> by SMS. "
+        "Open the Telegram app on the device that already has this number and look for it, "
+        "or for a “Confirm login” / “Yes, it's me” button.\n\n"
+        "<b>2. Check SMS and email</b>\n"
+        "Look in your SMS app (including spam/blocked) and your login email inbox.\n\n"
+        "<b>3. Make sure the number is right</b>\n"
+        "Use international format with the country code and <u>no</u> leading 0: "
+        "<code>+251912345678</code>.\n\n"
+        "<b>4. Try another delivery channel</b>\n"
+        "Tap 🔄 <b>Resend Code</b> — Telegram then switches channel "
+        "(app message → SMS → call). Telegram may also offer a voice call.\n\n"
+        "<b>5. Wait out the rate limit</b>\n"
+        "Repeated requests trigger Telegram's flood limit, after which <b>no</b> code is "
+        "sent for a while. If you see a wait time, stop retrying for that long.\n\n"
+        "<b>6. Check the server can reach Telegram</b>\n"
+        "On Render Free Tier the service sleeps after 15 minutes idle. If the request "
+        "timed out, the code may never have been sent — use an uptime monitor on "
+        "<code>/health</code>, then try again."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Resend Code", callback_data="otp:resend")],
+            [
+                InlineKeyboardButton(
+                    text="🔁 Change Phone Number", callback_data="wiz:login_phone"
+                ),
+                InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method"),
+            ],
+        ]
+    )
+    await safe_edit_text(callback, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("otp:"))
@@ -289,56 +396,80 @@ async def cb_otp_keypad(callback: CallbackQuery, ctx: AppContext, state: FSMCont
     action = parts[1] if len(parts) > 1 else ""
     data = await state.get_data()
     digits = str(data.get("otp_digits", ""))
-    phone = str(data.get("phone", ""))
+    phone = str(data.get("phone", "")) or (ctx.userbot.pending_phone or "")
+    delivery = ctx.userbot.last_code_delivery
+    max_digits = delivery.length if (delivery and delivery.length) else 7
 
-    if action == "d" and len(parts) == 3:
-        if len(digits) < 8:
-            digits += parts[2]
-            await state.update_data(otp_digits=digits)
-        await callback.answer()
+    async def _rerender(note: str | None = None) -> None:
         await safe_edit_text(
             callback,
-            _otp_prompt_text(phone, digits),
+            _otp_prompt_text(phone, digits, note=note, delivery=delivery),
             reply_markup=otp_keypad_kb(digits),
         )
+
+    if action == "d" and len(parts) == 3:
+        if len(digits) >= max_digits:
+            await callback.answer(
+                f"Code length reached ({max_digits} digits). Tap ✅ Submit.",
+                show_alert=True,
+            )
+            return
+        digits += parts[2]
+        await state.update_data(otp_digits=digits)
+        await callback.answer()
+        await _rerender()
         return
 
     if action == "back":
         digits = digits[:-1]
         await state.update_data(otp_digits=digits)
         await callback.answer()
-        await safe_edit_text(
-            callback,
-            _otp_prompt_text(phone, digits),
-            reply_markup=otp_keypad_kb(digits),
-        )
+        await _rerender()
         return
 
     if action == "clear":
         await state.update_data(otp_digits="")
+        digits = ""
         await callback.answer("Cleared")
-        await safe_edit_text(
-            callback,
-            _otp_prompt_text(phone, ""),
-            reply_markup=otp_keypad_kb(""),
-        )
+        await _rerender()
+        return
+
+    if action == "help":
+        await callback.answer()
+        await _show_no_code_help(callback, ctx, state)
         return
 
     if action == "resend":
-        await callback.answer("Resending code...")
-        res = await ctx.userbot.resend_phone_code()
-        await state.update_data(otp_digits="")
-        note = res.message if res.status != "code_sent" else "Fresh code sent!"
         await safe_edit_text(
             callback,
-            _otp_prompt_text(phone, "", note=note),
+            _otp_prompt_text(phone, "", note="Requesting a fresh code from Telegram...", delivery=delivery),
             reply_markup=otp_keypad_kb(""),
         )
+        await callback.answer("Requesting new code...")
+        res = await ctx.userbot.resend_phone_code()
+        await state.update_data(otp_digits="")
+        if res.status is LoginStatus.CODE_SENT:
+            delivery = res.delivery or delivery
+            await safe_edit_text(
+                callback,
+                _otp_prompt_text(phone, "", delivery=delivery),
+                reply_markup=otp_keypad_kb(""),
+            )
+        else:
+            # Resend failed (flood wait, dead attempt, ...): explain and let the
+            # owner start the phone step over without hunting for /start.
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔁 Re-enter Phone Number", callback_data="wiz:login_phone")],
+                    [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+                ]
+            )
+            await safe_edit_text(callback, f"{res.message}", reply_markup=kb)
         return
 
     if action == "submit":
-        if len(digits) < 4:
-            await callback.answer("Enter all digits first!", show_alert=True)
+        if not digits:
+            await callback.answer("Enter the code first!", show_alert=True)
             return
         await callback.answer("Verifying code...")
         await _process_otp_submission(callback, ctx, state, digits)
@@ -350,8 +481,11 @@ async def msg_otp_fallback(message: Message, ctx: AppContext, state: FSMContext)
     raw = (message.text or "").strip()
     await safe_delete_message(message)
     digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) < 4:
-        await message.answer("⚠️ Please tap the keypad buttons above (or type digits separated by spaces).")
+    if not digits:
+        await message.answer(
+            "⚠️ Please tap the keypad buttons on the message above, or type the digits "
+            "separated by spaces (e.g. <code>1 2 3 4 5</code>)."
+        )
         return
     await _process_otp_submission(message, ctx, state, digits)
 
@@ -363,21 +497,30 @@ async def _process_otp_submission(
     digits: str,
 ) -> None:
     res = await ctx.userbot.submit_otp_code(digits)
-    if res.status == "ok":
-        await state.set_state(None)
+    data = await state.get_data()
+    phone = str(data.get("phone", "")) or (ctx.userbot.pending_phone or "")
+    delivery = ctx.userbot.last_code_delivery
+
+    if res.status is LoginStatus.OK:
+        await state.clear()
         if isinstance(target, CallbackQuery):
             await safe_edit_text(target, f"🎉 <b>{html.escape(res.message)}</b>")
+            inner = target.message
         else:
             await target.answer(f"🎉 <b>{html.escape(res.message)}</b>")
-        await _show_ai_step(target if isinstance(target, Message) else target.message, ctx, state)  # type: ignore[arg-type]
+            inner = target
+        if inner is not None:
+            await _show_ai_step(inner, ctx, state)
         return
 
-    if res.status == "2fa_required":
+    if res.status is LoginStatus.TWO_FA_REQUIRED:
         await state.set_state(WizardStates.waiting_2fa)
         msg_text = (
             "🔐 <b>Two-Step Verification (2FA) Required</b>\n\n"
-            "📥 Please send your Telegram 2FA cloud password.\n"
-            "<i>(Your message will be deleted immediately after reading.)</i>"
+            "The login code was accepted — your account also has a Telegram "
+            "<b>cloud password</b>.\n\n"
+            "📥 Send that 2FA password now.\n"
+            "<i>(Your message is deleted immediately after it is read.)</i>"
         )
         if isinstance(target, CallbackQuery):
             await safe_edit_text(target, msg_text)
@@ -385,11 +528,12 @@ async def _process_otp_submission(
             await target.answer(msg_text)
         return
 
-    # Error -> reset digits and let user retry
-    data = await state.get_data()
-    phone = str(data.get("phone", ""))
+    # Error -> show Telegram's real reason, keep the login session alive for a retry
     await state.update_data(otp_digits="")
-    err_prompt = _otp_prompt_text(phone, "", note=res.message)
+    err_prompt = _otp_prompt_text(phone, "", note=res.message, delivery=delivery)
+    if res.retry_after:
+        # FloodWait: a keypad retry would just fail again, so tell them to wait.
+        err_prompt += f"\n\n⏳ <i>Retry in about {res.retry_after}s.</i>"
     if isinstance(target, CallbackQuery):
         await safe_edit_text(target, err_prompt, reply_markup=otp_keypad_kb(""))
     else:
@@ -401,8 +545,8 @@ async def msg_2fa_password(message: Message, ctx: AppContext, state: FSMContext)
     password = message.text or ""
     await safe_delete_message(message)
     res = await ctx.userbot.submit_2fa_password(password)
-    if res.status != "ok":
-        await message.answer(f"❌ {html.escape(res.message)}\n\nPlease try your 2FA password again:")
+    if res.status is not LoginStatus.OK:
+        await message.answer(f"{res.message}\n\nPlease try your 2FA password again:")
         return
 
     await message.answer(f"🎉 <b>{html.escape(res.message)}</b>")
@@ -434,8 +578,8 @@ async def msg_string_session(message: Message, ctx: AppContext, state: FSMContex
 
     wait_msg = await message.answer("🔌 Connecting with StringSession...")
     res = await ctx.userbot.login_with_string_session(int(api_id), str(api_hash), session_str)
-    if res.status != "ok":
-        await wait_msg.edit_text(f"❌ {html.escape(res.message)}\n\nPaste a valid StringSession:")
+    if res.status is not LoginStatus.OK:
+        await wait_msg.edit_text(f"{res.message}\n\nPaste a valid StringSession:")
         return
 
     await wait_msg.edit_text(f"🎉 <b>{html.escape(res.message)}</b>")

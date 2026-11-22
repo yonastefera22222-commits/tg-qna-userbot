@@ -8,18 +8,11 @@ import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 
 from telethon import TelegramClient, events
 from telethon.errors import (
-    ApiIdInvalidError,
     ChatWriteForbiddenError,
     FloodWaitError,
-    PasswordHashInvalidError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
     UserBannedInChannelError,
 )
 from telethon.sessions import StringSession
@@ -29,25 +22,20 @@ from ..ai.engine import AIEngine, AnswerResult
 from ..ai.providers import PROVIDERS
 from ..storage.database import Database, GroupConfig
 from .filters import should_evaluate_message
+from .login import (
+    CodeDelivery,
+    LoginResult,
+    LoginStatus,
+    PhoneLoginSession,
+    make_login_client,
+    translate_send_error,
+)
+
+__all__ = ["CodeDelivery", "LoginResult", "LoginStatus", "UserbotManager"]
 
 logger = logging.getLogger(__name__)
 
 NotifyCallback = Callable[[str], Awaitable[None]]
-
-
-@dataclass
-class PendingLogin:
-    client: TelegramClient
-    api_id: int
-    api_hash: str
-    phone: str
-    phone_code_hash: str
-
-
-@dataclass
-class LoginResult:
-    status: str  # "ok" | "code_sent" | "2fa_required" | "error"
-    message: str
 
 
 class UserbotManager:
@@ -59,7 +47,8 @@ class UserbotManager:
         self._db = db
         self._ai = ai_engine
         self._client: TelegramClient | None = None
-        self._pending_login: PendingLogin | None = None
+        self._login = PhoneLoginSession()
+        self._login.set_persistence(self._persist_pending_login, self._clear_pending_login)
         self._me_id: int | None = None
         self._me_name: str | None = None
         self._me_username: str | None = None
@@ -91,7 +80,7 @@ class UserbotManager:
 
     @property
     def has_pending_login(self) -> bool:
-        return self._pending_login is not None
+        return self._login.has_pending
 
     async def reload_cache(self) -> None:
         """Refresh active groups and global enabled toggle from SQLite into memory."""
@@ -107,6 +96,10 @@ class UserbotManager:
     async def start_from_storage(self) -> bool:
         """Auto-connect userbot on startup if credentials & StringSession exist in DB."""
         await self.reload_cache()
+        # A phone-login attempt cannot survive a process restart (its auth key is
+        # gone), so clear it instead of letting the wizard show a dead attempt.
+        if await self.drop_stale_pending_login():
+            logger.info("Discarded a login attempt left over from the previous run.")
         api_id = await self._db.get_setting("tg_api_id")
         api_hash = await self._db.get_setting("tg_api_hash")
         session_str = await self._db.get_setting("tg_session")
@@ -115,11 +108,21 @@ class UserbotManager:
             logger.info("No saved Telethon session yet; waiting for in-bot setup wizard.")
             return False
 
+        if not isinstance(api_id, int):
+            try:
+                api_id = int(str(api_id))
+            except (TypeError, ValueError):
+                logger.error("Stored tg_api_id is not numeric; cannot restore session.")
+                return False
+
         try:
-            client = TelegramClient(StringSession(str(session_str)), int(api_id), str(api_hash))
+            client = make_login_client(api_id, str(api_hash), session=StringSession(str(session_str)))
             await client.connect()
             if not await client.is_user_authorized():
-                logger.warning("Saved Telethon session is no longer authorized.")
+                logger.warning(
+                    "Saved Telethon session is no longer authorized (it may have been revoked "
+                    "or logged out elsewhere). Re-run /start to log in again."
+                )
                 await client.disconnect()
                 return False
             await self._attach_client(client)
@@ -129,7 +132,7 @@ class UserbotManager:
             return False
 
     async def stop(self) -> None:
-        await self.cancel_pending_login()
+        await self._login.close()
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -164,134 +167,102 @@ class UserbotManager:
     # Interactive In-Bot Telegram Login Flow
     # ------------------------------------------------------------------
 
+    @property
+    def last_code_delivery(self) -> CodeDelivery | None:
+        """Where Telegram actually delivered the latest login code (for the wizard UI)."""
+        pending = self._login.pending
+        return pending.delivery if pending is not None else None
+
+    @property
+    def pending_phone(self) -> str | None:
+        """The normalised E.164 number of the in-progress login, if any."""
+        pending = self._login.pending
+        return pending.phone if pending is not None else None
+
+    async def _persist_pending_login(self, snapshot: dict[str, object] | None) -> None:
+        await self._db.set_setting("tg_pending_login", snapshot)
+
+    async def _clear_pending_login(self) -> None:
+        await self._db.delete_setting("tg_pending_login")
+
+    async def drop_stale_pending_login(self) -> bool:
+        """Clear a login attempt left over from a previous process run.
+
+        Telegram's ``phone_code_hash`` is tied to the temporary client's auth
+        key, so after a restart the saved attempt can never be completed. The
+        old code left the owner staring at "Requesting login code..." with no
+        way forward; now the bot asks for the number again on /start.
+        """
+        if not await self._db.get_setting("tg_pending_login"):
+            return False
+        await self._clear_pending_login()
+        return True
+
+    @property
+    def pending_code_length(self) -> int | None:
+        pending = self._login.pending
+        return pending.code_length if pending is not None else None
+
     async def cancel_pending_login(self) -> None:
-        if self._pending_login is not None:
-            try:
-                await self._pending_login.client.disconnect()
-            except Exception:
-                pass
-            self._pending_login = None
+        await self._login.close()
 
     async def start_phone_login(self, api_id: int, api_hash: str, phone: str) -> LoginResult:
-        """Step 1 of login: connect temporary Telethon client and request OTP code."""
-        await self.cancel_pending_login()
-        cleaned_phone = phone.strip().replace(" ", "").replace("-", "")
-        client = TelegramClient(StringSession(), int(api_id), api_hash.strip())
-        try:
-            await client.connect()
-            sent = await client.send_code_request(cleaned_phone)
-            self._pending_login = PendingLogin(
-                client=client,
-                api_id=int(api_id),
-                api_hash=api_hash.strip(),
-                phone=cleaned_phone,
-                phone_code_hash=sent.phone_code_hash,
-            )
-            return LoginResult("code_sent", f"Login code sent to {cleaned_phone}.")
-        except ApiIdInvalidError:
-            await client.disconnect()
-            return LoginResult("error", "Invalid API ID or API Hash. Check my.telegram.org.")
-        except PhoneNumberInvalidError:
-            await client.disconnect()
-            return LoginResult(
-                "error",
-                "Invalid phone number. Include country code (e.g. +251912345678 or +15551234567).",
-            )
-        except FloodWaitError as exc:
-            await client.disconnect()
-            return LoginResult(
-                "error", f"Telegram rate limit: please wait {exc.seconds} seconds before retrying."
-            )
-        except Exception as exc:
-            await client.disconnect()
-            return LoginResult("error", f"Could not send login code: {exc}")
+        """Step 1 of login: validate the number, request the OTP and report the delivery channel."""
+        return await self._login.request_code(int(api_id), str(api_hash), phone)
 
     async def resend_phone_code(self) -> LoginResult:
-        if self._pending_login is None:
-            return LoginResult("error", "No login in progress. Start login again.")
-        p = self._pending_login
-        return await self.start_phone_login(p.api_id, p.api_hash, p.phone)
+        """Request another code without throwing away a still-valid login attempt."""
+        return await self._login.resend_code()
 
     async def submit_otp_code(self, code: str) -> LoginResult:
         """Step 2 of login: verify OTP digits entered via inline keypad or spaced text."""
-        if self._pending_login is None:
-            return LoginResult("error", "No active login session. Please enter your phone again.")
-
-        digits = "".join(ch for ch in code if ch.isdigit())
-        if len(digits) < 4:
-            return LoginResult("error", "Code looks too short. Enter all digits sent by Telegram.")
-
-        p = self._pending_login
-        try:
-            await p.client.sign_in(
-                phone=p.phone,
-                code=digits,
-                phone_code_hash=p.phone_code_hash,
-            )
-        except SessionPasswordNeededError:
-            return LoginResult(
-                "2fa_required",
-                "Two-Step Verification (2FA) is enabled on your account. Please send your 2FA password.",
-            )
-        except PhoneCodeInvalidError:
-            return LoginResult("error", "Incorrect login code. Please clear and try again.")
-        except PhoneCodeExpiredError:
-            return LoginResult(
-                "error",
-                "That login code expired (or Telegram invalidated it if sent as plain text). "
-                "Tap Resend Code and use the keypad buttons!",
-            )
-        except FloodWaitError as exc:
-            return LoginResult("error", f"Telegram flood wait: please wait {exc.seconds}s.")
-        except Exception as exc:
-            return LoginResult("error", f"Sign-in failed: {exc}")
-
-        return await self._finalize_pending_login()
+        result = await self._login.submit_code(code)
+        if result.status is LoginStatus.OK:
+            return await self._finalize_pending_login()
+        return result
 
     async def submit_2fa_password(self, password: str) -> LoginResult:
         """Step 3 of login (optional): verify Telegram cloud password."""
-        if self._pending_login is None:
-            return LoginResult("error", "No active login session. Please restart login.")
-        p = self._pending_login
-        try:
-            await p.client.sign_in(password=password)
-        except PasswordHashInvalidError:
-            return LoginResult("error", "Incorrect 2FA password. Please try again.")
-        except FloodWaitError as exc:
-            return LoginResult("error", f"Telegram flood wait: please wait {exc.seconds}s.")
-        except Exception as exc:
-            return LoginResult("error", f"2FA verification failed: {exc}")
-
-        return await self._finalize_pending_login()
+        result = await self._login.submit_password(password)
+        if result.status is LoginStatus.OK:
+            return await self._finalize_pending_login()
+        return result
 
     async def login_with_string_session(
         self, api_id: int, api_hash: str, session_str: str
     ) -> LoginResult:
         """Alternative login: paste an existing Telethon StringSession."""
         await self.cancel_pending_login()
-        client = TelegramClient(StringSession(session_str.strip()), int(api_id), api_hash.strip())
+        session = StringSession(session_str.strip())
+        client = make_login_client(int(api_id), api_hash, session=session)
         try:
             await client.connect()
             if not await client.is_user_authorized():
                 await client.disconnect()
-                return LoginResult("error", "That StringSession is not authorized or has expired.")
+                return LoginResult(
+                    LoginStatus.ERROR,
+                    "That StringSession is not authorized or has expired. "
+                    "Generate a fresh one, or use the phone + code login instead.",
+                )
 
             await self._db.set_setting("tg_api_id", int(api_id))
             await self._db.set_setting("tg_api_hash", api_hash.strip())
             await self._db.set_setting("tg_session", session_str.strip())
             await self._attach_client(client)
-            return LoginResult("ok", f"Connected as {self.account_display}!")
+            return LoginResult(LoginStatus.OK, f"Connected as {self.account_display}!")
         except Exception as exc:
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            return LoginResult("error", f"Failed to connect with StringSession: {exc}")
+            return LoginResult(
+                LoginStatus.ERROR, translate_send_error(exc, "your account").message
+            )
 
     async def _finalize_pending_login(self) -> LoginResult:
-        assert self._pending_login is not None
-        p = self._pending_login
-        self._pending_login = None
+        p = self._login.take_authorized_client()
+        if p is None:
+            return LoginResult(LoginStatus.ERROR, "Login session was lost. Please start again.")
 
         session_str = p.client.session.save()
         await self._db.set_setting("tg_api_id", p.api_id)
@@ -299,7 +270,8 @@ class UserbotManager:
         await self._db.set_setting("tg_session", session_str)
 
         await self._attach_client(p.client)
-        return LoginResult("ok", f"Successfully connected as {self.account_display}!")
+        logger.info("Telegram account connected via phone login: %s", self.account_display)
+        return LoginResult(LoginStatus.OK, f"Successfully connected as {self.account_display}!")
 
     async def _attach_client(self, client: TelegramClient) -> None:
         # Disconnect any previously active client cleanly

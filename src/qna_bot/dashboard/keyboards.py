@@ -66,8 +66,9 @@ def otp_keypad_kb(current_digits: str) -> InlineKeyboardMarkup:
         callback_data="otp:submit",
     )
     b.button(text="🔄 Resend Code", callback_data="otp:resend")
+    b.button(text="❓ No code received?", callback_data="otp:help")
     b.button(text="❌ Cancel", callback_data="wiz:login_method")
-    b.adjust(3, 3, 3, 3, 1, 2)
+    b.adjust(3, 3, 3, 3, 1, 2, 1)
     return b.as_markup()
 
 
