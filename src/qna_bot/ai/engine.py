@@ -10,11 +10,27 @@ from dataclasses import dataclass
 import httpx
 
 from .math_solver import try_solve_math
-from .providers import get_provider_spec
+from .providers import PROVIDERS, get_provider_spec, retired_model_replacement
 
 logger = logging.getLogger(__name__)
 
 SKIP_TOKEN = "SKIP"
+
+#: Provider error bodies that mean "this model ID is gone", never "bad key".
+_MODEL_GONE_MARKERS = (
+    "model_not_found",
+    "does not exist",
+    "no longer supported",
+    "decommissioned",
+    "model_decommissioned",
+    "not found",
+    "unsupported model",
+)
+
+
+def _is_model_not_found(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in _MODEL_GONE_MARKERS)
 
 _SYSTEM_PROMPTS: dict[str, str] = {
     "giveaway": (
@@ -177,6 +193,44 @@ class AIEngine:
                 last_error = f"{provider}/{model}: {exc}"
                 logger.warning("AI provider attempt failed (%s): %s", provider, exc)
 
+                # A model saved to the DB months ago may have been retired since.
+                # Retry the same provider once with its live default instead of
+                # silently failing every giveaway answer.
+                replacement = retired_model_replacement(provider, model)
+                if replacement and replacement != model:
+                    logger.warning(
+                        "Model %s/%s is retired; retrying with %s", provider, model, replacement
+                    )
+                    try:
+                        raw_text = await self._call_provider(
+                            provider=provider,
+                            model=replacement,
+                            api_key=api_key,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            temperature=temperature,
+                            max_tokens=effective_max_tokens,
+                        )
+                        elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
+                        cleaned = self._clean_output(raw_text, answer_style)
+                        if cleaned is not None:
+                            return AnswerResult(
+                                answered=True,
+                                answer=cleaned,
+                                provider=provider,
+                                model=replacement,
+                                latency_ms=elapsed_ms,
+                                used_fallback=idx > 0,
+                            )
+                    except Exception as retry_exc:
+                        last_error = f"{provider}/{replacement}: {retry_exc}"
+                        logger.warning(
+                            "Replacement model attempt failed (%s/%s): %s",
+                            provider,
+                            replacement,
+                            retry_exc,
+                        )
+
         total_ms = int((time.perf_counter() - t0) * 1000)
         return AnswerResult(
             answered=False,
@@ -190,7 +244,38 @@ class AIEngine:
     async def test_connection(
         self, provider: str, model: str, api_key: str
     ) -> tuple[bool, int, str]:
-        """Verify an API key and model with a tiny trivia prompt. Returns (ok, latency_ms, detail)."""
+        """Verify an API key with a tiny trivia prompt. Returns (ok, latency_ms, detail).
+
+        A retired/renamed model ID must never be reported as a bad API key: that
+        sent owners chasing a key that was always fine. ``model_not_found`` is
+        treated as our problem -- we look up the live replacement, retry, and
+        report what happened instead of "key test failed".
+        """
+        ok, latency_ms, detail = await self._probe(provider, model, api_key)
+        if ok:
+            return ok, latency_ms, detail
+
+        if _is_model_not_found(detail):
+            replacement = retired_model_replacement(provider, model) or (
+                PROVIDERS[provider].default_model if provider in PROVIDERS else None
+            )
+            if replacement and replacement != model:
+                logger.warning(
+                    "Model %s/%s is gone; retrying the key test with %s",
+                    provider,
+                    model,
+                    replacement,
+                )
+                ok2, latency2, detail2 = await self._probe(provider, replacement, api_key)
+                if ok2:
+                    return (
+                        True,
+                        latency2,
+                        f"{detail2}\n__MODEL_FALLBACK__:{model}->{replacement}",
+                    )
+        return ok, latency_ms, detail
+
+    async def _probe(self, provider: str, model: str, api_key: str) -> tuple[bool, int, str]:
         t0 = time.perf_counter()
         try:
             raw = await self._call_provider(
