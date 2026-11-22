@@ -12,6 +12,8 @@ import operator
 import re
 from collections.abc import Callable
 
+from .language import AMHARIC_NUMERAL_CHARS, has_amharic_numerals, parse_amharic_numeral
+
 # Strip common giveaway prefixes/suffixes around math expressions
 _PREFIX_RE = re.compile(
     r"^(?:(?:q\d*[:.)]?\s*)|(?:question\s*\d*[:.)]?\s*)|(?:math\s*[:.)]?\s*)|"
@@ -20,6 +22,18 @@ _PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _SUFFIX_RE = re.compile(r"(?:\s*=\s*\?|\s*\?|\s*=|\s*\.)+$")
+
+#: Amharic wrappers around an arithmetic question, e.g. ``43 + 92 ስንት ነው?``
+#: ("how much is 43 + 92"). They are words, so without stripping them the
+#: expression never parses and the sub-millisecond local solver is wasted.
+_AMHARIC_PREFIX_RE = re.compile(
+    r"^(?:(?:ስንት\s*ነው|ስንት\s*ይሆናል|ስንት\s*ይሆን|ስንት|"
+    r"ምን\s*ይሆናል|አስላልኝ|አስላ|ድምሩ|ድምር|ቀንስ|አባዛ|ፍሬ|አካፍል)"
+    r"[\s:፦\-]*)+"
+)
+_AMHARIC_SUFFIX_RE = re.compile(
+    r"(?:\s+(?:ስንት|ስንትነው|ነው|ይሆናል|ይሆን|ናት|ይሰጣል|አስላልኝ)\s*\??\s*)+$"
+)
 
 # Handle simple "X% of Y" questions (e.g., "What is 15% of 240?")
 _PERCENT_OF_RE = re.compile(
@@ -50,9 +64,38 @@ _MAX_ABS_VALUE = 1e15
 _MAX_EXPONENT = 100
 
 
+def _convert_ethiopic_numerals(text: str) -> str:
+    """Rewrite Ethiopic numerals (፵፫ = 43) as ASCII digits for the parser."""
+
+    if not any(ch in AMHARIC_NUMERAL_CHARS for ch in text):
+        return text
+
+    out: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if not run:
+            return
+        value = parse_amharic_numeral("".join(run))
+        out.append(str(value) if value is not None else "".join(run))
+        run.clear()
+
+    for ch in text:
+        if ch in AMHARIC_NUMERAL_CHARS:
+            run.append(ch)
+        else:
+            flush()
+            out.append(ch)
+    flush()
+    return "".join(out)
+
+
 def _normalize_expression(text: str) -> str:
     expr = text.strip()
+    expr = _AMHARIC_PREFIX_RE.sub("", expr).strip()
+    expr = _convert_ethiopic_numerals(expr)
     expr = _PREFIX_RE.sub("", expr).strip()
+    expr = _AMHARIC_SUFFIX_RE.sub("", expr).strip()
     expr = _SUFFIX_RE.sub("", expr).strip()
 
     # Check "X% of Y"
@@ -138,7 +181,37 @@ def _format_number(val: float) -> str:
     return f"{val:.6f}".rstrip("0").rstrip(".")
 
 
-def try_solve_math(text: str) -> str | None:
+_AMHARIC_ONES = "፩፪፫፬፭፮፯፰፱"
+_AMHARIC_TENS = "፲፳፴፵፶፷፸፹፺"
+_AMHARIC_HUNDRED = "፻"       # 100
+_AMHARIC_TEN_THOUSAND = "፼"  # 10 000
+
+
+def to_amharic_numeral(value: int) -> str:
+    """Render an integer with Ethiopic numerals (43 -> ``፵፫``, 200 -> ``፪፻``).
+
+    Additive above 100 and multiplicative at ፻ (100) / ፼ (10 000), matching how
+    the digits are read aloud: ``፲፻`` is one thousand, not a hundred and ten.
+    """
+    if value <= 0 or value >= 10_000 * 100:
+        return str(value)
+
+    parts: list[str] = []
+    ten_thousands, rest = divmod(value, 10_000)
+    if ten_thousands:
+        parts.append(to_amharic_numeral(ten_thousands) + _AMHARIC_TEN_THOUSAND)
+    hundreds, rest = divmod(rest, 100)
+    if hundreds:
+        parts.append((to_amharic_numeral(hundreds) if hundreds > 1 else "") + _AMHARIC_HUNDRED)
+    tens, ones = divmod(rest, 10)
+    if tens:
+        parts.append(_AMHARIC_TENS[tens - 1])
+    if ones:
+        parts.append(_AMHARIC_ONES[ones - 1])
+    return "".join(parts)
+
+
+def try_solve_math(text: str, *, numeral_style: str = "auto") -> str | None:
     """Return the formatted numeric answer if `text` is a pure arithmetic question, else None."""
     if not text or len(text) > 160:
         return None
@@ -165,6 +238,16 @@ def try_solve_math(text: str) -> str | None:
         if sum(1 for _ in ast.walk(tree)) > _MAX_AST_NODES:
             return None
         value = _safe_eval_node(tree)
-        return _format_number(value)
+        formatted = _format_number(value)
     except Exception:
         return None
+
+    # Answer in the numerals the question was asked in: an Amharic numeral
+    # question should not be answered "43" when every other reply is "፵፫".
+    if value >= 0 and math.isclose(value, round(value), rel_tol=0.0, abs_tol=1e-9):
+        use_amharic = numeral_style == "amharic" or (
+            numeral_style == "auto" and has_amharic_numerals(text)
+        )
+        if use_amharic:
+            return to_amharic_numeral(int(round(value)))
+    return formatted

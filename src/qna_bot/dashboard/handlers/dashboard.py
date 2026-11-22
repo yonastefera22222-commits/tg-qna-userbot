@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from ...ai.language import is_amharic
 from ...ai.providers import PROVIDERS
 from ...storage.database import GroupConfig
 from ...userbot.filters import should_evaluate_message
@@ -385,11 +386,16 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
 
     # Recent decisions
     recent = ub.recent_decisions
+    amharic_seen = any(is_amharic(str(d.get("text") or "")) for d in recent)
     if recent:
         lines += ["", "<b>Recent messages (newest last)</b>"]
         for d in recent[-8:]:
             icon = "✅" if d["outcome"] == "answered" else "⛔"
             detail = str(d.get("detail") or d["outcome"])
+            # Amharic questions are easy to mistake for "nothing happened", so
+            # label them explicitly in the trail.
+            if is_amharic(str(d.get("text") or "")):
+                detail = f"🇪🇹 Amharic · {detail}"
             snippet = html.escape(str(d.get("text") or "—")[:40])
             lines.append(
                 f"{icon} <code>{d['at']}</code> <i>{snippet}</i>\\n"
@@ -418,6 +424,11 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
             "⚠️ The account is connected but no group messages have arrived. Most common "
             "cause: the enabled groups are not ones this account is actually in, or the "
             "service was restarted and updates were missed while it slept."
+        )
+    elif amharic_seen and counters["answers_sent"] == 0:
+        lines.append(
+            "🇪🇹 Amharic messages ARE arriving but none were answered. Amharic "
+            "words need no '?', so try detection mode 🔥 Aggressive for those groups."
         )
     elif counters["answers_sent"] == 0:
         lines.append(
