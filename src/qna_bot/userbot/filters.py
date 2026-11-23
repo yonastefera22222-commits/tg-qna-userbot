@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..ai.forex import is_forex_question
 from ..ai.math_solver import try_solve_math
 from ..ai.text_cleanup import has_text_content, strip_emoji
 from ..storage.database import GroupConfig
@@ -191,6 +192,12 @@ def should_evaluate_message(
     if word_count >= 3:
         return FilterDecision(True, "giveaway_candidate")
 
+    # Forex groups ask in shorthand: "EURUSD?", "GU bias", "XAU support".
+    # Those are one or two words with no English question word, so without this
+    # they were dropped as chatter.
+    if getattr(group, "forex_enabled", False) and is_forex_question(cleaned):
+        return FilterDecision(True, "forex_signal")
+
     return FilterDecision(False, "too_short_non_question")
 
 
@@ -218,6 +225,7 @@ REASON_TEXT: dict[str, str] = {
     "image_only": "it is a photo (no caption) and photo answers are enabled",
     "vision_disabled": "it is a photo but photo answers are disabled for this group",
     "amharic_question": "it is an Amharic question (Ethiopic script marker found)",
+    "forex_signal": "it is Forex/trading shorthand (pair, concept or instrument)",
 }
 
 

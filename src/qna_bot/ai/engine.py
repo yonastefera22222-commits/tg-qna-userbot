@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from .forex import group_guidance as forex_group_guidance
 from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
 from .math_solver import try_solve_math
 from .providers import (
@@ -186,6 +187,7 @@ class AIEngine:
         self,
         *,
         text: str,
+        forex_group: bool = False,
         answer_style: str,
         primary_provider: str,
         primary_model: str,
@@ -257,7 +259,7 @@ class AIEngine:
                 error="No API key configured for the selected AI provider.",
             )
 
-        system_prompt = self._build_system_prompt(answer_style, text)
+        system_prompt = self._build_system_prompt(answer_style, text, forex_group=forex_group)
         user_prompt = self._build_user_prompt(text, context_lines)
         effective_max_tokens = min(max_tokens, 48) if answer_style == "giveaway" else max_tokens
 
@@ -411,7 +413,7 @@ class AIEngine:
             return False, elapsed_ms, str(exc)
 
     @staticmethod
-    def _build_system_prompt(answer_style: str, text: str) -> str:
+    def _build_system_prompt(answer_style: str, text: str, *, forex_group: bool = False) -> str:
         """Base prompt + language rules.
 
         The always-on rule is a constant so the provider's prompt cache keeps
@@ -422,6 +424,11 @@ class AIEngine:
         guidance = prompt_guidance(text)
         if guidance:
             prompt = f"{prompt}\n{guidance}"
+        # Forex groups get trading conventions and a strict no-invented-prices
+        # rule. Applied for the whole group, not just recognised phrasing: a
+        # host may ask anything, and the honesty rule must always be present.
+        if forex_group:
+            prompt = f"{prompt}\n{forex_group_guidance()}"
         return prompt
 
     @staticmethod

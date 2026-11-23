@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -21,7 +22,7 @@ from ..keyboards import (
     wizard_login_method_kb,
     wizard_welcome_kb,
 )
-from ..states import WizardStates
+from ..states import AI_MENU_STATES, WizardStates
 
 router = Router(name="wizard")
 
@@ -1074,6 +1075,12 @@ async def cb_wiz_finish(callback: CallbackQuery, ctx: AppContext, state: FSMCont
 @router.message()
 async def msg_any_fallback(message: Message, ctx: AppContext, state: FSMContext) -> None:
     current = await state.get_state()
+
+    # This handler exists to explain silence, never to hijack another feature's
+    # input. If the active state belongs to the AI/model menus, let those routers
+    # process the message instead.
+    if current in AI_MENU_STATES:
+        raise SkipHandler
     has_session = bool(await ctx.db.get_setting("tg_session"))
     text = (message.text or "").strip()
 

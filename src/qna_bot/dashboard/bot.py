@@ -92,11 +92,16 @@ def create_dashboard_bot(ctx: AppContext) -> tuple[Bot, Dispatcher]:
     dp.message.middleware(auth_mw)
     dp.callback_query.middleware(auth_mw)
 
-    # Register routers (wizard first so /start & /cancel always take priority)
-    dp.include_router(wizard_router)
+    # Register routers. ORDER MATTERS: routers are tried in registration order and
+    # the first observer that raises no SkipHandler wins. wizard_router owns the
+    # catch-all @router.message() (msg_any_fallback), so registering it first made
+    # it swallow every text message - including API keys typed into the AI menu's
+    # "Update ... API Key" state, which lives in ai_router. State-specific
+    # handlers must therefore come before the catch-all.
     dp.include_router(groups_router)
     dp.include_router(ai_router)
     dp.include_router(dashboard_router)
+    dp.include_router(wizard_router)  # last: contains the catch-all
 
     async def notify_owner(html_text: str) -> None:
         owner_id = await ctx.get_owner_id()

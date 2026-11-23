@@ -65,6 +65,10 @@ class GroupConfig:
     #: Answer questions that are asked as an image (screenshot of a quiz, photo
     #: of a question). Requires a vision-capable model.
     vision_enabled: bool = True
+    #: Treat this group as a Forex/trading group: recognise trader shorthand
+    #: ("EURUSD?", "GU bias") and answer with FX conventions plus a strict
+    #: no-invented-prices rule.
+    forex_enabled: bool = False
 
     def trigger_keyword_list(self) -> list[str]:
         if not self.trigger_keywords.strip():
@@ -134,7 +138,8 @@ class Database:
                 reply_to_message INTEGER NOT NULL DEFAULT 1,
                 trigger_keywords TEXT NOT NULL DEFAULT '',
                 context_messages INTEGER NOT NULL DEFAULT 0,
-                vision_enabled INTEGER NOT NULL DEFAULT 1
+                vision_enabled INTEGER NOT NULL DEFAULT 1,
+                forex_enabled INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS answer_logs (
@@ -168,6 +173,7 @@ class Database:
 
         additions = {
             "vision_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "forex_enabled": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, ddl in additions.items():
             if column not in existing:
@@ -279,6 +285,7 @@ class Database:
             trigger_keywords=str(row["trigger_keywords"]),
             context_messages=int(row["context_messages"]),
             vision_enabled=bool(row["vision_enabled"]) if "vision_enabled" in row.keys() else True,
+            forex_enabled=bool(row["forex_enabled"]) if "forex_enabled" in row.keys() else False,
         )
 
     async def upsert_group_metadata(
@@ -308,12 +315,12 @@ class Database:
                 chat_id, title, username, enabled, sender_filter, answer_style,
                 detection_mode, local_math_enabled, cooldown_seconds,
                 human_delay_ms, reply_to_message, trigger_keywords, context_messages,
-                vision_enabled
+                vision_enabled, forex_enabled
             ) VALUES (
                 :chat_id, :title, :username, :enabled, :sender_filter, :answer_style,
                 :detection_mode, :local_math_enabled, :cooldown_seconds,
                 :human_delay_ms, :reply_to_message, :trigger_keywords, :context_messages,
-                :vision_enabled
+                :vision_enabled, :forex_enabled
             )
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
@@ -328,7 +335,8 @@ class Database:
                 reply_to_message = excluded.reply_to_message,
                 trigger_keywords = excluded.trigger_keywords,
                 context_messages = excluded.context_messages,
-                vision_enabled = excluded.vision_enabled
+                vision_enabled = excluded.vision_enabled,
+                forex_enabled = excluded.forex_enabled
             """,
             {
                 **data,
@@ -336,6 +344,7 @@ class Database:
                 "local_math_enabled": int(group.local_math_enabled),
                 "reply_to_message": int(group.reply_to_message),
                 "vision_enabled": int(group.vision_enabled),
+                "forex_enabled": int(group.forex_enabled),
             },
         )
         await self.conn.commit()
@@ -556,6 +565,8 @@ class Database:
                 reply_to_message=bool(g_dict.get("reply_to_message", True)),
                 trigger_keywords=str(g_dict.get("trigger_keywords", "")),
                 context_messages=int(g_dict.get("context_messages", 0)),
+                vision_enabled=bool(g_dict.get("vision_enabled", True)),
+                forex_enabled=bool(g_dict.get("forex_enabled", False)),
             )
             await self.save_group(group)
             restored_groups += 1

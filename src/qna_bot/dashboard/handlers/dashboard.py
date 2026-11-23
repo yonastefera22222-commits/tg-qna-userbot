@@ -102,6 +102,12 @@ async def msg_sim_run(message: Message, ctx: AppContext) -> None:
         detection_mode="giveaway_aggressive",
         local_math_enabled=True,
     )
+    # Mirror a real group's optional modes so the simulator does not disagree
+    # with production (e.g. rejecting "GU bias" that a Forex group would answer).
+    for existing in await ctx.db.list_groups():
+        if existing.enabled:
+            sim_group.forex_enabled = existing.forex_enabled
+            break
     decision = should_evaluate_message(text, sim_group)
     if not decision.should_process:
         await message.answer(
@@ -122,6 +128,7 @@ async def msg_sim_run(message: Message, ctx: AppContext) -> None:
 
     res = await ctx.ai.answer_question(
         text=text,
+        forex_group=sim_group.forex_enabled,
         answer_style="giveaway",
         primary_provider=primary_p,
         primary_model=primary_m,
@@ -542,6 +549,7 @@ async def cmd_testanswer(message: Message, ctx: AppContext) -> None:
 
     result = await ctx.ai.answer_question(
         text=sample,
+        forex_group=group.forex_enabled,
         answer_style=group.answer_style,
         primary_provider=provider,
         primary_model=model,
