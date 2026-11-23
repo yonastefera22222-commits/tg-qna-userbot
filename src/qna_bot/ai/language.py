@@ -107,24 +107,47 @@ def language_name(code: str) -> str:
 #: Appended to every system prompt. Kept byte-identical across requests so the
 #: provider's prompt cache still hits: appending a *stable* line does not
 #: fragment the cached prefix, unlike building a per-language prompt.
+#:
+#: This replaces an earlier "always answer in the language the question was
+#: asked in, never translate" rule. That rule was wrong for the case it was
+#: meant to cover: asked what FIFA stands for, the correct answer is the French
+#: expansion, and refusing to translate produced a useless answer. The rule now
+#: is *most appropriate language* - the language the answer is conventionally
+#: given in - which for ordinary facts is the question's language and for
+#: names, acronyms, institutions and terms of art is the language the thing is
+#: actually called in.
 ANSWER_IN_LANGUAGE_INSTRUCTION = (
-    "Always answer in the same language the question was asked in. "
-    "Amharic question -> Amharic answer, English question -> English answer. "
-    "Never translate an answer into English unless the question was English.\n"
+    "Answer in the language that best fits the ANSWER, not automatically the "
+    "language of the question.\n"
+    "- Ordinary facts, explanations and arithmetic: use the question's language "
+    "(Amharic question -> Amharic answer).\n"
+    "- Names, brands, institutions, acronyms and technical terms that are "
+    "formally known in another language: give the formal form in that language, "
+    "then the question's language if a word of context helps. Asked in Amharic "
+    "what FIFA stands for, the answer is 'Fédération Internationale de Football "
+    "Association', not a transliteration and not a translation.\n"
+    "- Never answer a 'what does X mean / stand for' question by repeating or "
+    "restating the question. It asks for the expansion or definition of X.\n"
+    "- Do not transliterate a foreign name into Ethiopic letters; write it as it "
+    "is actually written.\n"
     "Emoji and decoration around a question are not part of it: answer the "
     "words. Never repeat the question's emoji in your answer."
 )
 
 #: Extra guidance used only when the question itself is in Amharic.
 AMHARIC_GUIDANCE = (
-    "The question is in Amharic (Ethiopic script). Answer in Amharic using the "
-    "Ethiopic script, never transliterated Latin letters.\n"
+    "The question is in Amharic (Ethiopic script). The answer should read "
+    "naturally to an Amharic speaker, but the language of the ANSWER follows the "
+    "answer's own subject matter (see above): a definition or explanation in "
+    "Amharic, a formal name or acronym in the language it is actually written "
+    "in.\n"
     "- If the question MIXES English and Amharic (for example \"FIFA ሲተነተን ምን "
     "ማለት ነው\" or \"explain VAR ማለት ምን ነው\"), answer in Amharic, and keep any "
-    "name, acronym or technical term that was written in English exactly as it "
-    "was written - do not translate FIFA, VAR, USD or EURUSD into Amharic.\n"
-    "- A mixed question asking what a word MEANS (\"X ማለት ምን ነው\") wants the "
-    "meaning of X, not a restatement of the question.\n"
+    "name, acronym or technical term written in English exactly as it was "
+    "written unless its formal expansion is the better answer.\n"
+    "- A question asking what a word MEANS or STANDS FOR (\"X ማለት ምን ነው\", "
+    "\"FIFA ሲተነተን ምን ማለት ነው\") wants the definition or expansion of X, not a "
+    "restatement of the question and not a sentence about the question.\n"
     "- If the question uses Amharic numerals (፩ ፪ ፫ … ፲ ፳ ፻ ፼), reply using "
     "Amharic numerals too.\n"
     "- If the question refers to a year with ዓ.ም / ዓ.ዓ, use the Ethiopian "

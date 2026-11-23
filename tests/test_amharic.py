@@ -11,6 +11,7 @@ import respx
 from qna_bot.ai.engine import AIEngine
 from qna_bot.ai.language import (
     AMHARIC,
+    ANSWER_IN_LANGUAGE_INSTRUCTION,
     ENGLISH,
     detect_language,
     ethiopic_ratio,
@@ -155,8 +156,14 @@ def test_amharic_quiz_prefix_is_a_quiz_format() -> None:
 
 
 def test_language_rule_is_on_every_prompt() -> None:
+    """The language rule is stable so the provider's prompt cache keeps hitting.
+
+    It is no longer "answer in the question's language" - that produced useless
+    answers to "what does FIFA stand for" - but it is still one constant block.
+    """
     prompt = AIEngine._build_system_prompt("giveaway", "Capital of Kenya?")
-    assert "same language" in prompt
+    assert ANSWER_IN_LANGUAGE_INSTRUCTION in prompt
+    assert "best fits the ANSWER" in prompt
 
 
 def test_amharic_question_adds_script_guidance() -> None:

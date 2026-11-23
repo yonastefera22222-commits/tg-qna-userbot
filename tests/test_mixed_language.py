@@ -80,14 +80,19 @@ def test_mixed_but_latin_led_is_not_flagged_amharic() -> None:
 def test_mixed_guidance_keeps_english_terms() -> None:
     guidance = prompt_guidance(FIFA)
     assert "MIXES English and Amharic" in guidance
-    # Acronyms must survive as written; "ፊፋ" would not be recognised by a host.
-    assert "do not translate FIFA" in guidance
+    # An acronym written in English stays Latin script - "ፊፋ" is unreadable -
+    # but its formal expansion is the better answer, not a translation.
+    assert "exactly as it was written" in guidance
+    # The no-transliteration rule is in the always-on block, so check there.
+    from qna_bot.ai.language import ANSWER_IN_LANGUAGE_INSTRUCTION
+
+    assert "transliterate" in ANSWER_IN_LANGUAGE_INSTRUCTION.lower()
 
 
 def test_mixed_guidance_asks_for_meaning_not_restatement() -> None:
     guidance = prompt_guidance(FIFA)
     assert "ማለት ምን ነው" in guidance
-    assert "meaning of X" in guidance
+    assert "definition or expansion of X" in guidance
 
 
 def test_prompt_includes_mixed_rules_for_the_fifa_question() -> None:
