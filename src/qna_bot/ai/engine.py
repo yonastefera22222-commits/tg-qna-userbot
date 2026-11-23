@@ -260,7 +260,58 @@ class AIEngine:
         #     without an AI call at all - the same reasoning as the math solver.
         #     A model asked to eyeball a series will eventually pick the wrong
         #     bar, and this answer has to be exact to be worth posting.
-        if forex_group and live_data and not image:
+        #
+        # Build provider attempt list (primary + optional fallback). Done before
+        # the image steps because transcribing a picture needs the same keys.
+        attempts: list[tuple[str, str, str]] = []
+        primary_key = provider_keys.get(primary_provider)
+        if primary_key:
+            attempts.append((primary_provider, primary_model, primary_key))
+
+        if fallback_provider and fallback_model and fallback_provider != primary_provider:
+            fb_key = provider_keys.get(fallback_provider)
+            if fb_key:
+                attempts.append((fallback_provider, fallback_model, fb_key))
+
+        if image and not (text or "").strip():
+            # A giveaway poster normally carries the question *inside* the
+            # picture, with no caption at all. In that case `text` is empty and
+            # every exact path above has nothing to read - the bot could only
+            # answer by having a model look at the artwork and improvise, which
+            # is how a number gets invented in a competition.
+            #
+            # So read the words off the image first (one short call), then run
+            # the *same* deterministic paths on what it says. When the picture
+            # is just decoration this second chance costs nothing but the OCR
+            # call, and when it holds the question it turns a guess into a
+            # computed answer.
+            transcribed = await self._transcribe_image(
+                attempts=attempts, image=image, image_mime=image_mime
+            )
+            if transcribed:
+                text = transcribed
+                period = parse_period_query(text)
+                if forex_group and live_data and period is not None and period.instrument:
+                    computed = await self.market_feed.period_answer(period)
+                    if computed is not None:
+                        elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                        return AnswerResult(
+                            answered=True,
+                            answer=computed.formatted(),
+                            provider="local_market",
+                            model="ohlc-history",
+                            latency_ms=elapsed_ms,
+                            language=detect_language(text),
+                        )
+
+        #     NOT skipped for photos. This used to carry `and not image`, which
+        #     silently broke the most common real question in a trading giveaway:
+        #     "on the BTC chart, what was the highest price this week?", asked
+        #     over a decorative poster image. The photo made the exact path
+        #     unreachable, the model was handed an image instead of a series,
+        #     and the one answer that could be computed precisely was the one
+        #     left to a guess. An image cannot make a calendar week less exact.
+        if forex_group and live_data:
             period = parse_period_query(text)
             if period is not None and period.instrument:
                 computed = await self.market_feed.period_answer(period)
@@ -274,17 +325,6 @@ class AIEngine:
                         latency_ms=elapsed_ms,
                         language=detect_language(text),
                     )
-
-        # Build provider attempt list (primary + optional fallback)
-        attempts: list[tuple[str, str, str]] = []
-        primary_key = provider_keys.get(primary_provider)
-        if primary_key:
-            attempts.append((primary_provider, primary_model, primary_key))
-
-        if fallback_provider and fallback_model and fallback_provider != primary_provider:
-            fb_key = provider_keys.get(fallback_provider)
-            if fb_key:
-                attempts.append((fallback_provider, fallback_model, fb_key))
 
         if image:
             # A photo question can only be answered by a model that can see it.
@@ -317,7 +357,11 @@ class AIEngine:
         # Fetch market numbers before building the prompt: the guidance itself
         # changes depending on whether there is real data to hand over.
         market: MarketSnapshot | None = None
-        if forex_group and live_data and not image:
+        if forex_group and live_data:
+            # Also for photos. A chart picture cannot supply "the current price"
+            # for every question, but the feed can - and the image guidance used
+            # to replace the live-data rule entirely, so a photo question about
+            # a live level was answered from pixels alone.
             market = await self.market_feed.snapshot(text)
 
         system_prompt = self._build_system_prompt(
@@ -607,6 +651,55 @@ class AIEngine:
             resp.text[:160],
         )
         return await self.client.post(url, headers=headers, json=retry_payload, params=params)
+
+    #: Prompt for pulling the question out of a picture. Deliberately narrow:
+    #: this call is not asked to answer anything, only to report what the image
+    #: says, so a bad guess costs a wasted string rather than a wrong number.
+    TRANSCRIBE_PROMPT = (
+        "Transcribe only the text that appears inside this image, exactly as "
+        "written, on a single line. Ignore branding, logos, account numbers, "
+        "risk warnings and marketing. If the image contains a question, the "
+        "question must be included word for word, including any instrument name "
+        "(BTC, gold, EURUSD) and time window (today, this week, last week). If "
+        "there is no legible question in the image, reply with exactly: NONE"
+    )
+
+    async def _transcribe_image(
+        self,
+        *,
+        attempts: list[tuple[str, str, str]],
+        image: bytes,
+        image_mime: str = "image/jpeg",
+    ) -> str:
+        """Read the printed question out of a photo, or "" when there isn't one.
+
+        Never raises: a failed transcription just means the caller falls through
+        to the ordinary vision answer, which is what happened before this existed.
+        """
+        for provider, model, api_key in attempts:
+            vision_model = vision_model_for(provider, model)
+            if vision_model is None:
+                continue
+            try:
+                raw = await self._call_provider(
+                    provider=provider,
+                    model=vision_model,
+                    api_key=api_key,
+                    system_prompt=self.TRANSCRIBE_PROMPT,
+                    user_prompt="Transcribe the text in this image.",
+                    temperature=0.0,
+                    max_tokens=180,
+                    image=image,
+                    image_mime=image_mime,
+                )
+            except Exception as exc:  # noqa: BLE001 - best effort by design
+                logger.warning("Image transcription failed on %s: %s", provider, exc)
+                continue
+            cleaned = " ".join((raw or "").split())
+            if not cleaned or cleaned.strip(".").upper() == "NONE":
+                return ""
+            return cleaned
+        return ""
 
     async def _call_provider(
         self,

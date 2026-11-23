@@ -16,7 +16,9 @@ import pytest
 
 from qna_bot.ai.engine import AIEngine
 from qna_bot.ai.forex import (
-    CHART_IMAGE_GUIDANCE,
+    IMAGE_GUIDANCE,
+    LIVE_DATA_IN_IMAGE_GUIDANCE,
+    LIVE_DATA_PRESENT_GUIDANCE,
     NO_LIVE_DATA_GUIDANCE,
     group_guidance,
     is_forex_question,
@@ -117,7 +119,8 @@ def test_chart_photo_does_not_get_the_refusal_rule() -> None:
     )
     assert NO_LIVE_DATA_GUIDANCE not in prompt
     assert "image" in prompt.lower()
-    assert "never reply" in prompt.lower()
+    # The softened rule allows a visible figure but still forbids inventing one.
+    assert "do NOT invent one" in prompt
 
 
 def test_text_question_still_gets_the_refusal_rule() -> None:
@@ -127,15 +130,41 @@ def test_text_question_still_gets_the_refusal_rule() -> None:
     assert NO_LIVE_DATA_GUIDANCE in prompt
 
 
-def test_chart_guidance_tells_the_model_what_to_read() -> None:
-    for token in ("price scale", "candle", "axis", "symbol", "timeframe"):
-        assert token in CHART_IMAGE_GUIDANCE
+def test_image_guidance_tells_the_model_what_to_read() -> None:
+    for token in ("price axis", "candle", "instrument", "timeframe"):
+        assert token in IMAGE_GUIDANCE
 
 
-def test_image_beats_live_data_when_both_apply() -> None:
-    # A photo is never accompanied by a feed fetch, so the image branch wins.
+def test_image_guidance_warns_that_a_poster_carries_no_price() -> None:
+    """The reported case was a *decorative* poster with the question printed on it.
+
+    Treating every attached image as a chart invited the model to read a number
+    off the artwork, which is exactly the fabrication the group rules forbid.
+    """
+    lowered = IMAGE_GUIDANCE.lower()
+    assert "poster" in lowered or "decoration" in lowered
+    assert "do not read a number off the artwork" in lowered
+
+
+def test_image_without_a_feed_softens_the_refusal_but_stays_honest() -> None:
     guidance = group_guidance(has_live_data=False, has_image=True)
     assert NO_LIVE_DATA_GUIDANCE not in guidance
+    assert LIVE_DATA_IN_IMAGE_GUIDANCE in guidance
+    assert "do NOT invent one" in guidance
+
+
+def test_image_with_a_feed_keeps_the_live_rule_and_adds_the_image_rule() -> None:
+    """The two blocks are additive: a chart *and* a feed must both be usable."""
+    guidance = group_guidance(has_live_data=True, has_image=True)
+    assert LIVE_DATA_PRESENT_GUIDANCE in guidance
+    assert IMAGE_GUIDANCE in guidance
+    assert NO_LIVE_DATA_GUIDANCE not in guidance
+
+
+def test_image_rule_never_contradicts_the_feed() -> None:
+    guidance = group_guidance(has_live_data=True, has_image=True)
+    # "The picture is the data" must not survive alongside "use the feed".
+    assert guidance.index(LIVE_DATA_PRESENT_GUIDANCE) < guidance.index(IMAGE_GUIDANCE)
 
 
 def test_photo_with_caption_passes_the_filter_in_a_forex_group() -> None:
