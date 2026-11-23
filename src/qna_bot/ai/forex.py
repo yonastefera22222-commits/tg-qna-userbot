@@ -161,6 +161,28 @@ LIVE_DATA_PRESENT_GUIDANCE = (
 )
 
 
+#: The refusal, in the forms a model actually emits. It is the one answer that
+#: is worth *not* accepting when the picture in the message might contain the
+#: figure: a refusal cannot be right if the number is legible in the attachment.
+_REFUSAL_RE = re.compile(
+    r"^[\s\W]*(" + re.escape(NO_LIVE_DATA_ANSWER) + r"|no\s+live\s+(?:market\s+)?data|"
+    r"no\s+live\s+prices?|no\s+market\s+data|no\s+data\s+available|"
+    r"data\s+unavailable|i\s+don'?t\s+have\s+(?:live|real-?time)\s+data)"
+    r"[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
+def is_refusal(answer: str | None) -> bool:
+    """True when an answer amounts to "I have no market data" and nothing else.
+
+    Used to tell a refusal apart from a real answer: with an image attached, a
+    refusal means the model ignored the picture, so the picture is worth one more
+    look with the live-data rule taken out of its way.
+    """
+    return bool(_REFUSAL_RE.match(answer or ""))
+
+
 def is_forex_question(text: str) -> bool:
     """True when this looks like a Forex/trading question.
 

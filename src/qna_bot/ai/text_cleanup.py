@@ -176,6 +176,67 @@ _AMHARIC_QUESTION_WORDS = re.compile(
 )
 
 
+#: Captions that ask about "the answer" without asking anything. They appear
+#: constantly under a poster ("What is the answer", "What's the answer",
+#: "Answer below") because the poster is the question and the caption is just a
+#: nudge to comment. Treated as a question, the bot answers the nudge itself and
+#: never looks at the picture - which is exactly how a giveaway post ends up
+#: replied to with a refusal while the question sits legible on the card.
+_ANSWER_POINTER_RES = (
+    re.compile(
+        r"\bwhat(?:'s|’s|s|\s+is)?\s+(?:the\s+)?answer\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:the\s+)?answer\s+(?:is\s+)?(?:in|on|below|here|above)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\banswer\s+(?:below|this|it|here|the\s+(?:card|image|photo|picture))\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:solve|guess)\s+(?:this|it|below)\b", re.IGNORECASE),
+    re.compile(r"\bread\s+the\s+(?:card|image|photo|picture|post)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+do\s+you\s+think\b", re.IGNORECASE),
+    re.compile(r"\bfirst\s+(?:to\s+answer|comment)\b", re.IGNORECASE),
+)
+
+
+def is_answer_pointer(text: str) -> bool:
+    """True for captions that point at the question instead of asking it.
+
+    A "what is the answer" caption under a poster is a comment prompt, not a
+    question about the world: there is nothing in those words to answer, and the
+    question is on the card.
+
+    Deliberately *not* just "contains a pointer phrase". A caption can point at
+    the card and then ask the question anyway - "Answer this one for the
+    giveaway: what was the highest price of BTC this week?" - and that caption is
+    the question, so it must be answered as written rather than re-read off the
+    picture. The pointer only wins when removing it leaves nothing to answer.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    remainder = cleaned
+    matched = False
+    for pattern in _ANSWER_POINTER_RES:
+        if pattern.search(remainder):
+            matched = True
+            remainder = pattern.sub(" ", remainder)
+    if not matched:
+        return False
+
+    # What is left once the nudge is gone? If it still carries a question word,
+    # a number or a period phrase, the caption is asking something real.
+    remainder = remainder.strip(" \t\n:;,-–—!?.፧")
+    if not remainder:
+        return True
+    if re.search(r"\d", remainder):
+        return False
+    if looks_like_question(remainder):
+        return False
+    return len(remainder.split()) <= 2
+
+
 def looks_like_question(text: str) -> bool:
     """True when the text carries a question marker in either script."""
     if "?" in text or "፧" in text:
@@ -195,6 +256,46 @@ def is_photo_caption_stub(text: str) -> bool:
     cleaned = (text or "").strip()
     if not cleaned:
         return True
+    if is_answer_pointer(cleaned):
+        return True
     if len(cleaned) > IMAGE_CAPTION_STUB_CHARS:
         return False
     return not looks_like_question(cleaned)
+
+
+#: Words that make a message refer to an image it does not contain: "on this
+#: chart", "the picture above", "what does it show here".
+_IMAGE_REFERENCE_RE = re.compile(
+    r"\b(?:this|that|the|attached|above|posted)\s+"
+    r"(?:chart|image|photo|picture|card|poster|screenshot|graph)\b"
+    r"|\b(?:in|on)\s+the\s+(?:image|picture|chart|photo|card)\b"
+    r"|\b(?:shown|pictured)\s+(?:above|here|below)\b",
+    re.IGNORECASE,
+)
+
+
+def refers_to_an_image(text: str) -> bool:
+    """True when the text talks about a picture rather than containing one.
+
+    A member answering a giveaway card usually writes "What is the answer" or
+    "on this chart, which high?" under the card. Those messages are *about* the
+    poster in the reply, so the picture has to be pulled in from there - read
+    alone, a question about "this chart" has no chart.
+    """
+    return bool(_IMAGE_REFERENCE_RE.search(text or ""))
+
+
+def wants_inherited_image(text: str) -> bool:
+    """True when a caption-shaped reply needs the picture it is replying to.
+
+    Deliberately narrow. A reply that is a complete question on its own ("what
+    is the capital of Ethiopia") does not need, and should not silently inherit,
+    whatever image happens to sit above it - that would attach an unrelated
+    picture to a question with nothing to do with it.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    if is_photo_caption_stub(cleaned):
+        return True
+    return refers_to_an_image(cleaned)

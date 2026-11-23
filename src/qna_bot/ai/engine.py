@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import httpx
 
 from .forex import group_guidance as forex_group_guidance
+from .forex import is_refusal
 from .forex_math import solve_forex_math
 from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
 from .market import MarketFeed, MarketSnapshot, parse_period_query
@@ -445,6 +446,33 @@ class AIEngine:
                     )
                 elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
                 cleaned = self._clean_output(raw_text, answer_style)
+
+                # A refusal is not an answer when a picture is attached. The
+                # reported failure was exactly this: a legible poster plus a
+                # "What is the answer" caption came back "No live data" - twice,
+                # because two members asked. The model declined to quote a price
+                # it was told not to invent while the price sat in the image it
+                # was given. Ask once more with the picture framed as the source.
+                if image and is_refusal(cleaned):
+                    retried = await self._retry_from_image(
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        text=text,
+                        context_lines=context_lines,
+                        answer_style=answer_style,
+                        temperature=temperature,
+                        max_tokens=effective_max_tokens,
+                        image=image,
+                        image_mime=image_mime,
+                        speed_mode=speed_mode,
+                        from_image=asked_from_image,
+                        forex_group=forex_group,
+                    )
+                    if retried is not None:
+                        cleaned = self._clean_output(retried, answer_style)
+                    elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
+
                 if cleaned is None:
                     return AnswerResult(
                         answered=False,
@@ -745,6 +773,66 @@ class AIEngine:
         "explain or translate anything. If the image contains no legible text "
         "at all, reply with exactly: NONE"
     )
+
+    #: Appended to the prompt when a vision answer came back as a refusal. The
+    #: normal rules are deliberately strict about not inventing a price, and a
+    #: model that reads an image only as decoration obeys them by declining. This
+    #: says, in one place, that the picture is evidence - which is the part the
+    #: general rule cannot know.
+    REFUSAL_RETRY_GUIDANCE = (
+        "You just replied that you have no live data. Look at the attached image "
+        "again before repeating that. If the image shows a chart, a broker panel "
+        "or a card with numbers or a question printed on it, those figures ARE "
+        "the evidence: answer from them, briefly and directly. Only repeat the "
+        "refusal if the image genuinely contains nothing to read."
+    )
+
+    async def _retry_from_image(
+        self,
+        *,
+        provider: str,
+        model: str,
+        api_key: str,
+        text: str,
+        context_lines: list[str] | None,
+        answer_style: str,
+        temperature: float,
+        max_tokens: int,
+        image: bytes,
+        image_mime: str,
+        speed_mode: str,
+        from_image: bool,
+        forex_group: bool,
+    ) -> str | None:
+        """One second look at a picture after the model refused to read it.
+
+        Returns None when the retry itself failed, so the caller keeps the
+        original refusal rather than replacing it with an error.
+        """
+        # Same prompt as the first attempt, plus the one rule the model needs to
+        # stop declining: that the picture is evidence. Rebuilt rather than
+        # patched so the guidance stays a single, readable block.
+        base = self._build_system_prompt(
+            answer_style, text, forex_group=forex_group, market=None, has_image=True
+        )
+        system_prompt = f"{base}\n{self.REFUSAL_RETRY_GUIDANCE}"
+        user_prompt = self._build_user_prompt(text, context_lines, from_image=from_image)
+        try:
+            return await self._call_provider(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt or "Read the attached image and answer.",
+                temperature=temperature,
+                max_tokens=max_tokens,
+                image=image,
+                image_mime=image_mime,
+                speed_mode=speed_mode,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the original refusal
+            logger.warning("Refusal retry failed on %s: %s", provider, exc)
+            return None
 
     @staticmethod
     def _has_answerable_text(text: str) -> bool:
