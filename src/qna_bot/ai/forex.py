@@ -38,6 +38,32 @@ _CONCEPTS = (
     "candlestick", "doji", "hammer", "engulfing", "head and shoulders",
     "moving average", "ema", "sma", "rsi", "macd", "bollinger", "atr",
     "ichimoku", "scalping", "swing trading", "day trading", "position trading",
+    "cross pair", "base currency", "quote currency", "exotic pair", "major pair",
+    "minor pair", "bull flag", "bear flag", "pennant", "wedge", "triangle",
+    "golden cross", "death cross", "double top", "double bottom",
+    "triple top", "triple bottom", "cup and handle", "channel", "trendline",
+    "pivot", "pivot point", "round number", "psychological level",
+    "divergence", "overbought", "oversold", "confluence", "fakeout", "whipsaw",
+    "retest", "rejection", "wick", "body", "engulfing candle", "inside bar",
+    "pin bar", "spinning top", "marubozu", "momentum", "impulse",
+    "stop hunt", "trailing stop", "risk management", "position size", "leverage ratio",
+    "margin call", "free margin", "used margin", "equity curve", "win rate",
+    "profit factor", "expectancy", "spread cost", "commission", "raw spread",
+    "standard account", "cent account", "swap long", "swap short", "rollover",
+    "triple swap", "weekend gap", "economic calendar", "red news",
+    "high impact news", "central bank meeting", "interest rate decision",
+    "press conference", "fomc minutes", "dot plot", "tapering", "rate pause",
+    "basis point", "bond yield", "real yield", "inflation expectation",
+    "purchasing power", "current account", "trade balance", "balance of payments",
+    "gross domestic product", "unemployment rate", "retail sales",
+    "manufacturing", "services", "consumer confidence", "jobless claims",
+    "average earnings", "wage growth", "risk-on", "risk-off", "flight to safety",
+    "liquidity sweep", "order flow", "market maker", "retail trader",
+    "institutional", "speculator", "hedger", "long position", "short position",
+    "net long", "net short", "open interest", "spot price", "bid", "ask",
+    "bid-ask", "mid price", "quote price", "tick", "tick size", "point value",
+    "contract size", "notional", "pipette", "fractional pip",
+    "most traded", "most liquid", "traded pair", "currency pair",
     "hedging", "correlation", "volatility", "liquidity", "order block",
     "supply and demand", "session", "london session", "new york session",
     "tokyo session", "forex", "fx", "cfd", "broker", "brokerage", "swap rate",
@@ -150,12 +176,32 @@ def prompt_guidance(text: str) -> str:
     return FOREX_GUIDANCE
 
 
-def group_guidance(*, has_live_data: bool = False) -> str:
+#: A photograph of a chart carries the numbers the question is about, so the
+#: "no feed" rule must not fire on one. Without this a chart photo was answered
+#: "No live data" while the price sat in plain sight on the image.
+CHART_IMAGE_GUIDANCE = (
+    "The message includes an image: a trading chart, a position screenshot or a "
+    "broker panel. Read the values out of the image itself - price scale, last "
+    "price, high/low markers, candle highs and lows, indicator values, symbol, "
+    "timeframe - and answer from those. Those numbers ARE the data for this "
+    "question: never reply '" + NO_LIVE_DATA_ANSWER + "' when the answer is "
+    "visible in the picture.\n"
+    "Read the current price from the price axis against the latest candle, not "
+    "from an unrelated label elsewhere on the screen. Name the instrument and "
+    "timeframe when the image shows them (symbol, axis labels, candle spacing). "
+    "If a value is genuinely illegible, say which one, rather than guessing it."
+)
+
+
+def group_guidance(*, has_live_data: bool = False, has_image: bool = False) -> str:
     """Guidance for every answer in a Forex-mode group, question or not.
 
     Wider than :func:`prompt_guidance` on purpose: the honesty rule has to hold
     for phrasing the detector has never seen.
     """
+    if has_image:
+        # The picture is the feed; the refusal rule must not fire on a chart.
+        return FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, CHART_IMAGE_GUIDANCE)
     if has_live_data:
         return FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, LIVE_DATA_PRESENT_GUIDANCE)
     return FOREX_GUIDANCE
@@ -163,14 +209,33 @@ def group_guidance(*, has_live_data: bool = False) -> str:
 
 #: Appended for Forex groups. Written as rules, not vibes.
 FOREX_GUIDANCE = (
-    "This is a Forex/trading group. Answer with professional FX conventions:\n"
+    "This is a Forex/trading group. Answer as a professional trader would:\n"
+    "CONVENTIONS\n"
     "- Write pairs the way traders do (EURUSD, GBPJPY, XAUUSD) and say 'pips' "
     "for price movement, never 'points'.\n"
-    "- A pip is 0.0001 for most pairs and 0.01 for JPY pairs; a standard lot is "
-    "100,000 units. Use these exact conventions when asked.\n"
-    "- For 'what moves X' questions, distinguish interest-rate differentials, "
-    "central-bank policy, inflation prints, risk sentiment and commodity terms "
-    "of trade. Be specific about which is relevant, not generic.\n"
+    "- A pip is 0.0001 on 5-digit pairs and 0.01 on JPY pairs; a standard lot is "
+    "100,000 units, mini 10,000, micro 1,000. Gold moves in 0.1 'dollars' per pip.\n"
+    "- Quote the base currency first: in EURUSD, EUR is base and USD is quote.\n"
+    "MACRO REASONING - be specific about the mechanism, never generic\n"
+    "- Pair direction is a RELATIVE story: EURUSD rises on hawkish ECB vs dovish "
+    "Fed, not on 'good European news' alone. Name both sides of the pair.\n"
+    "- Rate differentials and real yields drive currency flows; inflation prints "
+    "matter through what they imply for central-bank policy, not in themselves.\n"
+    "- Risk sentiment: JPY, CHF and USD strengthen as safe havens in risk-off; "
+    "AUD and NZD are risk-on proxies; CAD tracks oil; NOK tracks oil and rates.\n"
+    "- Gold rises with falling real yields, a weaker dollar and safe-haven "
+    "demand. The dollar index (DXY) and gold usually move inversely.\n"
+    "TECHNICALS\n"
+    "- Use the correct vocabulary: support/resistance, trend, range, breakout, "
+    "retest, pullback, higher-high/higher-low, RSI overbought above 70 and "
+    "oversold below 30, moving-average crosses.\n"
+    "- A pattern name is not a prediction; describe what it signals and where it "
+    "invalidates.\n"
+    "ANSWER DISCIPLINE\n"
     "- Keep giveaway answers to the bare term or number, as the style requires.\n"
+    "- If a question is ambiguous (which pair, which timeframe), answer the most "
+    "standard reading and give the answer, not a question back.\n"
+    "- Never invent a price, level, indicator value or event result that is not "
+    "in the data you were given.\n"
     "- " + NO_LIVE_DATA_GUIDANCE
 )
