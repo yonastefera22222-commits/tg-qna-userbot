@@ -30,6 +30,7 @@ from ..ai.providers import DEFAULT_SPEED_MODE, PROVIDERS
 from ..ai.text_cleanup import prepare_incoming
 from ..storage.database import Database, GroupConfig
 from .filters import describe_reason, should_evaluate_message
+from .first_comment import FIRST_COMMENT_ANSWER, is_first_comment
 from .login import (
     CodeDelivery,
     LoginResult,
@@ -678,6 +679,58 @@ class UserbotManager:
             "active_groups": len(self._enabled_groups),
         }
 
+    async def _answer_first_comment(
+        self,
+        event: events.NewMessage.Event,
+        group: GroupConfig,
+        chat_id: int,
+        text: str,
+        dedup_key: tuple[int, int],
+    ) -> None:
+        """Post the fixed "I win" line. No model, no prompt, no API key.
+
+        Kept separate from the AI path so the hot path is a dict lookup, a regex
+        and one Telethon send - the same shape as the local math solver.
+        """
+        if group.reply_to_message:
+            send = event.reply
+        else:
+            send = event.respond
+        self._recent_msg_ids.append(dedup_key)
+        self._last_reply_ts[int(chat_id)] = time.monotonic()
+        try:
+            await send(FIRST_COMMENT_ANSWER)
+        except FloodWaitError as exc:
+            logger.warning("FloodWaitError (%ss) on first-comment reply in %s", exc.seconds, group.title)
+            return
+        except (ChatWriteForbiddenError, UserBannedInChannelError):
+            logger.warning("Cannot write in group %s; disabling it.", group.title)
+            group.enabled = False
+            await self._db.save_group(group)
+            await self.reload_cache()
+            return
+        except Exception as exc:  # noqa: BLE001 - never take the userbot down
+            logger.exception("Failed sending first-comment reply in %s: %s", group.title, exc)
+            return
+
+        self._answered_count += 1
+        self._record(
+            chat_id,
+            event.sender_id,
+            text,
+            "answered",
+            "first_comment (local, no AI)",
+        )
+        await self._db.log_answer(
+            chat_id=int(chat_id),
+            chat_title=group.title,
+            question_text=text,
+            answer_text=FIRST_COMMENT_ANSWER,
+            provider="local",
+            model="first-comment",
+            latency_ms=0,
+        )
+
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
         if not self._global_enabled:
             self._record(event.chat_id, event.sender_id, event.raw_text, "skip:global_paused")
@@ -749,6 +802,16 @@ class UserbotManager:
             if isinstance(sender, User) and sender.bot:
                 self._record(chat_id, event.sender_id, text, "skip:is_bot")
                 return
+
+        # "First comment" race: recognised and answered in-process, exactly like
+        # the local math solver. This has to run before the pre-filter (a bare
+        # "first comment" has no question word and would be dropped) and before
+        # any AI call (a 400ms model round-trip loses the race outright), and it
+        # deliberately ignores the per-group cooldown: this is a one-shot burst,
+        # and a cooldown would silently skip the message that wins it.
+        if group.first_comment_enabled and not has_image and is_first_comment(clean_text):
+            await self._answer_first_comment(event, group, chat_id, text, dedup_key)
+            return
 
         # Local pre-filter (runs in <0.1ms before any AI call)
         decision = should_evaluate_message(clean_text, group, has_image=has_image)

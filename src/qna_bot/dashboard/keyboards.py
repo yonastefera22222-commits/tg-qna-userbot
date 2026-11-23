@@ -254,6 +254,10 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
         callback_data=f"gcfg:{cid}:math:{back_page}:{mode_flag}",
     )
     b.button(
+        text=f"🏁 First Comment Race: {'ON' if group.first_comment_enabled else 'OFF'}",
+        callback_data=f"gcfg:{cid}:firstcmt:{back_page}:{mode_flag}",
+    )
+    b.button(
         text=f"📷 Answer Photo Questions: {'ON' if group.vision_enabled else 'OFF'}",
         callback_data=f"gcfg:{cid}:vision:{back_page}:{mode_flag}",
     )

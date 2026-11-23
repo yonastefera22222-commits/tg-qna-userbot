@@ -72,6 +72,9 @@ class GroupConfig:
     #: Forex groups only. When off, the bot still answers with FX conventions but
     #: refuses live questions instead of fetching a price.
     forex_live_data: bool = True
+    #: Answer "first comment" race signals with a fixed line, instantly and
+    #: without an AI call. Off by default: it posts on its own.
+    first_comment_enabled: bool = False
 
     def trigger_keyword_list(self) -> list[str]:
         if not self.trigger_keywords.strip():
@@ -143,7 +146,8 @@ class Database:
                 context_messages INTEGER NOT NULL DEFAULT 0,
                 vision_enabled INTEGER NOT NULL DEFAULT 1,
                 forex_enabled INTEGER NOT NULL DEFAULT 0,
-                forex_live_data INTEGER NOT NULL DEFAULT 1
+                forex_live_data INTEGER NOT NULL DEFAULT 1,
+                first_comment_enabled INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS answer_logs (
@@ -179,6 +183,7 @@ class Database:
             "vision_enabled": "INTEGER NOT NULL DEFAULT 1",
             "forex_enabled": "INTEGER NOT NULL DEFAULT 0",
         "forex_live_data": "INTEGER NOT NULL DEFAULT 1",
+        "first_comment_enabled": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, ddl in additions.items():
             if column not in existing:
@@ -292,6 +297,11 @@ class Database:
             vision_enabled=bool(row["vision_enabled"]) if "vision_enabled" in row.keys() else True,
             forex_enabled=bool(row["forex_enabled"]) if "forex_enabled" in row.keys() else False,
             forex_live_data=bool(row["forex_live_data"]) if "forex_live_data" in row.keys() else True,
+            first_comment_enabled=(
+                bool(row["first_comment_enabled"])
+                if "first_comment_enabled" in row.keys()
+                else False
+            ),
         )
 
     async def upsert_group_metadata(
@@ -321,12 +331,14 @@ class Database:
                 chat_id, title, username, enabled, sender_filter, answer_style,
                 detection_mode, local_math_enabled, cooldown_seconds,
                 human_delay_ms, reply_to_message, trigger_keywords, context_messages,
-                vision_enabled, forex_enabled, forex_live_data
+                vision_enabled, forex_enabled, forex_live_data,
+                first_comment_enabled
             ) VALUES (
                 :chat_id, :title, :username, :enabled, :sender_filter, :answer_style,
                 :detection_mode, :local_math_enabled, :cooldown_seconds,
                 :human_delay_ms, :reply_to_message, :trigger_keywords, :context_messages,
-                :vision_enabled, :forex_enabled, :forex_live_data
+                :vision_enabled, :forex_enabled, :forex_live_data,
+                :first_comment_enabled
             )
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
@@ -343,7 +355,8 @@ class Database:
                 context_messages = excluded.context_messages,
                 vision_enabled = excluded.vision_enabled,
                 forex_enabled = excluded.forex_enabled,
-                forex_live_data = excluded.forex_live_data
+                forex_live_data = excluded.forex_live_data,
+                first_comment_enabled = excluded.first_comment_enabled
             """,
             {
                 **data,
@@ -353,6 +366,7 @@ class Database:
                 "vision_enabled": int(group.vision_enabled),
                 "forex_enabled": int(group.forex_enabled),
                 "forex_live_data": int(group.forex_live_data),
+                "first_comment_enabled": int(group.first_comment_enabled),
             },
         )
         await self.conn.commit()
@@ -576,6 +590,7 @@ class Database:
                 vision_enabled=bool(g_dict.get("vision_enabled", True)),
                 forex_enabled=bool(g_dict.get("forex_enabled", False)),
                 forex_live_data=bool(g_dict.get("forex_live_data", True)),
+                first_comment_enabled=bool(g_dict.get("first_comment_enabled", False)),
             )
             await self.save_group(group)
             restored_groups += 1
