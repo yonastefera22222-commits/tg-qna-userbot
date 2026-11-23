@@ -34,7 +34,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from telethon import TelegramClient
@@ -255,10 +255,59 @@ class CodeDelivery:
     length: int | None = None
     #: ``True`` when the user must first complete a step (e.g. set up a login email).
     action_required: bool = False
+    #: The channel Telegram will use if we ask it to send the code again
+    #: (``auth.sentCode.next_type``). ``None`` means Telegram named no fallback,
+    #: in which case a "resend" button would be a lie.
+    next_channel: DeliveryChannel | None = None
+    #: Seconds to wait before Telegram will accept a resend (``auth.sentCode.timeout``).
+    next_after: int | None = None
+
+
+#: Map Telegram's ``auth.CodeType`` (the *next* delivery channel) to our enum.
+_NEXT_TYPE_CHANNELS: tuple[tuple[str, DeliveryChannel], ...] = (
+    ("CodeTypeCall", DeliveryChannel.CALL),
+    ("CodeTypeSms", DeliveryChannel.SMS),
+    ("CodeTypeFlashCall", DeliveryChannel.FLASH_CALL),
+    ("CodeTypeMissedCall", DeliveryChannel.MISSED_CALL),
+    ("CodeTypeFragmentSms", DeliveryChannel.FRAGMENT),
+)
+
+
+def describe_next_channel(next_type: object) -> DeliveryChannel | None:
+    """Turn ``auth.sentCode.next_type`` into the channel a resend would use.
+
+    Worth the code: the whole "no code ever arrives" complaint is often really
+    "no code arrives *on the channel asked for*, and the app never says another
+    channel exists". Telegram always names the fallback here; the old UI threw
+    it away, so Resend looked like it did nothing when in fact it was switching
+    to SMS or a call.
+    """
+    if next_type is None:
+        return None
+    name = type(next_type).__name__
+    for candidate, channel in _NEXT_TYPE_CHANNELS:
+        if name == candidate:
+            return channel
+    return None
 
 
 def describe_delivery(sent: object) -> CodeDelivery:
     """Turn a Telethon ``auth.SentCode`` into precise, actionable UI text.
+
+    Every branch here describes *this* attempt; the fallback channel Telegram
+    nominated for the *next* attempt is attached afterwards in one place, so no
+    single branch can forget it.
+    """
+    delivery = _describe_this_attempt(sent)
+    return replace(
+        delivery,
+        next_channel=describe_next_channel(getattr(sent, "next_type", None)),
+        next_after=getattr(sent, "timeout", None),
+    )
+
+
+def _describe_this_attempt(sent: object) -> CodeDelivery:
+    """Describe where Telegram just put the code (one branch per delivery type).
 
     This is the part the old wizard was missing entirely: it printed
     "A login code was sent ... via Telegram" for every delivery type, so users
@@ -277,7 +326,10 @@ def describe_delivery(sent: object) -> CodeDelivery:
             "📲 Open <b>Telegram</b> on that device. The code arrives in the <b>Telegram "
             "service chat</b> (look for “Telegram” with a blue shield ✓ at the very top "
             "of the chat list). If the app shows a <b>“Yes, it's me” / “Confirm login”</b> "
-            "button, just tap it — you will not need to type a code at all.",
+            "button, just tap it — you will not need to type a code at all.\n\n"
+            "⚠️ <b>If that chat stays empty</b>, do not keep tapping Resend: Telegram is "
+            "suppressing delivery, not losing it. Use the <b>link login</b> instead — it "
+            "needs no code delivery at all.",
             length,
         )
     if isinstance(sent_type, auth_types.SentCodeTypeSms):
@@ -571,6 +623,27 @@ def translate_signin_error(exc: Exception) -> LoginResult:
 # ---------------------------------------------------------------------------
 
 
+#: A coherent device identity for the login connection.
+#:
+#: This is not cosmetic. Telegram decides whether to *actually deliver* a login
+#: code partly on how the requesting client identifies itself. With Telethon's
+#: defaults the client announces itself as ``Telethon 1.x`` on ``Python``, which
+#: is exactly the fingerprint Telegram's anti-spam heuristics suppress: the
+#: request comes back ``SentCodeTypeApp`` with a valid hash, and nothing is ever
+#: delivered, with no error and no FloodWait. It is the single most reported
+#: cause of "the code never arrives" on third-party clients
+#: (Telethon issue #4730), and multiple reporters there confirmed that sending a
+#: realistic mobile profile made delivery reliable again.
+#:
+#: The values are deliberately a plain, widely-installed Android build rather
+#: than anything unusual, and they are used only for the *login* connection.
+DEVICE_MODEL = "Pixel 6"
+SYSTEM_VERSION = "SDK 33"
+APP_VERSION = "10.2.0 (4300)"
+LANG_CODE = "en"
+SYSTEM_LANG_CODE = "en-US"
+
+
 def make_login_client(api_id: int, api_hash: str, session: StringSession | None = None) -> TelegramClient:
     """Create a temporary Telethon client configured for interactive login.
 
@@ -579,6 +652,9 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
     wizard that looks like a frozen bot, so we surface the wait instead.
     ``request_retries`` is raised a little so flaky mobile-server connections do
     not abort a login the owner is halfway through.
+
+    The device parameters exist because a default Telethon client is the exact
+    fingerprint Telegram silently drops login codes for (see ``DEVICE_MODEL``).
     """
     return TelegramClient(
         session or StringSession(),
@@ -588,6 +664,11 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
         request_retries=5,
         connection_retries=5,
         retry_delay=1,
+        device_model=DEVICE_MODEL,
+        system_version=SYSTEM_VERSION,
+        app_version=APP_VERSION,
+        lang_code=LANG_CODE,
+        system_lang_code=SYSTEM_LANG_CODE,
     )
 
 

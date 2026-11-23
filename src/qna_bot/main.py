@@ -8,6 +8,7 @@ import sys
 
 from .ai.engine import AIEngine
 from .ai.providers import PROVIDERS
+from .browser_login import BrowserLoginManager
 from .config import EnvConfig, load_env_config
 from .dashboard.bot import create_dashboard_bot
 from .dashboard.context import AppContext
@@ -102,9 +103,14 @@ async def async_main() -> None:
     await ai_engine.start()
 
     userbot = UserbotManager(db=db, ai_engine=ai_engine)
-    ctx = AppContext(env=env, db=db, ai=ai_engine, userbot=userbot)
+    browser_login = BrowserLoginManager()
+    ctx = AppContext(
+        env=env, db=db, ai=ai_engine, userbot=userbot, browser_login=browser_login
+    )
 
-    # Start lightweight HTTP health server if PORT is provided (required on Render Free Web Service)
+    # Start lightweight HTTP health server if PORT is provided (required on Render Free Web Service).
+    # It also serves the browser login page, which is the only login route that
+    # does not depend on Telegram delivering anything.
     health_server: HealthServer | None = None
     if env.port is not None:
         health_server = HealthServer(
@@ -114,6 +120,7 @@ async def async_main() -> None:
                 "active_groups": len(userbot._enabled_groups),
                 **userbot.counters,
             },
+            login_manager=browser_login,
         )
         await health_server.start()
 
@@ -135,6 +142,7 @@ async def async_main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Shutting down gracefully...")
+        await browser_login.close()
         await userbot.stop()
         if health_server is not None:
             await health_server.stop()

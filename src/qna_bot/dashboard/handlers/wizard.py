@@ -426,23 +426,26 @@ async def msg_login_email_code(message: Message, ctx: AppContext, state: FSMCont
 # ----------------------------------------------------------------------
 
 
-def _qr_kb(url: str | None = None) -> InlineKeyboardMarkup:
-    """Keyboard for the QR screen.
+def _qr_kb(url: str | None = None, page_url: str | None = None) -> InlineKeyboardMarkup:
+    """Keyboard for the camera/QR screen.
 
-    The first row is the one-phone path. ``tg://login?token=...`` is a real
-    deep link Telegram opens itself, so the owner taps it on the *same* phone
-    that is already signed in - no second device, no camera, no scanning. It
-    was previously only offered as a small hyperlink buried in the caption,
-    which is why it looked like QR needed two phones.
+    ``tg://login?token=...`` is intentionally **not** used as a ``url`` button
+    here. Telegram's deep-link documentation says these links must only be
+    handled when opened from *outside* the app and explicitly not when clicked
+    inside a message or button - a bot button is exactly that, so the tap did
+    nothing. The token is rendered as a QR image for another device instead, and
+    the one-phone route is the browser page (``page_url``), which is outside the
+    app and therefore legal.
     """
     rows: list[list[InlineKeyboardButton]] = []
-    if url:
+    if page_url:
         rows.append(
-            [InlineKeyboardButton(text="⚡️ Log In With One Tap (no camera)", url=url)]
+            [InlineKeyboardButton(text="🌐 Log In On This Phone (no camera)", url=page_url)]
         )
     rows += [
         [InlineKeyboardButton(text="🔄 I Approved — Continue", callback_data="wiz:qr_check")],
-        [InlineKeyboardButton(text="🔗 Send Me a Fresh One-Tap Link", callback_data="wiz:onetaplink")],
+        [InlineKeyboardButton(text="🌐 Send Me the Login Link", callback_data="wiz:loginlink")],
+        [InlineKeyboardButton(text="📷 Make a QR Code", callback_data="wiz:qr_image")],
         [InlineKeyboardButton(text="♻️ Refresh QR Image", callback_data="wiz:qr_refresh")],
         [InlineKeyboardButton(text="🔁 Start Over", callback_data="wiz:login_qr")],
         [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
@@ -450,53 +453,111 @@ def _qr_kb(url: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _qr_caption(url: str, snapshot: dict | None = None) -> str:
+def _qr_caption(
+    url: str,
+    snapshot: dict | None = None,
+    page_url: str | None = None,
+) -> str:
     """Caption for the QR image, explaining that it renews itself."""
     renewed = ""
-    if snapshot and snapshot.get("refreshes"):
+    if snapshot and snapshot.get("renewals"):
         renewed = (
-            f"\n♻️ <i>Auto-renewed {snapshot['refreshes']}× — the code stays valid while "
+            f"\n♻️ <i>Auto-renewed {snapshot['renewals']}× — the code stays valid while "
             "this screen is open.</i>"
         )
+    first_choice = (
+        "🌐 <b>Same phone? Tap the green button above.</b> It opens a small page in "
+        "your browser; tap <b>Open Telegram &amp; Approve</b> and Telegram asks you to "
+        "confirm. No code, no camera, no second device.\n\n"
+        if page_url
+        else ""
+    )
     return (
-        "🔑 <b>Instant Login — one phone, no code, no camera</b>\n\n"
-        "✅ <b>Tap the ⚡️ button below on your phone.</b>\n"
-        "Telegram opens and asks you to confirm — tap <b>Approve</b>. Done. "
-        "This works on the <b>same phone</b> that is already signed in to Telegram; "
-        "you do not need a second device.\n\n"
-        "— or, if you prefer the camera —\n"
-        "1️⃣ Open <b>Telegram → Settings → Devices</b>\n"
-        "2️⃣ Tap <b>Link Desktop Device</b>\n"
-        "3️⃣ Point the camera at the code above\n\n"
+        "🔑 <b>Log in without a code</b>\n\n"
+        f"{first_choice}"
+        "📷 <b>Have a second device?</b> Scan the code above with "
+        "<b>Telegram → Settings → Devices → Link Desktop Device</b>.\n\n"
         "♾ <b>The code renews itself</b>, so there is no rush — Telegram's tokens live "
         "~30s but a fresh one is issued the moment the old lapses. "
-        "If your phone says “code expired”, just tap the ⚡️ button again."
+        "If a device says “code expired”, tap ♻️ Refresh QR Image."
         f"{renewed}"
     )
 
 
 @router.callback_query(F.data == "wiz:login_qr")
 async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
-    await callback.answer("Generating QR code...")
-    data = await state.get_data()
-    api_id = data.get("api_id") or ctx.env.tg_api_id or await ctx.db.get_setting("tg_api_id")
-    api_hash = data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
+    """Start the no-code login.
+
+    The browser page is preferred because it works with one phone and needs no
+    code delivery. The QR image is only rendered when the user explicitly asks
+    for it (``wiz:qr_image``) or when the deployment has no public URL: two live
+    Telegram connections for one login would just double the auth keys and the
+    chances of a flood wait.
+    """
+    await callback.answer("Starting login...")
+    api_id, api_hash = await _resolve_api_creds(ctx, state)
     if not (api_id and api_hash):
         await safe_edit_text(callback, "❌ Missing API credentials. Send /setup to restart.")
         return
 
-    await safe_edit_text(callback, "📷 Generating a QR login link...")
-    res, url = await ctx.userbot.start_qr_login(int(api_id), str(api_hash))
+    await safe_edit_text(callback, "🔑 Starting a login that needs no code...")
+    page_url = await _start_browser_login(ctx, int(api_id), str(api_hash))
+    if page_url is None:
+        # No public URL (local run, or PORT unset): fall back to the QR image.
+        await _show_qr_image(callback, ctx, state, int(api_id), str(api_hash))
+        return
+
+    await state.set_state(WizardStates.waiting_qr_2fa)
+    await state.update_data(qr_generation=1)
+    await safe_edit_text(
+        callback,
+        "🔑 <b>Log In Without a Code</b>\n\n"
+        "🌐 <b>Tap the link below on this phone.</b> It opens a small login page in "
+        "your browser; tap <b>Open Telegram &amp; Approve</b>, and Telegram shows its "
+        "own <b>“Log in?”</b> prompt. Approve it — done.\n\n"
+        "✅ No SMS. ✅ No code to type. ✅ No second phone.\n\n"
+        "<i>This is a web page rather than a button in this chat because Telegram "
+        "clients deliberately ignore login links tapped inside the app.</i>\n\n"
+        "Then tap <b>🔄 I Approved — Continue</b> here.",
+        reply_markup=_qr_kb(None, page_url),
+    )
+
+
+@router.callback_query(F.data == "wiz:qr_image")
+async def cb_qr_image(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    """Render the QR image for a second device (explicit opt-in)."""
+    await callback.answer("Generating QR code...")
+    api_id, api_hash = await _resolve_api_creds(ctx, state)
+    if not (api_id and api_hash):
+        await safe_edit_text(callback, "❌ Missing API credentials. Send /setup to restart.")
+        return
+    await _show_qr_image(callback, ctx, state, int(api_id), str(api_hash))
+
+
+async def _show_qr_image(
+    callback: CallbackQuery,
+    ctx: AppContext,
+    state: FSMContext,
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """Start a QR login session and post the code as an image."""
+    if callback.message is None:
+        return
+    await safe_edit_text(callback, "📷 Generating a QR login code...")
+    res, url = await ctx.userbot.start_qr_login(api_id, api_hash)
     if url is None:
         await safe_edit_text(callback, f"{res.message}", reply_markup=_qr_kb())
         return
 
     await state.set_state(WizardStates.waiting_qr_2fa)
     await state.update_data(qr_generation=1)
-    if callback.message is None:
-        return
 
-    caption = _qr_caption(url)
+    manager = ctx.browser_login
+    page_url = (
+        manager.page_url(ctx.env.public_url) if manager and ctx.env.public_url else None
+    )
+    caption = _qr_caption(url, page_url=page_url)
     png = ctx.userbot.qr_code()
     if png is not None:
         from aiogram.types import BufferedInputFile
@@ -504,56 +565,100 @@ async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContex
         await callback.message.answer_photo(
             BufferedInputFile(png, filename="login_qr.png"),
             caption=caption,
-            reply_markup=_qr_kb(url),
+            reply_markup=_qr_kb(url, page_url),
         )
     else:
-        await safe_edit_text(callback, caption, reply_markup=_qr_kb(url))
+        await safe_edit_text(callback, caption, reply_markup=_qr_kb(url, page_url))
 
 
-@router.callback_query(F.data == "wiz:onetaplink")
-async def cb_one_tap_link(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
-    """Hand back a live ``tg://login`` link as a tappable button.
+async def _resolve_api_creds(ctx: AppContext, state: FSMContext) -> tuple[object, object]:
+    """API id/hash for a login attempt: wizard state, then env, then the database."""
+    data = await state.get_data()
+    api_id = data.get("api_id") or ctx.env.tg_api_id or await ctx.db.get_setting("tg_api_id")
+    api_hash = (
+        data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
+    )
+    return api_id, api_hash
 
-    Telegram's QR token lives ~30 seconds, so the button posted earlier can be
-    stale by the time it is tapped. This re-reads the *current* token and edits
-    the message in place, which is the difference between "it worked" and "the
-    link looks broken".
+
+async def _start_browser_login(ctx: AppContext, api_id: int, api_hash: str) -> str | None:
+    """Start the browser-based login and return the page URL for this owner.
+
+    Returns ``None`` (without raising) when the deployment has no public URL -
+    which is the normal case for a local run with no PORT. The wizard then simply
+    offers the QR image instead, so nothing breaks.
     """
-    snapshot = ctx.userbot.qr_snapshot()
-    if snapshot is None:
-        await callback.answer("No login in progress — tap 🔁 Start Over.", show_alert=True)
-        return
-    if snapshot["status"] is LoginStatus.ERROR:
-        await callback.answer(str(snapshot["message"])[:190], show_alert=True)
+    manager = ctx.browser_login
+    base = ctx.env.public_url
+    if manager is None or not base:
+        return None
+    res, _url = await manager.start(api_id, api_hash)
+    if res.status is LoginStatus.ERROR:
+        return None
+    return manager.page_url(base)
+
+
+async def _browser_login_result(ctx: AppContext, state: FSMContext) -> tuple[LoginStatus, str]:
+    """Poll the browser attempt and report it in the shape the QR screen expects."""
+    manager = ctx.browser_login
+    if manager is None:
+        return LoginStatus.ERROR, "Browser login is not available on this deployment."
+    attempt = manager.current
+    if attempt is None:
+        return LoginStatus.ERROR, "No login in progress."
+    if attempt.status is LoginStatus.OK:
+        res = await ctx.userbot.adopt_browser_login(manager)
+        if res.status is LoginStatus.OK:
+            return LoginStatus.OK, res.message
+        return LoginStatus.ERROR, res.message
+    if attempt.status is LoginStatus.TWO_FA_REQUIRED:
+        return LoginStatus.TWO_FA_REQUIRED, attempt.message
+    if attempt.status is LoginStatus.ERROR:
+        return LoginStatus.ERROR, attempt.message
+    return attempt.status, (
+        f"Waiting for the approval. The page stays valid on its own "
+        f"(~{attempt.seconds_left}s on this link, then it renews)."
+    )
+
+
+@router.callback_query(F.data == "wiz:loginlink")
+async def cb_refresh_login_link(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    """Re-send the browser login page link for the current attempt.
+
+    The page URL contains a per-attempt capability, so re-posting it is only safe
+    inside the owner's private dashboard chat - which is where this runs.
+    """
+    manager = ctx.browser_login
+    page_url = manager.page_url(ctx.env.public_url) if manager and ctx.env.public_url else None
+    if page_url is None:
+        api_id, api_hash = await _resolve_api_creds(ctx, state)
+        if not (api_id and api_hash):
+            await callback.answer("Missing API credentials. Send /setup.", show_alert=True)
+            return
+        page_url = await _start_browser_login(ctx, int(api_id), str(api_hash))
+    if page_url is None:
+        await callback.answer("No public URL on this deployment — use the QR code.", show_alert=True)
         return
 
-    url = str(snapshot["url"])
-    left = int(snapshot.get("seconds_left") or 0)
-    if callback.message is None:
-        await callback.answer("Open a login screen first.", show_alert=True)
-        return
     await safe_edit_text(
-        callback.message,
-        "⚡️ <b>Tap the button below to log in</b>\n\n"
-        "It opens Telegram on the phone that is already signed in. Tap "
-        "<b>Approve</b> — done. No code, no SMS, no second device.\n\n"
-        f"⏱ <i>This link is valid for about <b>{left}s</b>. If it says the link "
-        "expired, tap this button again for a fresh one.</i>",
+        callback,
+        "🌐 <b>This-phone login link</b>\n\n"
+        "Open it in the browser on the phone that already has Telegram. Tap "
+        "<b>Open Telegram &amp; Approve</b>, then <b>Approve</b> in Telegram.\n\n"
+        "<i>The link renews the token by itself while the page is open, so leave it "
+        "open as long as you like.</i>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="⚡️ Open Telegram & Approve", url=url)],
+                [InlineKeyboardButton(text="🌐 Open the login page", url=str(page_url))],
                 [
                     InlineKeyboardButton(
-                        text="🔄 Fresh Link", callback_data="wiz:onetaplink"
-                    ),
-                    InlineKeyboardButton(
                         text="🔄 I Approved — Continue", callback_data="wiz:qr_check"
-                    ),
+                    )
                 ],
             ]
         ),
     )
-    await callback.answer("Fresh link ready")
+    await callback.answer("Link ready")
 
 
 @router.callback_query(F.data == "wiz:qr_refresh")
@@ -574,10 +679,16 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
 
     from aiogram.types import BufferedInputFile, InputMediaPhoto
 
-    # The renewed token has its own deep link, so the one-tap button must be
+    # The renewed token has its own deep link, so anything showing it must be
     # rebuilt from the NEW url or it would hand Telegram an expired token.
     current_url = str(snapshot["url"])
-    caption = _qr_caption(current_url, snapshot)
+    manager = ctx.browser_login
+    page_url = manager.page_url(ctx.env.public_url) if manager and ctx.env.public_url else None
+    if page_url is None:
+        api_id, api_hash = await _resolve_api_creds(ctx, state)
+        if api_id and api_hash:
+            page_url = await _start_browser_login(ctx, int(api_id), str(api_hash))
+    caption = _qr_caption(current_url, snapshot, page_url)
     try:
         # Replace the photo in place so the chat does not fill with images.
         await callback.message.edit_media(
@@ -585,7 +696,7 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
                 media=BufferedInputFile(png, filename="login_qr.png"),
                 caption=caption,
             ),
-            reply_markup=_qr_kb(current_url),
+            reply_markup=_qr_kb(current_url, page_url),
         )
         await callback.answer("QR refreshed")
     except Exception:
@@ -593,7 +704,7 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
         await callback.message.answer_photo(
             BufferedInputFile(png, filename="login_qr.png"),
             caption=caption,
-            reply_markup=_qr_kb(current_url),
+            reply_markup=_qr_kb(current_url, page_url),
         )
         await callback.answer("QR refreshed")
 
@@ -601,6 +712,19 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
 @router.callback_query(F.data == "wiz:qr_check")
 async def cb_qr_check(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
     status, message = ctx.userbot.qr_login_status()
+    # Tracks whether the OK came from the browser page, which finalises the
+    # session itself, or from the QR scan, which still needs finishing here.
+    finalised = False
+    if status is not LoginStatus.OK:
+        # The browser page drives a *separate* Telethon connection, so the QR
+        # session knows nothing about an approval that happened there.
+        browser_status, browser_message = await _browser_login_result(ctx, state)
+        if browser_status is LoginStatus.OK:
+            status, message, finalised = browser_status, browser_message, True
+        elif browser_status is LoginStatus.TWO_FA_REQUIRED and status is not LoginStatus.ERROR:
+            status, message = browser_status, browser_message
+        elif status is LoginStatus.ERROR and browser_status is not LoginStatus.ERROR:
+            status, message = browser_status, browser_message
 
     # Check 2FA *before* finalising: otherwise the "2FA required" state is
     # reported as a generic error and the owner never gets to type their password.
@@ -620,29 +744,23 @@ async def cb_qr_check(callback: CallbackQuery, ctx: AppContext, state: FSMContex
         return
 
     if status is not LoginStatus.OK:
-        snapshot = ctx.userbot.qr_snapshot() or {}
-        left = snapshot.get("seconds_left")
-        hint = (
-            f"Current code is valid ~{left}s and renews itself — scan it whenever "
-            "you are ready."
-            if left
-            else "Waiting for your phone to approve the QR code."
-        )
-        await callback.answer(hint[:190], show_alert=True)
+        await callback.answer(message[:190] or "Waiting for approval...", show_alert=True)
         return
 
-    res = await ctx.userbot.finish_qr_login_if_scanned()
-    if res is None or res.status is not LoginStatus.OK:
-        await callback.answer(
-            (res.message if res is not None else "QR login session was lost.")[:190],
-            show_alert=True,
-        )
-        return
+    if not finalised:
+        res = await ctx.userbot.finish_qr_login_if_scanned()
+        if res is None or res.status is not LoginStatus.OK:
+            await callback.answer(
+                (res.message if res is not None else "Login session was lost.")[:190],
+                show_alert=True,
+            )
+            return
+        message = res.message
 
     await callback.answer("Logged in!")
     await state.clear()
     if callback.message is not None:
-        await safe_edit_text(callback, f"🎉 <b>{html.escape(res.message)}</b>")
+        await safe_edit_text(callback, f"🎉 <b>{html.escape(message)}</b>")
         await _show_ai_step(callback.message, ctx, state)
 
 
@@ -650,6 +768,25 @@ async def cb_qr_check(callback: CallbackQuery, ctx: AppContext, state: FSMContex
 async def msg_qr_2fa(message: Message, ctx: AppContext, state: FSMContext) -> None:
     password = message.text or ""
     await safe_delete_message(message)
+
+    manager = ctx.browser_login
+    attempt = manager.current if manager is not None else None
+    if attempt is not None and attempt.needs_2fa:
+        res = await manager.submit_password(password)
+        if res.status is LoginStatus.OK:
+            adopt = await ctx.userbot.adopt_browser_login(manager)
+            if adopt.status is not LoginStatus.OK:
+                await message.answer(f"{adopt.message}\n\nTry the 2FA password again:")
+                return
+            await state.clear()
+            await message.answer(f"🎉 <b>{html.escape(adopt.message)}</b>")
+            await _show_ai_step(message, ctx, state)
+            return
+        if res.status is LoginStatus.TWO_FA_REQUIRED:
+            await message.answer(f"{res.message}\n\nTry the 2FA password again:")
+            return
+        await message.answer(f"❌ {res.message}\n\nTry the 2FA password again.")
+        return
 
     status, info = ctx.userbot.qr_login_status()
     if status is LoginStatus.OK:
@@ -661,7 +798,7 @@ async def msg_qr_2fa(message: Message, ctx: AppContext, state: FSMContext) -> No
             return
     if status is not LoginStatus.TWO_FA_REQUIRED:
         await message.answer(
-            f"⏳ {html.escape(info)}\n\nScan the QR code first, then send your 2FA password."
+            f"⏳ {html.escape(info)}\n\nApprove the login first, then send your 2FA password."
         )
         return
 
@@ -731,7 +868,7 @@ async def _show_no_code_help(
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             # The no-code route first: it is the answer to "no code received".
-            [InlineKeyboardButton(text="⚡️ Log in with one tap (no code)", callback_data="wiz:login_qr")],
+            [InlineKeyboardButton(text="⚡️ Log in without a code", callback_data="wiz:login_qr")],
             [InlineKeyboardButton(text="🔄 Resend Code", callback_data="otp:resend")],
             [
                 InlineKeyboardButton(
@@ -1211,6 +1348,10 @@ async def cmd_login_diagnose(message: Message, ctx: AppContext, state: FSMContex
     session = await ctx.db.get_setting("tg_session")
     lines.append(f"• Saved session: {'yes' if session else 'no'}")
     lines.append(f"• Userbot connected: {ctx.userbot.is_connected}")
+    lines.append(
+        f"• No-code login page: "
+        f"{'✅ ' + html.escape(ctx.env.public_url) if ctx.env.public_url else '❌ no PUBLIC_URL / RENDER_EXTERNAL_URL'}"
+    )
 
     if not (api_id and api_hash):
         lines += ["", "❌ No API credentials — send /start to run Step 1."]
@@ -1243,10 +1384,17 @@ async def cmd_login_diagnose(message: Message, ctx: AppContext, state: FSMContex
                         "• ⚠️ <b>BLOCKED</b>: no code will ever arrive until a login email "
                         "is set up (button below works)."
                     )
-                else:
+                    next_txt = (
+                        delivery.next_channel.value.replace("_", " ")
+                        if delivery.next_channel
+                        else "none offered"
+                    )
+                    lines.append(f"• Next channel on resend: <b>{next_txt}</b>")
                     lines.append(
-                        "• ✅ Telegram <b>did</b> dispatch a code. If you cannot find it, it is "
-                        "in the Telegram app's service chat (or the SMS/call channel above)."
+                        "• ⚠️ Telegram <b>accepted</b> the request — that is not proof it "
+                        "delivered anything. Since Feb 2023 it sends no SMS to third-party "
+                        "clients, and since early 2026 it often withholds the in-app code too "
+                        "(Telethon #4730). If the service chat is empty, use the no-code login."
                     )
             except Exception as exc:
                 lines.append(f"• ⚠️ send_code_request failed: <code>{html.escape(str(exc)[:200])}</code>")

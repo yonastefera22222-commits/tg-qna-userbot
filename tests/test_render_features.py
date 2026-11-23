@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import httpx
@@ -94,5 +95,78 @@ async def test_health_server_endpoints() -> None:
             r2 = await client.get(f"http://127.0.0.1:{port}/health")
             assert r2.status_code == 200
             assert r2.json()["status"] == "ok"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_login_page_is_served_and_scoped_to_its_attempt() -> None:
+    """The one-phone route: a real web page, not a chat button.
+
+    Telegram ignores ``tg://login`` links tapped inside the app, so the token has
+    to be handed to a browser instead. These routes are that hand-off.
+    """
+    from qna_bot.browser_login import BrowserLoginAttempt, BrowserLoginManager
+    from qna_bot.userbot.login import LoginStatus
+
+    manager = BrowserLoginManager()
+    manager._attempt = BrowserLoginAttempt(
+        attempt_id="attempt-xyz",
+        client=object(),
+        api_id=1,
+        api_hash="secret-hash",
+        url="tg://login?token=TOKEN123",
+        expires_at=time.time() + 30,
+        login=object(),
+        status=LoginStatus.CODE_SENT,
+    )
+    server = HealthServer(
+        port=0,
+        host="127.0.0.1",
+        status_provider=lambda: {"userbot_connected": False},
+        login_manager=manager,
+    )
+    await server.start()
+    try:
+        port = server.bound_port
+        async with httpx.AsyncClient() as client:
+            page = await client.get(f"http://127.0.0.1:{port}/login/attempt-xyz")
+            assert page.status_code == 200
+            assert "tg://login?token=TOKEN123" in page.text
+            # Never cache or index a page holding a live session token.
+            assert "no-store" in page.headers["cache-control"]
+            assert "noindex" in page.headers["x-robots-tag"]
+
+            wrong = await client.get(f"http://127.0.0.1:{port}/login/attempt-xy7")
+            assert wrong.status_code == 404
+            assert "TOKEN123" not in wrong.text
+
+            state = await client.get(f"http://127.0.0.1:{port}/login/attempt-xyz/state")
+            assert state.status_code == 200
+            body = state.json()
+            assert body["approved"] is False
+            assert body["url"] == "tg://login?token=TOKEN123"
+            assert "secret-hash" not in state.text
+
+            missing = await client.get(f"http://127.0.0.1:{port}/login/nope/state")
+            assert missing.json()["failed"] is True
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_health_server_works_without_a_login_manager() -> None:
+    """A local run has no public URL and must still boot."""
+    server = HealthServer(
+        port=0,
+        host="127.0.0.1",
+        status_provider=lambda: {"userbot_connected": False},
+    )
+    await server.start()
+    try:
+        port = server.bound_port
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"http://127.0.0.1:{port}/login/anything")
+            assert r.status_code == 404
     finally:
         await server.stop()
