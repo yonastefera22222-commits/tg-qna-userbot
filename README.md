@@ -29,6 +29,7 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
     - **↩️ Reply to Question**: Replies directly to the question message (`event.reply`).
     - **🧮 Instant Local Math Solver**: Solves arithmetic giveaways (`47 * 83`, `15% of 240`, `sqrt(144)`, `(12 + 8) × 5`) in **<1ms** locally with zero API latency!
     - **📷 Answer Photo Questions**: Answers questions sent as a **picture** — a screenshot of a quiz, a photographed handwritten problem, or an image with a caption. Works even when the photo has **no text at all**. Photos up to **4 MB** are downloaded and passed to a vision model.
+    - **💱 Forex Trading Mode**: Turns the group into a Forex specialist. Bare trader shorthand (`EURUSD?`, `GU bias`, `XAU support`, `cable`) is recognised instead of dropped as chatter, and answers use FX conventions — **pips** (0.0001, and 0.01 on JPY pairs), a **standard lot = 100,000 units**, pairs written `EURUSD`/`GBPJPY`/`XAUUSD`, and the real drivers of a currency (rate differentials, central-bank policy, inflation prints, risk sentiment, commodity terms of trade). It **refuses to invent live data**: asked for today's price, a level, a forecast or the news, it answers **`No live data`** rather than reciting a stale price as if it were current.
     - **⏱ Cooldown**, **⏳ Optional Human Delay**, **🏷 Custom Trigger Keywords**, and **🧠 Context Messages**.
 - **🤖 Multi-Provider Fast & Free AI + Automatic Fallback**:
   - **⚡ Groq** (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`, ~500–1000 tok/s — ideal primary for speed giveaways). Retired model IDs are detected automatically and swapped for the live replacement, so a stale model never looks like a bad API key.
@@ -145,6 +146,7 @@ docker compose logs -f
 | **Instant Local Math** | `ON` | Solves arithmetic giveaways in `<1ms` locally |
 | **Reply to Question** | `ON` | Replies directly to the host's question message |
 | **📷 Answer Photo Questions** | `ON` | Answers screenshot/photo quizzes — turn **off** to save paid vision credits |
+| **💱 Forex Trading Mode** | `ON` for FX groups | Accepts pair shorthand and uses pips/lot conventions; never fabricates a live price |
 | **🚀 Response Speed** | `⚡ Fastest` | Turns off the model's hidden reasoning step — the #1 cause of slow answers |
 | **🇪🇹 Amharic Groups** | `🔥 Aggressive` | Amharic questions often have no `?`, so aggressive mode catches them |
 

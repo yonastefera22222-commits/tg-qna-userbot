@@ -26,3 +26,18 @@ class DashboardStates(StatesGroup):
     waiting_sim_question = State()
     waiting_ai_key_update = State()
     waiting_custom_model_update = State()
+
+
+def _state_names(group: type[StatesGroup]) -> tuple[str, ...]:
+    """Fully-qualified state strings, e.g. ``DashboardStates:waiting_ai_key_update``."""
+    return tuple(f"{group.__name__}:{name}" for name in group.__dict__ if not name.startswith("_"))
+
+
+#: States owned by the AI / model menus (ai_settings router). The wizard's
+#: catch-all must not consume input that belongs to them.
+AI_MENU_STATES = frozenset(
+    {
+        f"{DashboardStates.__name__}:waiting_ai_key_update",
+        f"{DashboardStates.__name__}:waiting_custom_model_update",
+    }
+)

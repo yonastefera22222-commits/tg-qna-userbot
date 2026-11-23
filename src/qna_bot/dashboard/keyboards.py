@@ -258,6 +258,10 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
         callback_data=f"gcfg:{cid}:vision:{back_page}:{mode_flag}",
     )
     b.button(
+        text=f"💱 Forex Trading Mode: {'ON' if group.forex_enabled else 'OFF'}",
+        callback_data=f"gcfg:{cid}:forex:{back_page}:{mode_flag}",
+    )
+    b.button(
         text=f"⏱ Cooldown: {group.cooldown_seconds:g}s",
         callback_data=f"gcfg:{cid}:cooldown:{back_page}:{mode_flag}",
     )
