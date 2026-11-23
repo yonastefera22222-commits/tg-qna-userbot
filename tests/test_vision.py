@@ -163,7 +163,14 @@ async def test_text_only_requests_are_unchanged() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_local_math_is_skipped_for_photos() -> None:
-    """The arithmetic is inside the image; solving the caption is meaningless."""
+    """Math in *the image* is not solved from the caption.
+
+    This has to keep holding: a poster reading "2 + 2 = ?" and a caption reading
+    "47 * 83" are different questions, and solving the caption would post the
+    wrong number with total confidence. Only a caption that IS the question - a
+    text question with a decorative picture attached - takes the local path,
+    which is covered in tests/test_photo_market_questions.py.
+    """
     route = respx.post(GROQ_URL).mock(
         return_value=httpx.Response(200, json={"choices": [{"message": {"content": "42"}}]})
     )

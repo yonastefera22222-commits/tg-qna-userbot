@@ -645,6 +645,11 @@ class UserbotManager:
     #: Hard cap so a huge photo can never stall the responder or the AI bill.
     MAX_IMAGE_BYTES = 4 * 1024 * 1024
 
+    #: Image formats that are decoration by nature: Telegram draws stickers as
+    #: ``application/x-tgsticker`` (animated) or ``image/webp`` (static), and
+    #: neither carries a legible question.
+    _NON_QUESTION_IMAGE_MIMES = frozenset({"application/x-tgsticker", "image/gif"})
+
     @staticmethod
     def _message_has_image(event: events.NewMessage.Event) -> bool:
         """True when the message carries a real photo or image document.
@@ -660,7 +665,17 @@ class UserbotManager:
             return True
         document = getattr(message, "document", None)
         if isinstance(document, Document):
-            return str(getattr(document, "mime_type", "") or "").startswith("image/")
+            mime = str(getattr(document, "mime_type", "") or "").lower()
+            # Stickers and animated emoji are image/* documents too, but they are
+            # reaction-sized artwork: there is never a question inside one, and
+            # now that a short caption beside an image is treated as a real photo
+            # question, a "🔥🔥" caption on a sticker would otherwise be sent to a
+            # vision model on every reaction. Only the still vector formats are
+            # excluded - a WebP *photo* exported from a design tool is a
+            # perfectly normal way to post a giveaway card.
+            if mime in UserbotManager._NON_QUESTION_IMAGE_MIMES:
+                return False
+            return mime.startswith("image/")
         return False
 
     async def _download_image(self, event: events.NewMessage.Event) -> tuple[bytes | None, str]:

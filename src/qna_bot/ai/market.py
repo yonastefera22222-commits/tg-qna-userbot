@@ -52,6 +52,22 @@ CACHE_TTL_SECONDS = 30.0
 FEED_TIMEOUT_SECONDS = 4.0
 
 
+#: Amharic names for the instruments a giveaway asks about, mapped to the
+#: ticker. These are transliterations, not translations: "ቢቲሲ" is how BTC is
+#: written in Ethiopic script, and a poster printed in Addis will use it.
+_AMHARIC_INSTRUMENTS: dict[str, str] = {
+    "ቢቲሲ": "BTCUSD",
+    "ቢትኮይን": "BTCUSD",
+    "ኢቲኤች": "ETHUSD",
+    "ኢቴርየም": "ETHUSD",
+    "ሶል": "SOLUSD",
+    "ሶላና": "SOLUSD",
+    "ዶጅ": "DOGEUSD",
+    "ወርቅ": "XAUUSD",
+    "ብር": "XAGUSD",
+    "ዶላር": "DXY",
+}
+
 #: Traders' shorthand -> the instrument Yahoo quotes.
 _SHORTHAND: dict[str, str] = {
     "EU": "EURUSD",
@@ -86,8 +102,19 @@ _CRYPTO_NAMES = {
 #: Bare tokens that map straight onto a feedable instrument.
 #: "BTCUSD", "BTCUSDT", "BTC/USDT", "btcusd" - how brokers (Exness included)
 #: and charts actually write crypto pairs.
+#: Start/end of an instrument token. ``\b`` is wrong here: it treats every
+#: Ethiopic letter as a word character, so ``በBTC ገበታ`` (Amharic for "on the BTC
+#: chart") has no boundary before the B and the instrument is never found. The
+#: lookaround versions only exclude the characters that could genuinely be part
+#: of a ticker, which keeps ``BTCUSD`` and ``BTC/usd`` together while letting the
+#: Amharic prefix through.
+_TICKER_START = r"(?<![A-Za-z0-9])"
+_TICKER_END = r"(?![A-Za-z0-9])"
+
 _CRYPTO_PAIR_RE = re.compile(
-    r"\b(" + "|".join(_CRYPTO_NAMES) + r")\s*(?:/|-)?\s*(?:usdt|usd|busd)\b",
+    _TICKER_START
+    + r"(" + "|".join(_CRYPTO_NAMES) + r")\s*(?:/|-)?\s*(?:usdt|usd|busd)"
+    + _TICKER_END,
     re.IGNORECASE,
 )
 
@@ -135,13 +162,17 @@ HISTORY_INSTRUMENTS: dict[str, str] = {
 _PAIR_RE = re.compile(r"^([A-Z]{3})/?([A-Z]{3})$")
 #: Bare metals and the yield/index tokens a trader types on their own.
 _BARE_RE = re.compile(
-    r"\b(XAU|XAG|GOLD|SILVER|DXY|US10Y|BTC|ETH|SOL|XRP|DOGE|BNB|LTC|"
-    r"BITCOIN|ETHEREUM|SOLANA|RIPPLE|DOGECOIN|LITECOIN)\b"
+    _TICKER_START
+    + r"(XAU|XAG|GOLD|SILVER|DXY|US10Y|BTC|ETH|SOL|XRP|DOGE|BNB|LTC|"
+    r"BITCOIN|ETHEREUM|SOLANA|RIPPLE|DOGECOIN|LITECOIN)"
+    + _TICKER_END
 )
 _NICKNAME_RE = re.compile(
-    r"\b(" + "|".join(sorted(_SHORTHAND, key=len, reverse=True)) + r")\b"
+    _TICKER_START
+    + r"(" + "|".join(sorted(_SHORTHAND, key=len, reverse=True)) + r")"
+    + _TICKER_END
 )
-_PAIR_TOKEN_RE = re.compile(r"\b([A-Z]{3})\s*[/\-]?\s*([A-Z]{3})\b")
+_PAIR_TOKEN_RE = re.compile(_TICKER_START + r"([A-Z]{3})\s*[/\-]?\s*([A-Z]{3})" + _TICKER_END)
 
 #: Currencies Frankfurter publishes (ECB reference set).
 _ECB_CURRENCIES = {
@@ -279,6 +310,16 @@ _PERIOD_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(today|so\s+far\s+today)\b", re.I), "today"),
     (re.compile(r"\b(last|previous|past)\s+(?:7|seven)\s+days?\b", re.I), "last_week"),
     (re.compile(r"\b(last|previous|past)\s+(?:30|thirty)\s+days?\b", re.I), "last_month"),
+    # Amharic. A transcribed poster or a typed question from an Ethiopian
+    # giveaway group says "ይህ ሳምንት" where English says "this week", and none of the
+    # Latin patterns above can match Ethiopic script. Ordered longest-first so
+    # "ያለፈው ሳምንት" (last week) is not eaten by the bare "ሳምንት".
+    (re.compile(r"ያለፈው\s+ሳምንት|ባለፈው\s+ሳምንት"), "last_week"),
+    (re.compile(r"ይህ\s+ሳምንት|በዚህ\s+ሳምንት|የዚህ\s+ሳምንት"), "this_week"),
+    (re.compile(r"ያለፈው\s+ወር|ባለፈው\s+ወር"), "last_month"),
+    (re.compile(r"ይህ\s+ወር|በዚህ\s+ወር|የዚህ\s+ወር"), "this_month"),
+    (re.compile(r"ትናንት"), "yesterday"),
+    (re.compile(r"ዛሬ"), "today"),
 )
 
 #: What to read off the series.
@@ -288,6 +329,16 @@ _AGGREGATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(open(?:ing)?|opened)\b", re.I), "open"),
     (re.compile(r"\b(close|closed|closing|end(?:ed)?)\b", re.I), "close"),
     (re.compile(r"\b(change|move|performance|return|gain|loss|up|down|%)\b", re.I), "change"),
+    # Amharic. Checked after the Latin list, so a mixed-language question keeps
+    # its English aggregation when it has one.
+    # Amharic verbs inflect by prefix *and* suffix ("ተከፈተ" opened, "የተከፈተው"
+    # the one that opened), so matching a full word form would need a conjugation
+    # table. Matching the stem is what actually holds.
+    (re.compile(r"ከፍተኛ"), "high"),
+    (re.compile(r"ዝቅተኛ"), "low"),
+    (re.compile(r"ከፈተ|ክፈት|መክፈቻ"), "open"),
+    (re.compile(r"ዘጋ|ዘግተ|መዝጊያ"), "close"),
+    (re.compile(r"ለውጥ|እድገት|መቶኛ|መቶኛው"), "change"),
 )
 
 #: How many days back each period starts. Crypto trades daily, so calendar days
@@ -431,6 +482,10 @@ def instruments_in(text: str, *, limit: int = 4) -> list[str]:
     for match in _BARE_RE.finditer(upper):
         instrument = _BARE_MAP.get(match.group(1))
         if instrument and instrument not in found:
+            found.append(instrument)
+
+    for name, instrument in _AMHARIC_INSTRUMENTS.items():
+        if name in text and instrument not in found:
             found.append(instrument)
 
     return found[:limit]
