@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from ..ai.forex import is_forex_question
 from ..ai.math_solver import try_solve_math
-from ..ai.text_cleanup import has_text_content, strip_emoji
+from ..ai.text_cleanup import has_text_content, is_photo_caption_stub, strip_emoji
 from ..storage.database import GroupConfig
 
 # Common casual chat messages that are never giveaway questions
@@ -102,6 +102,13 @@ _QUIZ_FORMAT_RE = re.compile(
 )
 
 
+def _looks_like_question(text: str) -> bool:
+    """True when the text carries a question marker in either script."""
+    if "?" in text or "፧" in text:
+        return True
+    return bool(_QUESTION_WORD_RE.search(text)) or bool(_AMHARIC_QUESTION_RE.search(text))
+
+
 @dataclass(frozen=True)
 class FilterDecision:
     should_process: bool
@@ -158,6 +165,20 @@ def should_evaluate_message(
     # Fast bypass if it's clearly a pure math giveaway prompt
     if group.local_math_enabled and try_solve_math(cleaned) is not None:
         return FilterDecision(True, "math_detected")
+
+    # A photo caption is usually a stub: "answer below", "🔥🔥", "@ourchannel",
+    # "Rules in the pinned message". The question is printed on the picture, and
+    # the caption exists only because a Telegram post must wrap the media in
+    # something. Judging that caption by the text rules threw the photo away
+    # before the engine ever saw it, so a short non-question caption beside a
+    # photo is now treated as a photo with no caption and transcribed instead.
+    # Placed after the keyword and math bypasses so those keep precedence, and
+    # scoped to images, so typed text behaves exactly as before.
+    if (
+        has_image
+        and is_photo_caption_stub(cleaned)
+    ):
+        return FilterDecision(True, "image_caption_stub")
 
     # Skip trivial 1-2 word chatter
     stripped_punct = lower.strip(" .!?,~")
@@ -223,6 +244,7 @@ REASON_TEXT: dict[str, str] = {
     "giveaway_candidate": "it has 3+ words (aggressive mode)",
     "too_short_non_question": "it is too short and not a question (aggressive mode)",
     "image_only": "it is a photo (no caption) and photo answers are enabled",
+    "image_caption_stub": "it is a photo with a short caption; the question is on the picture",
     "vision_disabled": "it is a photo but photo answers are disabled for this group",
     "amharic_question": "it is an Amharic question (Ethiopic script marker found)",
     "forex_signal": "it is Forex/trading shorthand (pair, concept or instrument)",

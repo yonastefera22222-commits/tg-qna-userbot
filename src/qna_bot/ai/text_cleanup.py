@@ -12,6 +12,8 @@ deleting the digit with its decoration. Only then are whole emoji removed.
 
 from __future__ import annotations
 
+import re
+
 #: Codepoint ranges that hold emoji and their invisible joins/modifiers.
 EMOJI_RANGES: tuple[tuple[int, int], ...] = (
     (0x1F000, 0x1F0FF),  # mahjong / playing cards
@@ -148,3 +150,51 @@ def strip_leading_emoji(text: str) -> str:
 def has_text_content(text: str) -> bool:
     """True when at least one letter or digit survives after removing emoji."""
     return any(ch.isalnum() for ch in strip_emoji(text))
+
+
+#: Captions shorter than this beside a photo are treated as wrappers rather than
+#: as the question itself, unless they actually look like a question.
+IMAGE_CAPTION_STUB_CHARS = 120
+
+#: Question markers in either script. Duplicated deliberately from the filter's
+#: own lists: the engine must not import from ``userbot`` (the filter already
+#: imports from ``ai``, and the reverse would be a cycle), and these two lists
+#: are small enough that keeping them honest is cheaper than the indirection.
+_QUESTION_WORDS = re.compile(
+    r"\b(?:who|what|what's|whats|when|where|why|how|which|whose|whom|"
+    r"name|list|identify|define|explain|tell|give|guess|solve|calculate|"
+    r"compute|find|unscramble|rearrange|spell|translate|complete|fill|"
+    r"true\s+or\s+false|capital\s+of|full\s+form|stands\s+for|invented|"
+    r"discovered|wrote|founder|president|ceo|year|country|city|planet|"
+    r"chemical\s+symbol|formula|meaning\s+of|opposite\s+of|synonym)\b",
+    re.IGNORECASE,
+)
+_AMHARIC_QUESTION_WORDS = re.compile(
+    r"(?:ማን|ምን|የት|መቼ|ለምን|እንዴት|ስንት|ስንቱ|የቱ|የትኛው|ማንኛው|ማንኛችሁ|"
+    r"ስም|ስሙ|ዋና\s*ከተማ|ዋና\s*ከተማዋ|ሀገር|አገር|ፈጣሪ|ተፈጥሮ|ምርጫ|ትርጉም|"
+    r"ስንተኛ|ስንት\s*ነው|ምን\s*ይባላል|ማን\s*ይባላል|ምን\s*ይሆናል)"
+)
+
+
+def looks_like_question(text: str) -> bool:
+    """True when the text carries a question marker in either script."""
+    if "?" in text or "፧" in text:
+        return True
+    return bool(_QUESTION_WORDS.search(text)) or bool(_AMHARIC_QUESTION_WORDS.search(text))
+
+
+def is_photo_caption_stub(text: str) -> bool:
+    """True when a caption is too thin to be the question itself.
+
+    A Telegram post has to wrap its media in *something*, so giveaway posters
+    routinely arrive captioned "answer below", "🔥🔥", "@ourchannel" or "Read the
+    card" with the real question printed on the picture. Both the filter (which
+    must not drop such a post) and the engine (which must transcribe rather than
+    answer the wrapper) need this judgement, so it lives in one place.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    if len(cleaned) > IMAGE_CAPTION_STUB_CHARS:
+        return False
+    return not looks_like_question(cleaned)
