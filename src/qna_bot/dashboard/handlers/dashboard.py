@@ -417,6 +417,32 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
         + ("" if ai_ok else " (no API key saved)")
     )
 
+    # Live market feed: Forex groups are only as good as the numbers they can
+    # actually reach from the host. Prove it here instead of guessing.
+    fx_groups = [g for g in enabled if g.forex_enabled]
+    if fx_groups:
+        live_on = [g for g in fx_groups if g.forex_live_data]
+        if not live_on:
+            lines.append("📈 <b>Live prices:</b> OFF for all Forex groups")
+        else:
+            probe = await ctx.ai.market_feed.snapshot("EURUSD and gold")
+            if probe.is_empty():
+                lines.append(
+                    "🔴 <b>Live prices:</b> feed unreachable from this server "
+                    f"(failed: {html.escape(', '.join(probe.failed) or 'unknown')}) — "
+                    "price questions will answer <code>No live data</code>"
+                )
+            else:
+                sample = "; ".join(q.label() for q in probe.quotes[:3])
+                lines.append(f"🟢 <b>Live prices:</b> {html.escape(sample)}")
+                for q in probe.quotes:
+                    if q.kind == "daily_fix":
+                        lines.append(
+                            "   <i>daily fix only — intraday sources were blocked "
+                            "from this server</i>"
+                        )
+                        break
+
     # Per-group verdict
     if enabled:
         lines += ["", "<b>Enabled groups</b>"]
@@ -438,6 +464,8 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
                           "strict": "🔒 strict"}.get(g.detection_mode, g.detection_mode))
             if g.trigger_keyword_list():
                 notes.append(f"🏷 must contain: {html.escape(g.trigger_keywords)}")
+            if g.forex_enabled:
+                notes.append("💱 forex" + (" + 📈 live" if g.forex_live_data else ""))
             title = html.escape(g.title[:32])
             lines.append(f"• <b>{title}</b> — {' · '.join(notes)}")
         if len(enabled) > 6:

@@ -819,6 +819,7 @@ class UserbotManager:
         result: AnswerResult = await self._ai.answer_question(
             text=clean_text,
             forex_group=group.forex_enabled,
+            live_data=group.forex_live_data,
             answer_style=group.answer_style,
             primary_provider=primary_provider,
             primary_model=primary_model,
