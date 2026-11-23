@@ -124,14 +124,30 @@ class Quote:
     def formatted(self) -> str:
         return f"{self.price:.{self.decimals}f}"
 
-    def label(self) -> str:
-        """The instrument plus how trustworthy the freshness is."""
+    def label(self, *, detailed: bool = False) -> str:
+        """The instrument and its price, without anything the model could echo.
+
+        Timestamps are deliberately absent by default. A group reply that reads
+        ``EURUSD 1.09840 (2026-11-23 05:01 UTC)`` announces both that a machine
+        produced it and that a feed was consulted, which is not what a person
+        typing a price into a giveaway does. ``detailed=True`` is for the
+        owner's own diagnostics, never for a group answer.
+        """
         stamp = self.as_of.strftime("%Y-%m-%d %H:%M UTC")
+        if detailed:
+            if self.kind == "daily_fix":
+                return f"{self.instrument} {self.formatted()} (official ECB daily fix, {self.as_of:%Y-%m-%d})"
+            if self.age_minutes > STALE_AFTER_MINUTES:
+                return f"{self.instrument} {self.formatted()} (last tick {stamp}, market closed)"
+            return f"{self.instrument} {self.formatted()} ({stamp})"
+        # A closed market still needs saying: without it the model would present
+        # Friday's close as the live price. A bare state tag does that without
+        # exposing a clock.
         if self.kind == "daily_fix":
-            return f"{self.instrument} {self.formatted()} (official ECB daily fix, {self.as_of:%Y-%m-%d})"
+            return f"{self.instrument} {self.formatted()} (daily fix)"
         if self.age_minutes > STALE_AFTER_MINUTES:
-            return f"{self.instrument} {self.formatted()} (last tick {stamp}, market closed)"
-        return f"{self.instrument} {self.formatted()} ({stamp})"
+            return f"{self.instrument} {self.formatted()} (market closed)"
+        return f"{self.instrument} {self.formatted()}"
 
 
 @dataclass
@@ -153,15 +169,15 @@ class MarketSnapshot:
         caveats: list[str] = []
         if any(q.kind == "daily_fix" for q in self.quotes):
             caveats.append(
-                "Figures marked 'official ECB daily fix' are a once-a-day reference "
-                "rate, not an intraday price; never call them the current price."
+                "Figures marked 'daily fix' are a once-a-day reference rate, not an "
+                "intraday price; never call them the current price."
             )
         if any(
             q.kind != "daily_fix" and q.age_minutes > STALE_AFTER_MINUTES for q in self.quotes
         ):
             caveats.append(
                 "Figures marked 'market closed' are the last available tick. Say the "
-                "market is closed and give the timestamp; never present them as live."
+                "market is closed; never present them as live."
             )
         if any(q.kind == "futures" for q in self.quotes):
             caveats.append(
@@ -170,8 +186,12 @@ class MarketSnapshot:
             )
         extra = ("\n" + "\n".join(caveats)) if caveats else ""
         return (
-            "LIVE MARKET DATA (fetched just now, the only prices you may state):\n"
-            f"{numbers}{extra}"
+            "LIVE MARKET DATA (the only prices you may state):\n"
+            f"{numbers}{extra}\n"
+            "Quote the number exactly as written. Never add a date, a time, "
+            "'as of', 'fetched', or a source name, and never mention data feeds, "
+            "APIs or being updated - reply the way a trader glancing at a chart "
+            "would: the price, and nothing around it."
         )
 
 

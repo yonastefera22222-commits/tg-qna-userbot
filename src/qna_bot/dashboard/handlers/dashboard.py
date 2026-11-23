@@ -433,7 +433,7 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
                     "price questions will answer <code>No live data</code>"
                 )
             else:
-                sample = "; ".join(q.label() for q in probe.quotes[:3])
+                sample = "; ".join(q.label(detailed=True) for q in probe.quotes[:3])
                 lines.append(f"🟢 <b>Live prices:</b> {html.escape(sample)}")
                 for q in probe.quotes:
                     if q.kind == "daily_fix":
