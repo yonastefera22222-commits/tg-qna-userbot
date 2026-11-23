@@ -35,6 +35,17 @@ SKIP_TOKEN = "SKIP"
 #: Give the thought process room without letting the visible answer grow.
 REASONING_HEADROOM_TOKENS = 256
 
+#: Ethiopic script tokenizes at roughly one token per character, against about
+#: four characters per token for Latin. The same 48-token giveaway budget that
+#: fits a one-word English answer can therefore cut an Amharic sentence off
+#: mid-word. Amharic rewards the extra room; the prompt still asks for a bare
+#: answer, so the visible reply does not grow.
+AMHARIC_TOKEN_HEADROOM = 64
+
+
+class _TruncatedAnswerError(RuntimeError):
+    """The provider stopped at its token ceiling, so the text is a fragment."""
+
 #: How long a pooled TLS connection survives an idle spell. httpx defaults to
 #: 5s, which is shorter than the gap between giveaway questions, so the next
 #: message after every pause paid a fresh handshake.
@@ -318,23 +329,45 @@ class AIEngine:
         )
         user_prompt = self._build_user_prompt(text, context_lines)
         effective_max_tokens = min(max_tokens, 48) if answer_style == "giveaway" else max_tokens
+        # Ethiopic script costs far more tokens per character than Latin, so an
+        # Amharic answer needs more room to say the same thing. The prompt still
+        # asks for a bare answer, so this widens the ceiling, not the reply.
+        if detect_language(text) == "am":
+            effective_max_tokens += AMHARIC_TOKEN_HEADROOM
 
         last_error: str | None = None
         for idx, (provider, model, api_key) in enumerate(attempts):
             attempt_t0 = time.perf_counter()
             try:
-                raw_text = await self._call_provider(
-                    provider=provider,
-                    model=model,
-                    api_key=api_key,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    temperature=temperature,
-                    max_tokens=effective_max_tokens,
-                    image=image,
-                    image_mime=image_mime,
-                    speed_mode=speed_mode,
-                )
+                try:
+                    raw_text = await self._call_provider(
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_tokens=effective_max_tokens,
+                        image=image,
+                        image_mime=image_mime,
+                        speed_mode=speed_mode,
+                    )
+                except _TruncatedAnswerError:
+                    # One retry with a ceiling wide enough to finish. Posting the
+                    # fragment instead would look like a confident wrong answer.
+                    logger.info("Answer truncated at %s tokens; retrying with room", effective_max_tokens)
+                    raw_text = await self._call_provider(
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_tokens=effective_max_tokens * 3,
+                        image=image,
+                        image_mime=image_mime,
+                        speed_mode=speed_mode,
+                    )
                 elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
                 cleaned = self._clean_output(raw_text, answer_style)
                 if cleaned is None:
@@ -625,7 +658,15 @@ class AIEngine:
             choices = data.get("choices") or []
             if not choices:
                 return ""
-            return str(choices[0].get("message", {}).get("content") or "")
+            choice = choices[0]
+            if choice.get("finish_reason") == "length":
+                # The answer was cut off mid-thought. Posting the fragment is
+                # worse than posting nothing: it reads as a confident wrong
+                # answer. Callers treat it as SKIP and let the fallback try.
+                raise _TruncatedAnswerError(
+                    f"{provider}/{model} hit the {max_tokens}-token ceiling"
+                )
+            return str(choice.get("message", {}).get("content") or "")
 
         if provider == "gemini":
             url = f"{spec.base_url}/models/{model}:generateContent"
@@ -654,7 +695,13 @@ class AIEngine:
             candidates = data.get("candidates") or []
             if not candidates:
                 return ""
-            parts = candidates[0].get("content", {}).get("parts") or []
+            candidate = candidates[0]
+            # MAX_TOKENS = 2 in the Gemini proto enum.
+            if candidate.get("finishReason") in ("MAX_TOKENS", 2):
+                raise _TruncatedAnswerError(
+                    f"{provider}/{model} hit the {max_tokens}-token ceiling"
+                )
+            parts = candidate.get("content", {}).get("parts") or []
             return "".join(str(p.get("text", "")) for p in parts)
 
         raise ValueError(f"Unsupported provider: {provider}")

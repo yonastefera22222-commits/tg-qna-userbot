@@ -63,14 +63,37 @@ def ethiopic_ratio(text: str) -> float:
     return ethiopic / total
 
 
-def detect_language(text: str, *, threshold: float = 0.5) -> str:
+#: Share of Ethiopic letters at which a message counts as Amharic.
+#:
+#: Mixed questions are the normal case in these groups, not the exception:
+#: "FIFA ሲተነተን ምን ማለት ነው" (0.75 Ethiopic) and "explain VAR ማለት ምን ነው" (0.41)
+#: are both Amharic questions with an English term embedded. A 0.5 cut sent the
+#: second one down the English path and answered it in English. A third of the
+#: letters is enough to know the asker is writing Amharic.
+MIXED_AMHARIC_THRESHOLD = 0.25
+
+
+def detect_language(text: str, *, threshold: float = MIXED_AMHARIC_THRESHOLD) -> str:
     """Return ``"am"`` for Amharic text, else ``"en"``.
 
-    The threshold is a share of letters, not of characters: a question that
-    quotes one English name inside an Amharic sentence is still an Amharic
-    question.
+    The threshold is a share of letters, not of characters, and it is set low on
+    purpose: a question that embeds an English name or term inside an Amharic
+    sentence is still an Amharic question.
     """
     return AMHARIC if ethiopic_ratio(text) >= threshold else ENGLISH
+
+
+def is_mixed(text: str) -> bool:
+    """True when the text carries both Ethiopic and Latin letters.
+
+    Mixed questions need their own rule: the answer should be in the language
+    being *asked* (the Ethiopic one, when the Ethiopic text is the question
+    frame), while any term quoted in English must be kept as the English term
+    rather than translated into something the host will not recognise.
+    """
+    ethiopic = any(ord(ch) in _ETHIOPIC_CODE_POINTS for ch in text or "")
+    latin = any(ch.isascii() and ch.isalpha() for ch in text or "")
+    return ethiopic and latin
 
 
 def is_amharic(text: str) -> bool:
@@ -96,6 +119,12 @@ ANSWER_IN_LANGUAGE_INSTRUCTION = (
 AMHARIC_GUIDANCE = (
     "The question is in Amharic (Ethiopic script). Answer in Amharic using the "
     "Ethiopic script, never transliterated Latin letters.\n"
+    "- If the question MIXES English and Amharic (for example \"FIFA ሲተነተን ምን "
+    "ማለት ነው\" or \"explain VAR ማለት ምን ነው\"), answer in Amharic, and keep any "
+    "name, acronym or technical term that was written in English exactly as it "
+    "was written - do not translate FIFA, VAR, USD or EURUSD into Amharic.\n"
+    "- A mixed question asking what a word MEANS (\"X ማለት ምን ነው\") wants the "
+    "meaning of X, not a restatement of the question.\n"
     "- If the question uses Amharic numerals (፩ ፪ ፫ … ፲ ፳ ፻ ፼), reply using "
     "Amharic numerals too.\n"
     "- If the question refers to a year with ዓ.ም / ዓ.ዓ, use the Ethiopian "
