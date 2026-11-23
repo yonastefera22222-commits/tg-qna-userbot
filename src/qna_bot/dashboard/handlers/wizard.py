@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import logging
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -13,6 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from ...ai.providers import PROVIDERS, fetch_live_models
 from ...userbot.login import CodeDelivery, LoginStatus
 from ..context import AppContext, safe_delete_message, safe_edit_text
+from ..filters import NotACommand
 from ..keyboards import (
     groups_list_kb,
     main_dashboard_kb,
@@ -23,6 +25,8 @@ from ..keyboards import (
     wizard_welcome_kb,
 )
 from ..states import AI_MENU_STATES, WizardStates
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="wizard")
 
@@ -171,8 +175,16 @@ async def cmd_setup(message: Message, ctx: AppContext, state: FSMContext) -> Non
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    # Clear the state FIRST and never let anything below undo that. This is the
+    # owner's way out of a stuck step: if cancelling the pending login threw, the
+    # handler would abort with the state still set and the bot would keep
+    # demanding an API key forever. A failed side effect is worth a log line, not
+    # a trapped owner.
     await state.clear()
-    await ctx.userbot.cancel_pending_login()
+    try:
+        await ctx.userbot.cancel_pending_login()
+    except Exception as exc:  # noqa: BLE001 - an escape hatch must always open
+        logger.warning("Cancelling the pending login failed: %s", exc)
     if await ctx.is_setup_complete():
         global_on = bool(await ctx.db.get_setting("global_enabled", True))
         notify_on = bool(await ctx.db.get_setting("notify_on_answer", False))
@@ -227,7 +239,7 @@ async def cb_step1_creds(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(WizardStates.waiting_api_id)
+@router.message(NotACommand(), WizardStates.waiting_api_id)
 async def msg_api_id(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     await safe_delete_message(message)
@@ -242,7 +254,7 @@ async def msg_api_id(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(WizardStates.waiting_api_hash)
+@router.message(NotACommand(), WizardStates.waiting_api_hash)
 async def msg_api_hash(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     await safe_delete_message(message)
@@ -299,7 +311,7 @@ async def cb_login_phone(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(WizardStates.waiting_phone)
+@router.message(NotACommand(), WizardStates.waiting_phone)
 async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> None:
     phone = (message.text or "").strip()
     await safe_delete_message(message)
@@ -373,7 +385,7 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
 # ----------------------------------------------------------------------
 
 
-@router.message(WizardStates.waiting_login_email)
+@router.message(NotACommand(), WizardStates.waiting_login_email)
 async def msg_login_email(message: Message, ctx: AppContext, state: FSMContext) -> None:
     email = (message.text or "").strip()
     await safe_delete_message(message)
@@ -394,7 +406,7 @@ async def msg_login_email(message: Message, ctx: AppContext, state: FSMContext) 
     )
 
 
-@router.message(WizardStates.waiting_login_email_code)
+@router.message(NotACommand(), WizardStates.waiting_login_email_code)
 async def msg_login_email_code(message: Message, ctx: AppContext, state: FSMContext) -> None:
     code = (message.text or "").strip()
     await safe_delete_message(message)
@@ -452,7 +464,7 @@ async def cb_email_code(callback: CallbackQuery, ctx: AppContext, state: FSMCont
     )
 
 
-@router.message(WizardStates.waiting_email_login_address)
+@router.message(NotACommand(), WizardStates.waiting_email_login_address)
 async def msg_email_login_address(message: Message, ctx: AppContext, state: FSMContext) -> None:
     address = (message.text or "").strip()
     await safe_delete_message(message)
@@ -479,7 +491,7 @@ async def msg_email_login_address(message: Message, ctx: AppContext, state: FSMC
     )
 
 
-@router.message(WizardStates.waiting_email_login_code)
+@router.message(NotACommand(), WizardStates.waiting_email_login_code)
 async def msg_email_login_code(message: Message, ctx: AppContext, state: FSMContext) -> None:
     code = (message.text or "").strip()
     await safe_delete_message(message)
@@ -858,7 +870,7 @@ async def cb_qr_check(callback: CallbackQuery, ctx: AppContext, state: FSMContex
         await _show_ai_step(callback.message, ctx, state)
 
 
-@router.message(WizardStates.waiting_qr_2fa)
+@router.message(NotACommand(), WizardStates.waiting_qr_2fa)
 async def msg_qr_2fa(message: Message, ctx: AppContext, state: FSMContext) -> None:
     password = message.text or ""
     await safe_delete_message(message)
@@ -1060,7 +1072,7 @@ async def cb_otp_keypad(callback: CallbackQuery, ctx: AppContext, state: FSMCont
         await _process_otp_submission(callback, ctx, state, digits)
 
 
-@router.message(WizardStates.waiting_otp)
+@router.message(NotACommand(), WizardStates.waiting_otp)
 async def msg_otp_fallback(message: Message, ctx: AppContext, state: FSMContext) -> None:
     """Allow spaced text fallback like '1 2 3 4 5' if the user types instead of using keypad."""
     raw = (message.text or "").strip()
@@ -1125,7 +1137,7 @@ async def _process_otp_submission(
         await target.answer(err_prompt, reply_markup=otp_keypad_kb(""))
 
 
-@router.message(WizardStates.waiting_2fa)
+@router.message(NotACommand(), WizardStates.waiting_2fa)
 async def msg_2fa_password(message: Message, ctx: AppContext, state: FSMContext) -> None:
     password = message.text or ""
     await safe_delete_message(message)
@@ -1150,7 +1162,7 @@ async def cb_login_session(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(WizardStates.waiting_string_session)
+@router.message(NotACommand(), WizardStates.waiting_string_session)
 async def msg_string_session(message: Message, ctx: AppContext, state: FSMContext) -> None:
     session_str = (message.text or "").strip()
     await safe_delete_message(message)
@@ -1204,7 +1216,7 @@ async def cb_wiz_pick_provider(callback: CallbackQuery, ctx: AppContext, state: 
     )
 
 
-@router.message(WizardStates.waiting_ai_key)
+@router.message(NotACommand(), WizardStates.waiting_ai_key)
 async def msg_wiz_ai_key(message: Message, ctx: AppContext, state: FSMContext) -> None:
     api_key = (message.text or "").strip()
     await safe_delete_message(message)
@@ -1333,7 +1345,7 @@ async def cb_wiz_model(callback: CallbackQuery, ctx: AppContext, state: FSMConte
         )
 
 
-@router.message(WizardStates.waiting_custom_model)
+@router.message(NotACommand(), WizardStates.waiting_custom_model)
 async def msg_wiz_custom_model(message: Message, ctx: AppContext, state: FSMContext) -> None:
     model_id = (message.text or "").strip()
     if not model_id:

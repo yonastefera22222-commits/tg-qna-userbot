@@ -10,7 +10,14 @@ from aiogram.types import CallbackQuery, Message
 
 from ...ai.providers import PROVIDERS, fetch_live_models
 from ..context import AppContext, safe_delete_message, safe_edit_text
-from ..keyboards import SPEED_CYCLE, ai_menu_kb, model_picker_kb, provider_picker_kb
+from ..filters import NotACommand
+from ..keyboards import (
+    SPEED_CYCLE,
+    ai_menu_kb,
+    cancel_to_dashboard_kb,
+    model_picker_kb,
+    provider_picker_kb,
+)
 from ..states import DashboardStates
 
 router = Router(name="ai_settings")
@@ -182,21 +189,109 @@ async def cb_prompt_key_update(
     )
 
 
-@router.message(DashboardStates.waiting_ai_key_update)
+def sanitise_api_key(raw: str) -> str:
+    """Strip the noise that gets pasted along with a key.
+
+    Owners paste keys out of a browser, a password manager or a chat message, so
+    a trailing newline, surrounding quotes, a stray ``Bearer `` prefix or an
+    invisible bidi mark all arrive with the key. Sent verbatim, any one of them
+    makes the header malformed and the provider answers 401 "Missing
+    Authentication header" - which reads as a bad key when the key was fine.
+    """
+    key = (raw or "").strip()
+    # Quoted pastes: "sk-or-v1-..." or 'sk-...'
+    for quote in ('"', "'", "`"):
+        if len(key) > 1 and key.startswith(quote) and key.endswith(quote):
+            key = key[1:-1].strip()
+    # Already-prefixed pastes create "Bearer Bearer ..."
+    if key[:7].lower() == "bearer ":
+        key = key[7:].strip()
+    # Invisible marks: bidi controls, zero-width spaces, BOM.
+    key = key.translate({i: None for i in list(range(0x200B, 0x2010)) + [0xFEFF, 0x200E, 0x200F]})
+    # A pasted key can carry a label such as "OpenRouter key: sk-or-v1-..."
+    if ":" in key and " " not in key.split(":", 1)[1].strip():
+        key = key.split(":", 1)[1].strip()
+    return key.strip()
+
+
+def describe_key_failure(spec, key: str, detail: str) -> str:
+    """Turn a provider's 401 into the one sentence that moves the owner forward.
+
+    "Missing Authentication header" from OpenRouter means the request carried no
+    usable key *at all* - an empty or mangled paste - not that the key was
+    rejected. Reporting it raw sent the owner round the same loop three times.
+    """
+    lowered = (detail or "").lower()
+    if "missing authentication" in lowered or "no auth" in lowered:
+        return (
+            "ℹ️ The request reached "
+            f"{spec.name} without a usable key, so nothing was actually checked. "
+            "That usually means the key was pasted incompletely or with extra "
+            "text around it."
+        )
+    if "401" in lowered or "unauthor" in lowered or "invalid api key" in lowered:
+        return (
+            f"ℹ️ {spec.name} rejected this key. Make sure it was copied in full "
+            f"and not revoked, then send a fresh one."
+        )
+    if "429" in lowered or "rate limit" in lowered or "quota" in lowered:
+        return (
+            f"ℹ️ The key itself is fine; {spec.name} is rate-limiting it right "
+            "now. Wait a moment and send it again, or use another provider."
+        )
+    return "Send another key, or tap below to leave this step:"
+
+
+def api_key_problem(spec, key: str) -> str | None:
+    """Explain why a key cannot be a real key, or None when it looks plausible.
+
+    Checked locally so the owner gets a straight answer instead of one provider's
+    HTTP 401, which is indistinguishable from a bad key and sends them round the
+    same loop again.
+    """
+    if not key:
+        return "That message did not contain a key. Send the key itself, or /cancel."
+    if any(ch.isspace() for ch in key):
+        return (
+            "The key contains spaces, so it was probably pasted with a label or "
+            "across lines. Send just the key."
+        )
+    if len(key) < 16:
+        return f"That is too short to be a {spec.name} key ({len(key)} characters)."
+    if spec.key_prefix and not key.startswith(spec.key_prefix):
+        return (
+            f"{spec.name} keys start with <code>{spec.key_prefix}</code>; this one "
+            "starts differently. Copy it again from your provider's dashboard."
+        )
+    return None
+
+
+@router.message(NotACommand(), DashboardStates.waiting_ai_key_update)
 async def msg_update_ai_key(message: Message, ctx: AppContext, state: FSMContext) -> None:
-    api_key = (message.text or "").strip()
+    api_key = sanitise_api_key(message.text or "")
     await safe_delete_message(message)
     data = await state.get_data()
     provider = str(data.get("key_target_provider", "groq"))
     role = str(data.get("key_target_role", "key_only"))
     spec = PROVIDERS[provider]
 
+    problem = api_key_problem(spec, api_key)
+    if problem is not None:
+        await message.answer(
+            f"⚠️ <b>{spec.name}: not saved</b>\n\n{problem}\n\n"
+            "Send the key again, or tap below to leave this step:",
+            reply_markup=cancel_to_dashboard_kb(),
+        )
+        return
+
     wait_msg = await message.answer(f"⚡ Testing {spec.name} API key...")
     ok, latency_ms, detail = await ctx.ai.test_connection(provider, spec.default_model, api_key)
     if not ok:
         await wait_msg.edit_text(
             f"❌ <b>{spec.name} test failed</b> ({latency_ms}ms):\n"
-            f"<code>{html.escape(detail)}</code>\n\nSend another key or /cancel:"
+            f"<code>{html.escape(detail)}</code>\n\n"
+            f"{describe_key_failure(spec, api_key, detail)}",
+            reply_markup=cancel_to_dashboard_kb(),
         )
         return
 
@@ -308,7 +403,7 @@ async def cb_ai_model_action(
         )
 
 
-@router.message(DashboardStates.waiting_custom_model_update)
+@router.message(NotACommand(), DashboardStates.waiting_custom_model_update)
 async def msg_custom_model_update(
     message: Message, ctx: AppContext, state: FSMContext
 ) -> None:

@@ -114,6 +114,9 @@ git push -u origin main
    - **Step 1**: Enter your Telegram `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) → *API development tools*.
    - **Step 2**: If codes never arrive, use **📷 Login with QR Code** (no SMS needed). Otherwise send your phone number in **international format** (e.g. `+251912345678` — country code, no leading `0`). The bot then tells you **where Telegram sent the code** (usually a service message *inside* the Telegram app, not an SMS), then tap the digits on the **inline numeric keypad** (+ 2FA password if enabled). No code? Tap **❓ No code received?**, then **🔄 Resend Code** — Telegram switches channel (app message → SMS → call).
    - **Step 3**: Pick a free AI provider (recommended: **⚡ Groq** from [console.groq.com/keys](https://console.groq.com/keys)), paste your API key (tested live with ms speed!), and choose a model.
+     - Paste the key **on its own**. Trailing newlines, surrounding quotes, a `Bearer ` prefix and invisible characters copied from a browser are all stripped automatically, and a key with the wrong prefix (e.g. a Groq `gsk_…` key pasted into OpenRouter, which expects `sk-or-…`) is caught **before** any request is sent.
+     - If a test fails, the message says *why*: a 401 saying **"Missing Authentication header"**, a **429** rate limit and a genuinely rejected key are three different problems, and only one of them means "get a new key".
+     - **You can always leave the step.** `/cancel`, `/start`, `/setup`, `/dashboard` and every other command work from any step — a stuck prompt can never lock you out of the bot.
    - **Step 4**: Toggle `✅` on the giveaway groups you want to monitor, tap `⚙️` on any group to customize rules, and tap **✅ Finish Setup & Open Dashboard**.
 
 ### Step 4 — Make Your Setup Survive Render Free Restarts (Important!)

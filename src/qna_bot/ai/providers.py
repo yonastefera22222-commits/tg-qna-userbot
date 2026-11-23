@@ -25,6 +25,10 @@ class ProviderSpec:
     base_url: str
     default_model: str
     presets: tuple[ModelPreset, ...]
+    #: How every key from this provider begins. Checked locally before an HTTP
+    #: call so a truncated or mistyped paste is reported as such, instead of
+    #: coming back as a bare 401 that looks identical to an invalid key.
+    key_prefix: str = ""
 
 
 PROVIDERS: dict[str, ProviderSpec] = {
@@ -39,6 +43,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         # Enterprise-only), and shut down Llama 4 Scout and Qwen3 32B on
         # 2026-07-17. The free plan today is gpt-oss + Qwen3.8.
         default_model="openai/gpt-oss-120b",
+        key_prefix="gsk_",
         presets=(
             ModelPreset(
                 "openai/gpt-oss-120b",
@@ -72,6 +77,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
         # Free-tier Flash / Flash-Lite IDs as of late 2026. 2.0 Flash was shut
         # down on 2026-06-01 and 2.5 access is restricted to older projects.
         default_model="gemini-3.5-flash-lite",
+        # Google AI Studio keys all begin with this; the exact value is used only
+        # as a paste check, never as authentication.
+        key_prefix="AIza",
         presets=(
             ModelPreset(
                 "gemini-3.5-flash-lite",
@@ -106,6 +114,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         signup_url="https://openrouter.ai/keys",
         base_url="https://openrouter.ai/api/v1",
         default_model="openrouter/free",
+        key_prefix="sk-or-",
         presets=(
             ModelPreset(
                 "openrouter/free",
