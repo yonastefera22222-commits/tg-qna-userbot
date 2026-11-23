@@ -78,6 +78,17 @@ _CONCEPTS = (
     "aussie", "kiwi", "swissy", "yen", "euro", "pound", "greenback",
 )
 
+#: Forex terms written in Ethiopic script. Amharic-speaking traders spell the
+#: English term phonetically - ጎልድ is "gold", ሌቨሬጅ is "leverage" - and these
+#: questions are otherwise invisible to an English keyword list.
+_AMHARIC_FOREX_TERMS = (
+    "ጎልድ", "ሶስት", "ብር", "ዶላር", "ዩሮ", "ፓውንድ", "የን",
+    "ፒፕ", "ፒፕስ", "ሎት", "ሌቨሬጅ", "ስፕሬድ", "ማርጅን", "ስቶፕ ሎስ",
+    "ቴክ ፕሮፊት", "ስዋፕ", "ሴሽን", "ትሬንድ", "ሱፖርት", "ሪሲስታንስ",
+    "ቻርት", "ካንድል", "ብረት", "ሴንትራል ባንክ", "ኢንፍሌሽን",
+    "ኤፍኤክስ", "ፎሬክስ", "ሚኒ ሎት", "ስታንዳርድ ሎት", "ሚክሮ ሎት",
+)
+
 #: Explicit pair mentions: EURUSD, EUR/USD, EUR-USD.
 _PAIR_RE = re.compile(
     r"\b(?:" + "|".join(_CURRENCIES) + r")\s*[/\-]?\s*"
@@ -104,6 +115,10 @@ _CONCEPT_RE = re.compile(
 )
 
 _NICKNAME_RE = re.compile(r"\b(?:" + "|".join(_NICKNAMES) + r")\b", re.IGNORECASE)
+
+#: Ethiopic terms are matched without \b: the word-boundary classes are tuned
+#: for Latin script and would not fire reliably around Ethiopic letters.
+_AMHARIC_TERM_RE = re.compile("|".join(_AMHARIC_FOREX_TERMS))
 
 #: A question that asks for live/current/forward-looking information. These are
 #: unanswerable without a data feed and must not be guessed.
@@ -159,6 +174,7 @@ def is_forex_question(text: str) -> bool:
         or _METAL_RE.search(text)
         or _CONCEPT_RE.search(text)
         or _NICKNAME_RE.search(text)
+        or _AMHARIC_TERM_RE.search(text)
     )
 
 
