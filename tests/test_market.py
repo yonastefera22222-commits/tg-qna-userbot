@@ -137,25 +137,42 @@ def _quote(**kwargs) -> Quote:
     return Quote(**{**defaults, **kwargs})
 
 
-def test_live_quote_is_labelled_with_time() -> None:
+def test_live_quote_label_has_no_timestamp() -> None:
+    """A group reply must not reveal that a feed was consulted, or when.
+
+    "EURUSD 1.09840 (2026-11-23 05:01 UTC)" tells the whole group that a bot
+    fetched a price. The bare figure is what a person would type.
+    """
     label = _quote().label()
-    assert "1.09840" in label
-    assert "UTC" in label
-    assert "market closed" not in label
+    assert label == "EURUSD 1.09840"
+    assert "UTC" not in label
+    assert "2026" not in label
 
 
-def test_stale_quote_says_market_closed() -> None:
+def test_stale_quote_says_market_closed_without_a_clock() -> None:
     old = _quote(as_of=datetime.now(UTC) - timedelta(minutes=STALE_AFTER_MINUTES + 5))
     label = old.label()
+    # The state still has to be honest - Friday's close is not the live price -
+    # but the timestamp itself is not shown.
     assert "market closed" in label
-    assert "last tick" in label
+    assert "UTC" not in label
+    assert "2026" not in label
 
 
 def test_ecb_fix_is_never_called_current() -> None:
     fix = _quote(kind="daily_fix", source="frankfurter/ecb", as_of=datetime(2026, 11, 20, tzinfo=UTC))
     label = fix.label()
-    assert "official ECB daily fix" in label
-    assert "2026-11-20" in label
+    assert "daily fix" in label
+    assert "official" not in label
+    assert "2026-11-20" not in label
+
+
+def test_detailed_label_keeps_the_timestamp() -> None:
+    # The owner's own diagnostics still need the clock; group replies do not.
+    label = _quote().label(detailed=True)
+    assert "UTC" in label
+    fix = _quote(kind="daily_fix", as_of=datetime(2026, 11, 20, tzinfo=UTC))
+    assert "2026-11-20" in fix.label(detailed=True)
 
 
 def test_jpy_pairs_use_three_decimals() -> None:
@@ -173,8 +190,17 @@ def test_prompt_block_warns_about_daily_fixes() -> None:
         quotes=[_quote(kind="daily_fix", as_of=datetime(2026, 11, 20, tzinfo=UTC))]
     )
     block = snapshot.as_prompt_block()
-    assert "official ECB daily fix" in block
+    assert "daily fix" in block
     assert "never call them the current price" in block
+    assert "2026-11-20" not in block
+
+
+def test_prompt_block_forbids_dates_and_provenance() -> None:
+    block = MarketSnapshot(quotes=[_quote()]).as_prompt_block()
+    # The model is told not to decorate the number, whatever it can see.
+    assert "Never add a date, a time" in block
+    assert "never mention data feeds" in block
+    assert "UTC" not in block
 
 
 def test_prompt_block_warns_about_closed_market() -> None:

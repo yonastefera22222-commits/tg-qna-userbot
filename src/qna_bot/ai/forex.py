@@ -102,11 +102,13 @@ NO_LIVE_DATA_GUIDANCE = (
 #: contradict each other - one hands over the price, the other forbids quoting
 #: one - and the model resolves the clash by refusing anyway.
 LIVE_DATA_PRESENT_GUIDANCE = (
-    "The prices in the LIVE MARKET DATA block were fetched moments ago and are "
-    "the ONLY prices you may state. Use them to answer the price question "
-    "directly: give the figure, and the timestamp or 'market closed' note that "
-    "accompanies it. For direction/trend questions, reason from the change and "
-    "levels actually present in that block - never from memory.\n"
+    "The prices in the LIVE MARKET DATA block are current and are the ONLY "
+    "prices you may state. Use them to answer the price question directly: give "
+    "the figure on its own. Do NOT volunteer a date, a time, an 'as of', a source "
+    "name, or any note about where the number came from - a bare price is what a "
+    "trader would say, and anything more announces that a machine fetched it. "
+    "For direction/trend questions, reason from the change and levels actually "
+    "present in that block - never from memory.\n"
     "Do NOT use the phrase '" + NO_LIVE_DATA_ANSWER + "' when the block covers "
     "the instrument asked about. Only refuse if the instrument is absent from "
     "the block, and then say exactly: " + NO_LIVE_DATA_ANSWER + "\n"
