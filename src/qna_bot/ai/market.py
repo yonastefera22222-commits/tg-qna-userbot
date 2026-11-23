@@ -72,8 +72,33 @@ _SHORTHAND: dict[str, str] = {
 }
 
 _METALS = {"XAU": "XAUUSD", "XAG": "XAGUSD"}
+
+#: Crypto is quoted around the clock, including weekends, so a period question
+#: about it is always answerable without a "market closed" caveat.
+_CRYPTO_NAMES = {
+    "BTC": "BTCUSD", "BITCOIN": "BTCUSD",
+    "ETH": "ETHUSD", "ETHEREUM": "ETHUSD",
+    "SOL": "SOLUSD", "SOLANA": "SOLUSD",
+    "XRP": "XRPUSD", "RIPPLE": "XRPUSD",
+    "DOGE": "DOGEUSD", "DOGECOIN": "DOGEUSD",
+    "BNB": "BNBUSD", "LTC": "LTCUSD", "LITECOIN": "LTCUSD",
+}
 #: Bare tokens that map straight onto a feedable instrument.
-_BARE_MAP = {**_METALS, "GOLD": "XAUUSD", "SILVER": "XAGUSD", "DXY": "DXY", "US10Y": "US10Y"}
+#: "BTCUSD", "BTCUSDT", "BTC/USDT", "btcusd" - how brokers (Exness included)
+#: and charts actually write crypto pairs.
+_CRYPTO_PAIR_RE = re.compile(
+    r"\b(" + "|".join(_CRYPTO_NAMES) + r")\s*(?:/|-)?\s*(?:usdt|usd|busd)\b",
+    re.IGNORECASE,
+)
+
+_BARE_MAP = {
+    **_METALS,
+    **_CRYPTO_NAMES,
+    "GOLD": "XAUUSD",
+    "SILVER": "XAGUSD",
+    "DXY": "DXY",
+    "US10Y": "US10Y",
+}
 _INDEX_INSTRUMENTS = {
     "DXY": ("DX-Y.NYB", "DXY", "US Dollar Index"),
     "US10Y": ("^TNX", "US10Y", "US 10-year yield (percent)"),
@@ -85,9 +110,34 @@ _YAHOO_SYMBOLS: dict[str, tuple[str, str, str]] = {
     **_INDEX_INSTRUMENTS,
 }
 
+#: Crypto instruments and their Yahoo tickers. These are also the instruments
+#: eligible for period questions ("what was the high last week").
+_CRYPTO_SYMBOLS: dict[str, str] = {
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+    "SOLUSD": "SOL-USD",
+    "XRPUSD": "XRP-USD",
+    "DOGEUSD": "DOGE-USD",
+    "BNBUSD": "BNB-USD",
+    "LTCUSD": "LTC-USD",
+}
+
+#: Instruments whose OHLC history is fetched from the same free chart endpoint.
+#: Metals and indices are included because "last week's high" is just as fair a
+#: question about gold as about Bitcoin.
+HISTORY_INSTRUMENTS: dict[str, str] = {
+    **_CRYPTO_SYMBOLS,
+    "XAUUSD": "GC=F",
+    "XAGUSD": "SI=F",
+    "DXY": "DX-Y.NYB",
+}
+
 _PAIR_RE = re.compile(r"^([A-Z]{3})/?([A-Z]{3})$")
 #: Bare metals and the yield/index tokens a trader types on their own.
-_BARE_RE = re.compile(r"\b(XAU|XAG|GOLD|SILVER|DXY|US10Y)\b")
+_BARE_RE = re.compile(
+    r"\b(XAU|XAG|GOLD|SILVER|DXY|US10Y|BTC|ETH|SOL|XRP|DOGE|BNB|LTC|"
+    r"BITCOIN|ETHEREUM|SOLANA|RIPPLE|DOGECOIN|LITECOIN)\b"
+)
 _NICKNAME_RE = re.compile(
     r"\b(" + "|".join(sorted(_SHORTHAND, key=len, reverse=True)) + r")\b"
 )
@@ -151,6 +201,29 @@ class Quote:
 
 
 @dataclass
+class PeriodAnswer:
+    """A computed fact about a past window: not a quote, an answer."""
+
+    instrument: str
+    period: str
+    aggregation: str
+    value: float
+    high: float
+    low: float
+    open: float
+    close: float
+    start: datetime
+    end: datetime
+    decimals: int = 2
+
+    def formatted(self) -> str:
+        # "change" is a percentage, everything else is a price.
+        if self.aggregation == "change":
+            return f"{self.value:+.2f}%"
+        return f"{self.value:.{self.decimals}f}"
+
+
+@dataclass
 class MarketSnapshot:
     """A digest of the figures relevant to one question."""
 
@@ -195,9 +268,99 @@ class MarketSnapshot:
         )
 
 
+#: Period questions. "last week", "yesterday", "this month" - a window whose
+#: high/low/close/change can be read straight off the OHLC series.
+_PERIOD_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(yesterday|last\s+session)\b", re.I), "yesterday"),
+    (re.compile(r"\b(last|previous|past)\s+week\b", re.I), "last_week"),
+    (re.compile(r"\bthis\s+week\b|\bweek\s+to\s+date\b|\bwtd\b", re.I), "this_week"),
+    (re.compile(r"\b(last|previous|past)\s+month\b", re.I), "last_month"),
+    (re.compile(r"\bthis\s+month\b|\bmonth\s+to\s+date\b|\bmtd\b", re.I), "this_month"),
+    (re.compile(r"\b(today|so\s+far\s+today)\b", re.I), "today"),
+    (re.compile(r"\b(last|previous|past)\s+(?:7|seven)\s+days?\b", re.I), "last_week"),
+    (re.compile(r"\b(last|previous|past)\s+(?:30|thirty)\s+days?\b", re.I), "last_month"),
+)
+
+#: What to read off the series.
+_AGGREGATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(highest|high|top|peak|maximum|max)\b", re.I), "high"),
+    (re.compile(r"\b(lowest|low|bottom|minimum|min)\b", re.I), "low"),
+    (re.compile(r"\b(open(?:ing)?|opened)\b", re.I), "open"),
+    (re.compile(r"\b(close|closed|closing|end(?:ed)?)\b", re.I), "close"),
+    (re.compile(r"\b(change|move|performance|return|gain|loss|up|down|%)\b", re.I), "change"),
+)
+
+#: How many days back each period starts. Crypto trades daily, so calendar days
+#: are the right unit; an FX "last week" skips the weekend automatically because
+#: Yahoo simply has no bars for it.
+_PERIOD_DAYS = {
+    "today": 1,
+    "yesterday": 2,
+    "this_week": 7,
+    "last_week": 14,
+    "this_month": 31,
+    "last_month": 62,
+}
+
+
+@dataclass
+class PeriodQuery:
+    """A question about a past window, answerable from an OHLC series."""
+
+    period: str
+    aggregation: str
+    instrument: str | None = None
+
+    @property
+    def days(self) -> int:
+        return _PERIOD_DAYS.get(self.period, 7)
+
+    def window_days(self) -> int:
+        """How many of the most recent bars belong to the window itself.
+
+        "last week" means the previous 7 days excluding today; "this week"
+        includes today, so the arithmetic lives here rather than in the caller.
+        """
+        if self.period in ("today", "yesterday"):
+            return 1
+        return 7 if "week" in self.period else 30
+
+
+def parse_period_query(text: str) -> PeriodQuery | None:
+    """Detect a "high/low/close over a past window" question.
+
+    Returns None when the message is not a period question, which keeps the
+    live-quote path untouched for everything else.
+    """
+    if not text:
+        return None
+    period = None
+    for pattern, name in _PERIOD_PATTERNS:
+        if pattern.search(text):
+            period = name
+            break
+    if period is None:
+        return None
+
+    aggregation = None
+    for pattern, name in _AGGREGATIONS:
+        if pattern.search(text):
+            aggregation = name
+            break
+    if aggregation is None:
+        return None
+
+    instruments = instruments_in(text)
+    return PeriodQuery(period=period, aggregation=aggregation,
+                       instrument=instruments[0] if instruments else None)
+
+
 def _decimals_for(instrument: str) -> int:
     if "JPY" in instrument:
         return 3
+    # Crypto is quoted in dollars; five FX decimals on 66055.10 is nonsense.
+    if instrument in _CRYPTO_SYMBOLS:
+        return 2
     if instrument in ("XAUUSD", "XAGUSD"):
         return 2
     if instrument in ("DXY", "US10Y"):
@@ -210,6 +373,9 @@ def normalise_instrument(token: str) -> str | None:
     cleaned = token.strip().upper().replace(" ", "")
     if cleaned in _BARE_MAP:
         return _BARE_MAP[cleaned]
+    crypto = _CRYPTO_PAIR_RE.fullmatch(cleaned)
+    if crypto:
+        return _CRYPTO_NAMES[crypto.group(1).upper()]
     if cleaned in _SHORTHAND:
         return _SHORTHAND[cleaned]
     pair = _PAIR_RE.match(cleaned)
@@ -235,6 +401,11 @@ def instruments_in(text: str, *, limit: int = 4) -> list[str]:
         return []
     found: list[str] = []
     upper = text.upper()
+
+    for match in _CRYPTO_PAIR_RE.finditer(text):
+        instrument = _CRYPTO_NAMES.get(match.group(1).upper())
+        if instrument and instrument not in found:
+            found.append(instrument)
 
     for match in _PAIR_TOKEN_RE.finditer(upper):
         instrument = normalise_instrument(f"{match.group(1)}{match.group(2)}")
@@ -315,6 +486,123 @@ class MarketFeed:
             else:
                 snapshot.quotes.append(quote)
         return snapshot
+
+    async def period_answer(self, query: PeriodQuery) -> PeriodAnswer | None:
+        """Answer "high/low/close over a window" from a real OHLC series.
+
+        The arithmetic is done here, not by the model: the highest price in a
+        window is a fact about the series, and a model asked to eyeball a list
+        of bars will eventually pick the wrong one. This is the same principle
+        as the local math solver, applied to market history.
+        """
+        instrument = query.instrument
+        if not instrument or instrument not in HISTORY_INSTRUMENTS:
+            return None
+
+        ticker = HISTORY_INSTRUMENTS[instrument]
+        days = query.days
+        client = await self._get_client()
+        resp = await client.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={"interval": "1d", "range": f"{max(days, 5)}d"},
+        )
+        resp.raise_for_status()
+        result = ((resp.json().get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            return None
+
+        timestamps = result.get("timestamp") or []
+        quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        highs = quotes.get("high") or []
+        lows = quotes.get("low") or []
+        opens = quotes.get("open") or []
+        closes = quotes.get("close") or []
+
+        # Pair each day with its bar, dropping the null bars Yahoo emits when a
+        # market was shut (weekends, holidays). Those nulls are why "today" is
+        # always the LAST element: on a Sunday the final bars are empty and the
+        # live one is appended after them.
+        bars: list[tuple[datetime, float, float, float, float]] = []
+        def at(series: list, idx: int) -> float | None:
+            return series[idx] if idx < len(series) else None
+
+        # A bar is usable when the field the question needs is present. Yahoo
+        # routinely leaves one field null on a still-forming candle, and
+        # dropping the whole bar for that would silently shorten the window -
+        # which is how "the high last week" comes back as the week before.
+        for idx, stamp in enumerate(timestamps):
+            h = at(highs, idx)
+            low = at(lows, idx)
+            o = at(opens, idx)
+            c = at(closes, idx)
+            if h is None or low is None:
+                continue
+            bars.append(
+                (
+                    datetime.fromtimestamp(int(stamp), tz=UTC),
+                    float(h),
+                    float(low),
+                    float(o) if o is not None else float(c if c is not None else h),
+                    float(c) if c is not None else float(o if o is not None else low),
+                )
+            )
+        if not bars:
+            return None
+
+        # Drop today's still-forming bar from the *completed* pool: an
+        # incomplete candle makes "highest price last week" wrong the moment it
+        # is posted. Today's own bar is still what "today"/"this week" ask for.
+        # Identify today's bar by date, and fall back to the newest bar when the
+        # forming candle carried no values at all (a Sunday, say). Position alone
+        # is unreliable the moment a bar is dropped for a null field.
+        now = datetime.now(UTC)
+        today_bar = next((b for b in reversed(bars) if b[0].date() == now.date()), None)
+        if today_bar is None and bars:
+            today_bar = bars[-1]
+        completed = [b for b in bars if b is not today_bar]
+        pool = completed or bars
+
+        window = query.window_days()
+        if query.period == "today":
+            selected = [today_bar] if today_bar else pool[-1:]
+        elif query.period == "yesterday":
+            selected = pool[-1:]
+        elif query.period in ("this_week", "this_month"):
+            # Trailing window ending now, today's partial bar included.
+            selected = pool[-window:]
+            if today_bar is not None:
+                selected = [*selected, today_bar]
+        else:
+            # "last week" / "last month": the completed window before today.
+            selected = pool[-window:]
+        if not selected:
+            return None
+
+        highest = max(b[1] for b in selected)
+        lowest = min(b[2] for b in selected)
+        first_open = selected[0][3]
+        last_close = selected[-1][4]
+        value = {
+            "high": highest,
+            "low": lowest,
+            "open": first_open,
+            "close": last_close,
+            "change": (last_close - first_open) / first_open * 100 if first_open else 0.0,
+        }[query.aggregation]
+
+        return PeriodAnswer(
+            instrument=instrument,
+            period=query.period,
+            aggregation=query.aggregation,
+            value=value,
+            high=highest,
+            low=lowest,
+            open=first_open,
+            close=last_close,
+            start=selected[0][0],
+            end=selected[-1][0],
+            decimals=_decimals_for(instrument),
+        )
 
     async def _quote(self, instrument: str) -> Quote | None:
         """Try sources in order; one failing must not prevent the next."""

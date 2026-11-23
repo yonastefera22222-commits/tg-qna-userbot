@@ -342,6 +342,160 @@ async def test_cache_is_per_instrument_set() -> None:
     assert len(client.calls) == calls_before
 
 
+# --- period questions (crypto / history) -----------------------------------
+# The series below is the real BTC-USD daily data captured from the live
+# endpoint: 32 bars, a null weekend gap, and today's still-forming candle last.
+_BTC_CLOSES = [
+    81074.19, 80790.84, 80024.01, 80006.66, 80805.08, 81267.59, 77775.11, 77198.21,
+    77434.75, 78248.45, 76677.30, 77345.05, 80405.29, 75942.13, 75746.93, 75747.58,
+    74584.65, 75223.15, 73720.12, 73964.47, 71342.97, 68249.27, 64128.05, 65305.06,
+    64855.84, 64893.95, 62987.27, 61901.82, 58798.98, 60094.09, None, 61605.06,
+]
+_BTC_HIGHS = [
+    81956.34, 81098.24, 80928.27, 80709.98, 81180.92, 81703.20, 81889.95, 78647.39,
+    77629.73, 78313.26, 78724.39, 77964.98, 81079.79, 80833.62, 76291.06, 76138.68,
+    76096.69, 75505.34, 75320.91, 74703.45, 74115.22, 71428.53, 68377.54, 66055.10,
+    65604.60, 65365.13, 64928.80, 64017.27, 62540.21, 60843.76, None, 61674.92,
+]
+_BTC_LOWS = [
+    80421.74, 79145.54, 79766.83, 79278.71, 79380.36, 80300.30, 77737.19, 76189.88,
+    77000.65, 77384.48, 76572.23, 76270.0, 75627.98, 75114.29, 74795.11, 75485.69,
+    73691.77, 73664.54, 72689.38, 73141.53, 71084.05, 67653.07, 63329.43, 62017.88,
+    63834.67, 63284.46, 62017.38, 61380.88, 57708.70, 55149.57, None, 60367.81,
+]
+_BTC_TIMESTAMPS = [
+    1792713600, 1792800000, 1792886400, 1792972800, 1793059200, 1793145600, 1793232000,
+    1793318400, 1793404800, 1793491200, 1793577600, 1793664000, 1793750400, 1793836800,
+    1793923200, 1794009600, 1794096000, 1794182400, 1794268800, 1794355200, 1794441600,
+    1794528000, 1794614400, 1794700800, 1794787200, 1794873600, 1794960000, 1795046400,
+    1795132800, 1795219200, 1795305600, 1795392000,
+]
+BTC_PAYLOAD = {
+    "chart": {
+        "result": [
+            {
+                "meta": {"symbol": "BTC-USD", "regularMarketPrice": 61605.06},
+                "timestamp": _BTC_TIMESTAMPS,
+                "indicators": {
+                    "quote": [
+                        {
+                            "high": _BTC_HIGHS,
+                            "low": _BTC_LOWS,
+                            # 32 entries, aligned to the timestamps; the forming
+                            # candle's open is present (Yahoo sometimes omits it).
+                            "open": [
+                                81311.89, *[c for c in _BTC_CLOSES if c][:30], 61162.20
+                            ],
+                            "close": _BTC_CLOSES,
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+}
+
+
+@pytest.mark.parametrize(
+    ("text", "period", "aggregation", "instrument"),
+    [
+        ("On the exness BTC chart, what was the highest price recorded last week?",
+         "last_week", "high", "BTCUSD"),
+        ("BTC lowest last week?", "last_week", "low", "BTCUSD"),
+        ("btc high this week", "this_week", "high", "BTCUSD"),
+        ("bitcoin lowest last month", "last_month", "low", "BTCUSD"),
+        ("what was btc highest yesterday", "yesterday", "high", "BTCUSD"),
+        ("BTC change last week", "last_week", "change", "BTCUSD"),
+        ("eth high last week", "last_week", "high", "ETHUSD"),
+    ],
+)
+def test_parse_period_query(text, period, aggregation, instrument) -> None:
+    from qna_bot.ai.market import parse_period_query
+
+    pq = parse_period_query(text)
+    assert pq is not None
+    assert (pq.period, pq.aggregation, pq.instrument) == (period, aggregation, instrument)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "what is a pip",
+        "EURUSD price now?",
+        "capital of Kenya?",
+        "first comment",
+        "BTC is bullish",
+        "",
+    ],
+)
+def test_parse_period_query_ignores_non_period_questions(text: str) -> None:
+    from qna_bot.ai.market import parse_period_query
+
+    assert parse_period_query(text) is None
+
+
+@pytest.mark.asyncio
+async def test_btc_last_week_high_is_computed_exactly() -> None:
+    """The user's actual question: "highest BTC price last week"."""
+    from qna_bot.ai.market import MarketFeed, parse_period_query
+
+    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
+    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    answer = await feed.period_answer(parse_period_query(
+        "On the exness BTC chart, what was the highest price recorded last week?"
+    ))
+    assert answer is not None
+    assert answer.formatted() == "66055.10"
+
+
+@pytest.mark.asyncio
+async def test_period_answers_use_price_precision_not_fx_precision() -> None:
+    """66055.10000 is a tell; crypto quotes two decimals."""
+    from qna_bot.ai.market import MarketFeed, parse_period_query
+
+    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
+    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    answer = await feed.period_answer(parse_period_query("BTC high last week"))
+    assert answer is not None
+    assert not answer.formatted().endswith("000")
+
+
+@pytest.mark.asyncio
+async def test_last_week_excludes_todays_forming_bar() -> None:
+    """An incomplete candle must not become "the high last week"."""
+    from qna_bot.ai.market import MarketFeed, parse_period_query
+
+    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
+    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    answer = await feed.period_answer(parse_period_query("BTC high last week"))
+    assert answer is not None
+    # Today's bar high is 61674.92 and is NOT the weekly high.
+    assert answer.high == pytest.approx(66055.10)
+
+
+@pytest.mark.asyncio
+async def test_period_answer_is_computed_without_ai() -> None:
+    """The model must never be asked to eyeball a series for a max/min."""
+    from qna_bot.ai.market import MarketFeed
+
+    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
+    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    engine = _CapturingEngine(feed)
+
+    result = await engine.answer_question(
+        text="On the exness BTC chart, what was the highest price last week?",
+        forex_group=True,
+        answer_style="giveaway",
+        primary_provider="groq",
+        primary_model="openai/gpt-oss-120b",
+        provider_keys={"groq": "gsk_test"},
+        local_math_enabled=False,
+    )
+    assert result.answer == "66055.10"
+    assert result.provider == "local_market"
+    assert engine.prompts == [], "a period question must not reach the AI"
+
+
 # --- engine integration ----------------------------------------------------
 class _CapturingEngine(AIEngine):
     """Records the system prompt without calling any AI provider."""
