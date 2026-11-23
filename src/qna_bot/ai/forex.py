@@ -46,6 +46,9 @@ _CONCEPTS = (
     "hawkish", "dovish", "quantitative easing", "inflation", "deflation",
     "recession", "safe haven", "gold", "xauusd", "silver", "xagusd",
     "oil", "wti", "brent", "dxy", "dollar index", "cable", "fiber", "loonie",
+    "btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp", "ripple",
+    "doge", "dogecoin", "bnb", "ltc", "litecoin", "crypto", "btcusd", "btcusdt",
+    "ethusdt", "coin", "altcoin", "chart", "candle", "ohlc",
     "aussie", "kiwi", "swissy", "yen", "euro", "pound", "greenback",
 )
 

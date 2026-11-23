@@ -12,7 +12,7 @@ import httpx
 
 from .forex import group_guidance as forex_group_guidance
 from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
-from .market import MarketFeed, MarketSnapshot
+from .market import MarketFeed, MarketSnapshot, parse_period_query
 from .math_solver import try_solve_math
 from .providers import (
     DEFAULT_SPEED_MODE,
@@ -225,6 +225,26 @@ class AIEngine:
                     latency_ms=elapsed_ms,
                     language=detect_language(text),
                 )
+
+        # 1b. Period questions ("highest BTC price last week") are arithmetic
+        #     over a real OHLC series, so they are computed here and returned
+        #     without an AI call at all - the same reasoning as the math solver.
+        #     A model asked to eyeball a series will eventually pick the wrong
+        #     bar, and this answer has to be exact to be worth posting.
+        if forex_group and live_data and not image:
+            period = parse_period_query(text)
+            if period is not None and period.instrument:
+                computed = await self.market_feed.period_answer(period)
+                if computed is not None:
+                    elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                    return AnswerResult(
+                        answered=True,
+                        answer=computed.formatted(),
+                        provider="local_market",
+                        model="ohlc-history",
+                        latency_ms=elapsed_ms,
+                        language=detect_language(text),
+                    )
 
         # Build provider attempt list (primary + optional fallback)
         attempts: list[tuple[str, str, str]] = []
