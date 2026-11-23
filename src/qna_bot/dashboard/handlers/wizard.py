@@ -63,8 +63,10 @@ def _otp_prompt_text(
         f"🔢 <b>Entered code:</b> <code>{masked}</code>\n\n"
         "💡 <i>Tap the keypad buttons below to enter your code.</i>\n"
         "<i>(Type digits spaced like <code>1 2 3 4 5</code> if you prefer.)</i>\n\n"
-        "⚡️ <b>No code arriving?</b> Tap <b>“No code coming? Log in with one tap”</b> "
-        "below — it logs you in without any code at all."
+        "⚡️ <b>No code arriving?</b> Telegram has stopped delivering login codes to "
+        "third-party clients for many accounts — the request succeeds and nothing is "
+        "sent. Tap <b>“No code coming? Get it by email”</b> below: email is the one "
+        "channel Telegram still delivers for third-party apps."
         f"{extra}"
     )
 
@@ -422,6 +424,99 @@ async def msg_login_email_code(message: Message, ctx: AppContext, state: FSMCont
 
 
 # ----------------------------------------------------------------------
+# Step 2b-bis: get the login code by EMAIL (the channel that delivers)
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data == "wiz:emailcode")
+async def cb_email_code(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    """Ask for an inbox and route the login code there.
+
+    Why this is the answer rather than another retry: Telegram has stopped
+    delivering login codes to third-party clients over SMS (Feb 2023) and now
+    silently withholds the in-app code for many accounts. Email is an official
+    delivery channel for third-party apps, and Telegram's own mail servers send
+    it, so nothing depends on an app session or an SMS gateway.
+    """
+    await callback.answer()
+    await state.set_state(WizardStates.waiting_email_login_address)
+    await safe_edit_text(
+        callback,
+        "📧 <b>Get the login code by email</b>\n\n"
+        "Telegram will send the login code to an <b>email address</b> instead of the "
+        "Telegram app or SMS. This works for third-party apps, which is why it "
+        "actually arrives.\n\n"
+        "📥 Send the email address to use (e.g. <code>you@gmail.com</code>).\n"
+        "<i>It becomes this account's Telegram login email. Your message is deleted "
+        "immediately after it is read.</i>",
+    )
+
+
+@router.message(WizardStates.waiting_email_login_address)
+async def msg_email_login_address(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    address = (message.text or "").strip()
+    await safe_delete_message(message)
+
+    wait = await message.answer("📧 Asking Telegram to send the login code there...")
+    res = await ctx.userbot.use_login_email(address)
+    if res.status is not LoginStatus.CODE_SENT:
+        await wait.edit_text(
+            f"{res.message}\n\nSend the email address again, or tap ⬅️ Login Options.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")]
+                ]
+            ),
+        )
+        return
+
+    await state.update_data(login_email=address, otp_digits="")
+    await state.set_state(WizardStates.waiting_email_login_code)
+    await wait.edit_text(
+        f"{res.message}\n\n"
+        "📥 Send the code now.\n"
+        "<i>(Check spam/junk. Your message is deleted after reading.)</i>",
+    )
+
+
+@router.message(WizardStates.waiting_email_login_code)
+async def msg_email_login_code(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    await safe_delete_message(message)
+
+    wait = await message.answer("✅ Verifying the emailed code...")
+    res = await ctx.userbot.submit_email_login_code(code)
+
+    if res.status is LoginStatus.OK:
+        await state.clear()
+        await wait.edit_text(f"🎉 <b>{html.escape(res.message)}</b>")
+        await _show_ai_step(wait, ctx, state)
+        return
+
+    if res.status is LoginStatus.TWO_FA_REQUIRED:
+        await state.set_state(WizardStates.waiting_2fa)
+        await wait.edit_text(
+            "🔐 <b>Two-Step Verification (2FA) Required</b>\n\n"
+            "The email code was accepted — your account also has a Telegram "
+            "<b>cloud password</b>.\n\n📥 Send that 2FA password now."
+        )
+        return
+
+    if res.status is LoginStatus.CODE_SENT:
+        # Email verified: Telegram has now dispatched the real login code.
+        delivery = res.delivery or ctx.userbot.last_code_delivery
+        await state.update_data(otp_digits="")
+        await state.set_state(WizardStates.waiting_otp)
+        await wait.edit_text(
+            _otp_prompt_text(ctx.userbot.pending_phone or "", "", delivery=delivery),
+            reply_markup=otp_keypad_kb(""),
+        )
+        return
+
+    await wait.edit_text(f"{res.message}\n\nSend the code again, or tap ⬅️ Login Options.")
+
+
+# ----------------------------------------------------------------------
 # Step 2c: QR-code login (no code delivery involved)
 # ----------------------------------------------------------------------
 
@@ -465,21 +560,20 @@ def _qr_caption(
             f"\n♻️ <i>Auto-renewed {snapshot['renewals']}× — the code stays valid while "
             "this screen is open.</i>"
         )
-    first_choice = (
-        "🌐 <b>Same phone? Tap the green button above.</b> It opens a small page in "
-        "your browser; tap <b>Open Telegram &amp; Approve</b> and Telegram asks you to "
-        "confirm. No code, no camera, no second device.\n\n"
-        if page_url
-        else ""
-    )
     return (
-        "🔑 <b>Log in without a code</b>\n\n"
-        f"{first_choice}"
-        "📷 <b>Have a second device?</b> Scan the code above with "
-        "<b>Telegram → Settings → Devices → Link Desktop Device</b>.\n\n"
-        "♾ <b>The code renews itself</b>, so there is no rush — Telegram's tokens live "
-        "~30s but a fresh one is issued the moment the old lapses. "
-        "If a device says “code expired”, tap ♻️ Refresh QR Image."
+        "📷 <b>Scan this code with another device</b>\n\n"
+        "On the device that is <b>already signed in to Telegram</b>: "
+        "<b>Settings → Devices → Link Desktop Device</b>, then point its camera at "
+        "the code above.\n\n"
+        "⚠️ <b>This route needs a camera and a second screen — it cannot be done from "
+        "one phone.</b> Telegram will not let an app approve a login from a link: "
+        "opening one inside Telegram only shows <i>“go to Settings → Devices → Scan "
+        "QR”</i>. That restriction is deliberate, so there is no bypass.\n\n"
+        "📧 <b>One phone only?</b> Use <b>Login With Email Code</b> instead — the code "
+        "arrives in an inbox and needs no second device.\n\n"
+        "♾ The code renews itself, so there is no rush — tokens live ~30s but a fresh "
+        "one is issued the moment the old lapses. If a device says “code expired”, tap "
+        "♻️ Refresh QR Image."
         f"{renewed}"
     )
 
@@ -511,13 +605,13 @@ async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContex
     await state.update_data(qr_generation=1)
     await safe_edit_text(
         callback,
-        "🔑 <b>Log In Without a Code</b>\n\n"
-        "🌐 <b>Tap the link below on this phone.</b> It opens a small login page in "
-        "your browser; tap <b>Open Telegram &amp; Approve</b>, and Telegram shows its "
-        "own <b>“Log in?”</b> prompt. Approve it — done.\n\n"
-        "✅ No SMS. ✅ No code to type. ✅ No second phone.\n\n"
-        "<i>This is a web page rather than a button in this chat because Telegram "
-        "clients deliberately ignore login links tapped inside the app.</i>\n\n"
+        "📷 <b>QR Login</b>\n\n"
+        "This route needs a <b>second device</b> with a camera, because Telegram "
+        "refuses to approve a login from a link opened inside its own app.\n\n"
+        "🌐 <b>No second device?</b> The button below opens the same token as a web "
+        "page, which is the one place Telegram will accept it from — but if your phone "
+        "still answers with <i>“go to Settings → Devices → Scan QR”</i>, use "
+        "<b>📧 Login With Email Code</b> instead. That one needs no camera at all.\n\n"
         "Then tap <b>🔄 I Approved — Continue</b> here.",
         reply_markup=_qr_kb(None, page_url),
     )
@@ -837,11 +931,11 @@ async def _show_no_code_help(
 
     text = (
         "❓ <b>No code received</b>\n\n"
-        "⚡️ <b>Fastest fix: stop waiting for a code.</b> Tap "
-        "<b>“Log in with one tap”</b> below. It opens Telegram on the phone you are "
-        "already signed in on, you tap <b>Approve</b>, and you are done — no code, no "
-        "SMS, no waiting out a rate limit, <b>no second phone</b>.\n\n"
-        "The checklist below is only if you specifically want the code route.\n\n"
+        "📧 <b>Fastest fix: change the channel.</b> Tap "
+        "<b>📧 Get the code by email</b> below. Telegram sends the login code to an "
+        "inbox instead of the app or SMS, which is the one delivery route it still "
+        "gives third-party apps. Everything below is about the code you are waiting "
+        "for.\n\n"
         f"📞 Number used: <code>{html.escape(phone) or '—'}</code>\n\n"
         f"{where}\n\n"
         "<b>1. Check inside Telegram first (most common)</b>\n"
@@ -868,7 +962,7 @@ async def _show_no_code_help(
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             # The no-code route first: it is the answer to "no code received".
-            [InlineKeyboardButton(text="⚡️ Log in without a code", callback_data="wiz:login_qr")],
+            [InlineKeyboardButton(text="📧 Get the code by email", callback_data="wiz:emailcode")],
             [InlineKeyboardButton(text="🔄 Resend Code", callback_data="otp:resend")],
             [
                 InlineKeyboardButton(

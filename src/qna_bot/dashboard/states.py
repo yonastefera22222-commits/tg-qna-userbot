@@ -10,6 +10,9 @@ class WizardStates(StatesGroup):
     waiting_otp = State()
     waiting_login_email = State()
     waiting_login_email_code = State()
+    #: Owner asked for the *login* code by email (not the setup verification).
+    waiting_email_login_address = State()
+    waiting_email_login_code = State()
     waiting_qr_2fa = State()
     waiting_2fa = State()
     waiting_string_session = State()
