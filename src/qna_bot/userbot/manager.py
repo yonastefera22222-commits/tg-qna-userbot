@@ -80,6 +80,11 @@ class UserbotManager:
         # Live counters for /diag and /health.
         self._seen_count = 0
         self._answered_count = 0
+        #: Messages the account sent itself. They are deliberately not answered,
+        #: but counting them is what lets /diag say "you are testing from the
+        #: same account you are running", which otherwise looks exactly like the
+        #: bot being dead.
+        self._own_message_count = 0
         self._last_reply_ts: dict[int, float] = {}
         self._recent_msg_ids: deque[tuple[int, int]] = deque(maxlen=500)
         self._recent_context: dict[int, deque[str]] = {}
@@ -593,6 +598,35 @@ class UserbotManager:
                 )
                 await asyncio.sleep(0.2)
 
+    @staticmethod
+    def _is_channel_sender(sender_id: int | None) -> bool:
+        """True when Telethon resolved the sender to a *channel*, not a person.
+
+        A message posted on behalf of a channel - a forward from "TM Tips", or an
+        anonymous channel admin - carries ``from_id = PeerChannel(...)``, and
+        Telethon then reports the channel's id as ``sender_id`` (negative, past
+        ``-100…``). That id can never appear in a group's admin list, so an
+        ``Admins Only`` group silently dropped every channel-forwarded question
+        while answering the same text posted by a person.
+        """
+        return sender_id is not None and int(sender_id) < 0
+
+    async def _poster_id(self, event: events.NewMessage.Event) -> int | None:
+        """The person behind the message, when a channel merely carried it.
+
+        A forward has both: the channel as ``sender_id`` and the account that
+        forwarded it in ``fwd_from.from_id``. The forwarder is the one who can be
+        an admin, so that is who the sender filter should judge.
+        """
+        message = getattr(event, "message", None)
+        fwd_from = getattr(message, "fwd_from", None)
+        from_id = getattr(fwd_from, "from_id", None)
+        if from_id is not None:
+            peer_id = getattr(from_id, "user_id", None)
+            if peer_id:
+                return int(peer_id)
+        return None
+
     async def _is_admin(self, chat_id: int, event: events.NewMessage.Event) -> bool:
         sender_id = event.sender_id
         # Anonymous group admins post as the group itself (from_id is None or PeerChannel == chat)
@@ -602,6 +636,12 @@ class UserbotManager:
             # Channel/anonymous admin posting inside the supergroup
             if int(f"-100{event.message.from_id.channel_id}") == chat_id:
                 return True
+
+        # A channel post is judged by whoever posted it, not by the channel.
+        if self._is_channel_sender(sender_id):
+            poster = await self._poster_id(event)
+            if poster is not None:
+                sender_id = poster
 
         cached = self._admin_cache.get(chat_id)
         now = time.monotonic()
@@ -769,6 +809,7 @@ class UserbotManager:
         return {
             "messages_seen": self._seen_count,
             "answers_sent": self._answered_count,
+            "own_messages": self._own_message_count,
             "active_groups": len(self._enabled_groups),
         }
 
@@ -829,6 +870,12 @@ class UserbotManager:
             self._record(event.chat_id, event.sender_id, event.raw_text, "skip:global_paused")
             return
         if event.out or event.is_private:
+            # An outgoing message is the account's own - a userbot cannot answer
+            # itself, and doing so would loop. Counted so /diag can tell this
+            # apart from "nothing is arriving": testing from the account you are
+            # running looks identical to a dead bot otherwise.
+            if event.out:
+                self._own_message_count += 1
             return
 
         chat_id = event.chat_id
@@ -893,13 +940,16 @@ class UserbotManager:
             if not await self._is_admin(int(chat_id), event):
                 if buf is not None:
                     buf.append(text[:200])
-                self._record(
-                    chat_id,
-                    event.sender_id,
-                    text,
-                    "skip:not_admin",
-                    "sender is not an admin and admins WERE verified",
-                )
+                # A channel sender is a special case worth naming in the log: the
+                # id is the *channel's*, so "not an admin" is true but unhelpful,
+                # and the owner would go looking for an admin who never posted.
+                detail = "sender is not an admin and admins WERE verified"
+                if self._is_channel_sender(event.sender_id):
+                    detail = (
+                        "posted on behalf of a channel, which cannot be an admin; "
+                        "set Who Triggers to Everyone to answer channel posts"
+                    )
+                self._record(chat_id, event.sender_id, text, "skip:not_admin", detail)
                 return
         elif group.sender_filter == "humans":
             sender = await event.get_sender()
@@ -939,10 +989,21 @@ class UserbotManager:
             self._record(chat_id, event.sender_id, text, "skip:cooldown")
             return
 
-        # Gather optional short context before appending current message
-        context_lines = list(buf)[-group.context_messages :] if (buf and group.context_messages > 0) else None
+        # Optional short context. The current message goes in FIRST: reading the
+        # buffer and then appending meant every answer was built from the
+        # *previous* message as its "latest", so a numbered set of giveaway
+        # questions (1, 2, 3, 4 posted minutes apart) was answered with no
+        # awareness that it was part of a series.
         if buf is not None:
             buf.append(clean_text[:200])
+        # The current message is now the last entry, so the context sent to the
+        # model is the window *before* it. Slicing from the end without dropping
+        # it sent the question twice: once as context, once as the question.
+        context_lines = None
+        if buf is not None and group.context_messages > 0:
+            prior = list(buf)[:-1]
+            if prior:
+                context_lines = prior[-group.context_messages :]
 
         # Load active AI settings in two queries rather than eight. On every
         # answered message this used to be ~8 serialised SQLite round-trips
