@@ -408,6 +408,11 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
         f"📥 <b>Messages seen since start:</b> {counters['messages_seen']}",
         f"💬 <b>Answers sent since start:</b> {counters['answers_sent']}",
     ]
+    if counters.get("own_messages"):
+        lines.append(
+            f"↩️ <b>Own messages skipped:</b> {counters['own_messages']} "
+            "<i>(a userbot cannot answer itself)</i>"
+        )
 
     ai_ok = bool(await ctx.db.get_all_provider_keys())
     primary = str(await ctx.db.get_setting("primary_provider", "—"))
@@ -507,6 +512,12 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
         lines.append("⬛ No groups are enabled. Tap /dashboard → Select & Configure Groups.")
     elif not ai_ok:
         lines.append("🔴 No AI API key saved. Re-run Step 3 in /setup.")
+    elif counters["messages_seen"] == 0 and counters.get("own_messages"):
+        lines.append(
+            "↩️ Only messages sent from this same account have arrived. A userbot "
+            "cannot answer itself, so **test from a different account** - or you "
+            "will see silence no matter what the settings are."
+        )
     elif counters["messages_seen"] == 0:
         lines.append(
             "⚠️ The account is connected but no group messages have arrived. Most common "
