@@ -62,7 +62,9 @@ def _otp_prompt_text(
         f"📨 {where}\n\n"
         f"🔢 <b>Entered code:</b> <code>{masked}</code>\n\n"
         "💡 <i>Tap the keypad buttons below to enter your code.</i>\n"
-        "<i>(Type digits spaced like <code>1 2 3 4 5</code> if you prefer.)</i>"
+        "<i>(Type digits spaced like <code>1 2 3 4 5</code> if you prefer.)</i>\n\n"
+        "⚡️ <b>No code arriving?</b> Tap <b>“No code coming? Log in with one tap”</b> "
+        "below — it logs you in without any code at all."
         f"{extra}"
     )
 
@@ -201,7 +203,9 @@ async def cb_use_env_creds(callback: CallbackQuery, ctx: AppContext, state: FSMC
     await safe_edit_text(
         callback,
         f"✅ Loaded API ID <code>{ctx.env.tg_api_id}</code> from <code>.env</code>.\n\n"
-        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n"
+        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n\n"
+        "⚡️ <b>Fastest: Instant Login.</b> One tap on the phone that is already "
+        "signed in to Telegram — no SMS, no code to type, and <b>no second phone</b>.\n\n"
         "Choose how you want to log in:",
         reply_markup=wizard_login_method_kb(),
     )
@@ -247,7 +251,9 @@ async def msg_api_hash(message: Message, state: FSMContext) -> None:
     await state.set_state(None)
     await message.answer(
         "✅ API credentials saved!\n\n"
-        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n"
+        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n\n"
+        "⚡️ <b>Fastest: Instant Login.</b> One tap on the phone that is already "
+        "signed in to Telegram — no SMS, no code to type, and <b>no second phone</b>.\n\n"
         "Choose how you want to log in:",
         reply_markup=wizard_login_method_kb(),
     )
@@ -265,7 +271,9 @@ async def cb_login_method(callback: CallbackQuery, ctx: AppContext, state: FSMCo
     await state.set_state(None)
     await safe_edit_text(
         callback,
-        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n"
+        "<b>Step 2 / 4 — Connect Your Telegram Account</b>\n\n"
+        "⚡️ <b>Fastest: Instant Login.</b> One tap on the phone that is already "
+        "signed in to Telegram — no SMS, no code to type, and <b>no second phone</b>.\n\n"
         "Choose how you want to log in:",
         reply_markup=wizard_login_method_kb(),
     )
@@ -418,15 +426,28 @@ async def msg_login_email_code(message: Message, ctx: AppContext, state: FSMCont
 # ----------------------------------------------------------------------
 
 
-def _qr_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 I Scanned It — Continue", callback_data="wiz:qr_check")],
-            [InlineKeyboardButton(text="♻️ Refresh QR Image", callback_data="wiz:qr_refresh")],
-            [InlineKeyboardButton(text="🔁 Start Over", callback_data="wiz:login_qr")],
-            [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
-        ]
-    )
+def _qr_kb(url: str | None = None) -> InlineKeyboardMarkup:
+    """Keyboard for the QR screen.
+
+    The first row is the one-phone path. ``tg://login?token=...`` is a real
+    deep link Telegram opens itself, so the owner taps it on the *same* phone
+    that is already signed in - no second device, no camera, no scanning. It
+    was previously only offered as a small hyperlink buried in the caption,
+    which is why it looked like QR needed two phones.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if url:
+        rows.append(
+            [InlineKeyboardButton(text="⚡️ Log In With One Tap (no camera)", url=url)]
+        )
+    rows += [
+        [InlineKeyboardButton(text="🔄 I Approved — Continue", callback_data="wiz:qr_check")],
+        [InlineKeyboardButton(text="🔗 Send Me a Fresh One-Tap Link", callback_data="wiz:onetaplink")],
+        [InlineKeyboardButton(text="♻️ Refresh QR Image", callback_data="wiz:qr_refresh")],
+        [InlineKeyboardButton(text="🔁 Start Over", callback_data="wiz:login_qr")],
+        [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _qr_caption(url: str, snapshot: dict | None = None) -> str:
@@ -438,16 +459,18 @@ def _qr_caption(url: str, snapshot: dict | None = None) -> str:
             "this screen is open.</i>"
         )
     return (
-        "📷 <b>QR Code Login — no SMS, no code needed</b>\n\n"
-        "On the phone that is <b>already logged in</b> to Telegram:\n"
+        "🔑 <b>Instant Login — one phone, no code, no camera</b>\n\n"
+        "✅ <b>Tap the ⚡️ button below on your phone.</b>\n"
+        "Telegram opens and asks you to confirm — tap <b>Approve</b>. Done. "
+        "This works on the <b>same phone</b> that is already signed in to Telegram; "
+        "you do not need a second device.\n\n"
+        "— or, if you prefer the camera —\n"
         "1️⃣ Open <b>Telegram → Settings → Devices</b>\n"
         "2️⃣ Tap <b>Link Desktop Device</b>\n"
         "3️⃣ Point the camera at the code above\n\n"
-        f"🔗 Or open this link on the phone: <a href='{html.escape(url)}'>tap here</a>\n\n"
-        "♾ <b>This code refreshes itself automatically</b>, so there is no rush — "
-        "Telegram's codes live ~30 seconds but a new one is issued the moment the old "
-        "one lapses.\n"
-        "If your phone shows “code expired”, just scan again (or tap ♻️ Refresh QR Image)."
+        "♾ <b>The code renews itself</b>, so there is no rush — Telegram's tokens live "
+        "~30s but a fresh one is issued the moment the old lapses. "
+        "If your phone says “code expired”, just tap the ⚡️ button again."
         f"{renewed}"
     )
 
@@ -481,10 +504,56 @@ async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContex
         await callback.message.answer_photo(
             BufferedInputFile(png, filename="login_qr.png"),
             caption=caption,
-            reply_markup=_qr_kb(),
+            reply_markup=_qr_kb(url),
         )
     else:
-        await safe_edit_text(callback, caption, reply_markup=_qr_kb())
+        await safe_edit_text(callback, caption, reply_markup=_qr_kb(url))
+
+
+@router.callback_query(F.data == "wiz:onetaplink")
+async def cb_one_tap_link(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    """Hand back a live ``tg://login`` link as a tappable button.
+
+    Telegram's QR token lives ~30 seconds, so the button posted earlier can be
+    stale by the time it is tapped. This re-reads the *current* token and edits
+    the message in place, which is the difference between "it worked" and "the
+    link looks broken".
+    """
+    snapshot = ctx.userbot.qr_snapshot()
+    if snapshot is None:
+        await callback.answer("No login in progress — tap 🔁 Start Over.", show_alert=True)
+        return
+    if snapshot["status"] is LoginStatus.ERROR:
+        await callback.answer(str(snapshot["message"])[:190], show_alert=True)
+        return
+
+    url = str(snapshot["url"])
+    left = int(snapshot.get("seconds_left") or 0)
+    if callback.message is None:
+        await callback.answer("Open a login screen first.", show_alert=True)
+        return
+    await safe_edit_text(
+        callback.message,
+        "⚡️ <b>Tap the button below to log in</b>\n\n"
+        "It opens Telegram on the phone that is already signed in. Tap "
+        "<b>Approve</b> — done. No code, no SMS, no second device.\n\n"
+        f"⏱ <i>This link is valid for about <b>{left}s</b>. If it says the link "
+        "expired, tap this button again for a fresh one.</i>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚡️ Open Telegram & Approve", url=url)],
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Fresh Link", callback_data="wiz:onetaplink"
+                    ),
+                    InlineKeyboardButton(
+                        text="🔄 I Approved — Continue", callback_data="wiz:qr_check"
+                    ),
+                ],
+            ]
+        ),
+    )
+    await callback.answer("Fresh link ready")
 
 
 @router.callback_query(F.data == "wiz:qr_refresh")
@@ -505,7 +574,10 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
 
     from aiogram.types import BufferedInputFile, InputMediaPhoto
 
-    caption = _qr_caption(str(snapshot["url"]), snapshot)
+    # The renewed token has its own deep link, so the one-tap button must be
+    # rebuilt from the NEW url or it would hand Telegram an expired token.
+    current_url = str(snapshot["url"])
+    caption = _qr_caption(current_url, snapshot)
     try:
         # Replace the photo in place so the chat does not fill with images.
         await callback.message.edit_media(
@@ -513,7 +585,7 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
                 media=BufferedInputFile(png, filename="login_qr.png"),
                 caption=caption,
             ),
-            reply_markup=_qr_kb(),
+            reply_markup=_qr_kb(current_url),
         )
         await callback.answer("QR refreshed")
     except Exception:
@@ -521,7 +593,7 @@ async def cb_qr_refresh(callback: CallbackQuery, ctx: AppContext, state: FSMCont
         await callback.message.answer_photo(
             BufferedInputFile(png, filename="login_qr.png"),
             caption=caption,
-            reply_markup=_qr_kb(),
+            reply_markup=_qr_kb(current_url),
         )
         await callback.answer("QR refreshed")
 
@@ -627,7 +699,12 @@ async def _show_no_code_help(
         )
 
     text = (
-        "❓ <b>No code received — checklist</b>\n\n"
+        "❓ <b>No code received</b>\n\n"
+        "⚡️ <b>Fastest fix: stop waiting for a code.</b> Tap "
+        "<b>“Log in with one tap”</b> below. It opens Telegram on the phone you are "
+        "already signed in on, you tap <b>Approve</b>, and you are done — no code, no "
+        "SMS, no waiting out a rate limit, <b>no second phone</b>.\n\n"
+        "The checklist below is only if you specifically want the code route.\n\n"
         f"📞 Number used: <code>{html.escape(phone) or '—'}</code>\n\n"
         f"{where}\n\n"
         "<b>1. Check inside Telegram first (most common)</b>\n"
@@ -653,6 +730,8 @@ async def _show_no_code_help(
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            # The no-code route first: it is the answer to "no code received".
+            [InlineKeyboardButton(text="⚡️ Log in with one tap (no code)", callback_data="wiz:login_qr")],
             [InlineKeyboardButton(text="🔄 Resend Code", callback_data="otp:resend")],
             [
                 InlineKeyboardButton(
