@@ -47,12 +47,13 @@ def wizard_welcome_kb(has_env_creds: bool, is_connected: bool) -> InlineKeyboard
 def wizard_login_method_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     # Ordered by speed of the happy path, not by how the feature is built.
-    # The one-tap route is the QR token delivered as a tappable deep link, so
-    # it needs no code, no SMS and no second device - it is the same session
-    # as "Login with QR", just approved by a tap instead of a camera scan.
-    b.button(text="⚡️ Instant Login — one tap, no code, no camera", callback_data="wiz:login_qr")
+    # The first route is a web page opened in the phone's browser: from there
+    # Telegram *will* follow the tg://login link (it refuses to when the same
+    # link is tapped inside a chat), so approval happens on the one phone that
+    # is already signed in - no code delivery, no camera, no second device.
+    b.button(text="⚡️ No-Code Login (one phone, no SMS)", callback_data="wiz:login_qr")
     b.button(text="📱 Login with Phone + OTP Keypad", callback_data="wiz:login_phone")
-    b.button(text="📷 Login with QR Code (scan with another device)", callback_data="wiz:login_qr")
+    b.button(text="📷 QR Code (scan with another device)", callback_data="wiz:login_qr")
     b.button(text="🔑 Paste Existing StringSession", callback_data="wiz:login_session")
     b.button(text="⬅️ Re-enter API Credentials", callback_data="wiz:step1_creds")
     b.adjust(1)
@@ -75,8 +76,8 @@ def otp_keypad_kb(current_digits: str) -> InlineKeyboardMarkup:
     b.button(text="❓ No code received?", callback_data="otp:help")
     # The dead end this fixes: when no code ever arrives, the keypad used to
     # offer only "resend" and "cancel". One tap now switches to the login that
-    # needs no code at all.
-    b.button(text="⚡️ No code coming? Log in with one tap", callback_data="wiz:login_qr")
+    # needs no code delivery at all.
+    b.button(text="⚡️ No code coming? Log in without one", callback_data="wiz:login_qr")
     b.button(text="❌ Cancel", callback_data="wiz:login_method")
     b.adjust(3, 3, 3, 3, 1, 2, 1, 1)
     return b.as_markup()

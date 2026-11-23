@@ -330,6 +330,31 @@ class UserbotManager:
         logger.info("Telegram account connected via QR login: %s", self.account_display)
         return LoginResult(LoginStatus.OK, f"Successfully connected as {self.account_display}!")
 
+    async def adopt_browser_login(self, manager: object) -> LoginResult:
+        """Take over a session approved on the browser login page.
+
+        The page drives its own Telethon connection (Telegram binds the login
+        token to the connection that asked for it), so once it is approved the
+        authorized client is transferred here and persisted exactly like a QR or
+        phone login.
+        """
+        take = getattr(manager, "take_authorized_client", None)
+        pending = take() if callable(take) else None
+        if pending is None:
+            return LoginResult(
+                LoginStatus.ERROR,
+                "The login was not approved yet. Approve it in Telegram, then tap "
+                "🔄 I Approved — Continue.",
+            )
+
+        session_str = pending.client.session.save()
+        await self._db.set_setting("tg_api_id", pending.api_id)
+        await self._db.set_setting("tg_api_hash", pending.api_hash)
+        await self._db.set_setting("tg_session", session_str)
+        await self._attach_client(pending.client)
+        logger.info("Telegram account connected via browser login: %s", self.account_display)
+        return LoginResult(LoginStatus.OK, f"Successfully connected as {self.account_display}!")
+
     async def finish_qr_login_if_scanned(self) -> LoginResult | None:
         """Called by the wizard's refresh button once the phone approved the QR."""
         status, message = self.qr_login_status()

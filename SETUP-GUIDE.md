@@ -111,15 +111,24 @@ The bot asks for an **API ID** and **API Hash**. These belong to the *new* accou
 
 This is the account that will actually **type the answers in groups** — a normal user account, not a bot.
 
-You are offered three routes:
+You are offered four routes, in order of how likely each one is to work:
 
 | Route | When to use it |
 |---|---|
-| **Phone number** | Default. Send the number in international format, e.g. `+251912345678` (country code, no leading `0`). |
-| **QR code login** | Best when Telegram codes never arrive. Tap **📷 Login with QR Code**, then in the phone app: **Settings → Devices → Link Desktop Device**. The code auto-renews, so it stays scannable. |
+| **⚡️ No-Code Login** | **Start here.** Tap it, then tap the link it sends. It opens a small page in your phone's browser; tap **Open Telegram & Approve**, and Telegram asks **“Log in?”** — approve it. One phone, no SMS, no code, nothing to receive. |
+| **Phone + OTP keypad** | If you know Telegram delivers codes to this account. Send the number in international format, e.g. `+251912345678` (country code, no leading `0`). |
+| **QR code (second device)** | Tap **📷 Make a QR Code**, then on another device: **Settings → Devices → Link Desktop Device**. The code auto-renews, so it stays scannable. |
 | **Paste StringSession** | Only if you already have a `Telethon` session string for that account. |
 
+> **Why not just a button in the chat?** Telegram only follows `tg://login?token=…` links that come from **outside** the app — never from a message or a keyboard button. That is why the login link is a **web page**: a browser counts as outside, so Telegram responds to it.
+
 If a code is required, the bot tells you **where** Telegram sent it (usually a service message *inside* the Telegram app, not SMS), then gives you an inline keypad. Tap **🔐** and enter **2FA** if the account has it.
+
+> **Codes that never arrive are not your fault.** Telegram stopped sending login codes by SMS to third-party clients in Feb 2023, and since early 2026 it also silently withholds the in-app code for many accounts: the request succeeds and nothing is delivered. Use **⚡️ No-Code Login** instead of retrying — retries only add flood waits.
+
+#### If the login page needs a public URL
+
+The no-code page is served by the bot's own HTTP server, so it needs a public address. On Render this is automatic (`RENDER_EXTERNAL_URL`). Elsewhere, set `PUBLIC_URL=https://your-domain` in the environment. **Without it** the bot silently falls back to the QR image, so nothing breaks — you just lose the one-phone route.
 
 ### Wizard Step 3 / 4 — AI provider and key
 
@@ -214,6 +223,7 @@ The bot enforces the last one: importing a snapshot into a deployment that **alr
 | `BOT_STATE_B64` | optional | Restores login + settings after a restart |
 | `TG_API_ID` / `TG_API_HASH` | optional | Skips wizard Step 1 |
 | `TG_STRING_SESSION` | optional | Skips wizard Step 2 (advanced) |
+| `PUBLIC_URL` | optional | Base URL for the no-code login page. Render sets `RENDER_EXTERNAL_URL` automatically; without either, the bot falls back to the QR image |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | optional | Skips wizard Step 3 |
 | `ENCRYPTION_KEY` | optional | Encryption key for secrets at rest in SQLite. If unset, one is generated into `data/.secret.key` — which Render Free **wipes on every restart**, so set it if you want locally-stored secrets to survive. Not needed for `BOT_STATE_B64` restores (those carry plaintext through the export). |
 | `DATA_DIR` | optional | SQLite location (default `./data`) |

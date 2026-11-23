@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Message
 
 from ..ai.engine import AIEngine
 from ..ai.providers import PROVIDERS
+from ..browser_login import BrowserLoginManager
 from ..config import EnvConfig
 from ..storage.database import Database
 from ..userbot.manager import UserbotManager
@@ -21,6 +22,9 @@ class AppContext:
     db: Database
     ai: AIEngine
     userbot: UserbotManager
+    #: Serves the browser login page (``/login/<id>``) and owns its attempt.
+    #: Optional so tests and CLI paths can build a context without a web server.
+    browser_login: BrowserLoginManager | None = None
     pairing_code: str = field(default_factory=lambda: secrets.token_hex(3).upper())
 
     async def get_owner_id(self) -> int | None:

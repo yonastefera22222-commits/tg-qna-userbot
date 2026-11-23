@@ -21,6 +21,14 @@ def _parse_int(value: str | None) -> int | None:
         return None
 
 
+def _normalise_public_url(value: str | None) -> str | None:
+    """Strip whitespace and trailing slashes; ignore anything that is not http(s)."""
+    url = (value or "").strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        return None
+    return url
+
+
 @dataclass(frozen=True)
 class EnvConfig:
     bot_token: str
@@ -33,6 +41,9 @@ class EnvConfig:
     openrouter_api_key: str | None
     bot_state_b64: str | None
     port: int | None
+    #: Public base URL of this deployment, used to build the browser login page.
+    #: Render sets RENDER_EXTERNAL_URL automatically; PUBLIC_URL overrides it.
+    public_url: str | None
     data_dir: Path
     encryption_key: str | None
     log_level: str
@@ -70,6 +81,9 @@ def load_env_config() -> EnvConfig:
         openrouter_api_key=(os.getenv("OPENROUTER_API_KEY") or "").strip() or None,
         bot_state_b64=(os.getenv("BOT_STATE_B64") or "").strip() or None,
         port=_parse_int(os.getenv("PORT")),
+        public_url=_normalise_public_url(
+            os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+        ),
         data_dir=data_dir,
         encryption_key=(os.getenv("ENCRYPTION_KEY") or "").strip() or None,
         log_level=(os.getenv("LOG_LEVEL") or "INFO").strip().upper(),
