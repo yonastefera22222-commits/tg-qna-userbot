@@ -14,6 +14,7 @@ from ...ai.providers import PROVIDERS
 from ...storage.database import GroupConfig
 from ...userbot.filters import should_evaluate_message
 from ..context import AppContext, safe_edit_text
+from ..filters import NotACommand
 from ..keyboards import account_menu_kb, cancel_to_dashboard_kb, main_dashboard_kb
 from ..states import DashboardStates
 
@@ -88,7 +89,7 @@ async def cb_sim_start(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(DashboardStates.waiting_sim_question)
+@router.message(NotACommand(), DashboardStates.waiting_sim_question)
 async def msg_sim_run(message: Message, ctx: AppContext) -> None:
     text = (message.text or "").strip()
     if not text:

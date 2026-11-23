@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Message
 
 from ...storage.database import GroupConfig
 from ..context import AppContext, safe_edit_text
+from ..filters import NotACommand
 from ..keyboards import group_config_kb, groups_list_kb
 from ..states import GroupStates
 
@@ -166,7 +167,7 @@ async def cb_group_search(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(GroupStates.waiting_search_query)
+@router.message(NotACommand(), GroupStates.waiting_search_query)
 async def msg_group_search(message: Message, ctx: AppContext, state: FSMContext) -> None:
     query = (message.text or "").strip()
     data = await state.get_data()
@@ -283,7 +284,7 @@ async def cb_group_cfg_update(
     )
 
 
-@router.message(GroupStates.waiting_trigger_keywords)
+@router.message(NotACommand(), GroupStates.waiting_trigger_keywords)
 async def msg_trigger_keywords(message: Message, ctx: AppContext, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     data = await state.get_data()
