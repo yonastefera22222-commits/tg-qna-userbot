@@ -12,6 +12,7 @@ import httpx
 
 from .forex import group_guidance as forex_group_guidance
 from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
+from .market import MarketFeed, MarketSnapshot
 from .math_solver import try_solve_math
 from .providers import (
     DEFAULT_SPEED_MODE,
@@ -153,8 +154,11 @@ class AnswerResult:
 class AIEngine:
     """Manages persistent HTTP/2 clients and fast single-shot Q&A across Groq, Gemini, OpenRouter."""
 
-    def __init__(self) -> None:
+    def __init__(self, market_feed: MarketFeed | None = None) -> None:
         self._client: httpx.AsyncClient | None = None
+        # Serves live prices to Forex groups. Injectable so tests never touch
+        # the network.
+        self.market_feed = market_feed or MarketFeed()
 
     async def start(self) -> None:
         if self._client is None:
@@ -176,6 +180,7 @@ class AIEngine:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        await self.market_feed.close()
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -188,6 +193,7 @@ class AIEngine:
         *,
         text: str,
         forex_group: bool = False,
+        live_data: bool = True,
         answer_style: str,
         primary_provider: str,
         primary_model: str,
@@ -259,7 +265,18 @@ class AIEngine:
                 error="No API key configured for the selected AI provider.",
             )
 
-        system_prompt = self._build_system_prompt(answer_style, text, forex_group=forex_group)
+        # Fetch market numbers before building the prompt: the guidance itself
+        # changes depending on whether there is real data to hand over.
+        market: MarketSnapshot | None = None
+        if forex_group and live_data and not image:
+            market = await self.market_feed.snapshot(text)
+
+        system_prompt = self._build_system_prompt(
+            answer_style,
+            text,
+            forex_group=forex_group,
+            market=market,
+        )
         user_prompt = self._build_user_prompt(text, context_lines)
         effective_max_tokens = min(max_tokens, 48) if answer_style == "giveaway" else max_tokens
 
@@ -413,7 +430,13 @@ class AIEngine:
             return False, elapsed_ms, str(exc)
 
     @staticmethod
-    def _build_system_prompt(answer_style: str, text: str, *, forex_group: bool = False) -> str:
+    def _build_system_prompt(
+        answer_style: str,
+        text: str,
+        *,
+        forex_group: bool = False,
+        market: MarketSnapshot | None = None,
+    ) -> str:
         """Base prompt + language rules.
 
         The always-on rule is a constant so the provider's prompt cache keeps
@@ -428,7 +451,10 @@ class AIEngine:
         # rule. Applied for the whole group, not just recognised phrasing: a
         # host may ask anything, and the honesty rule must always be present.
         if forex_group:
-            prompt = f"{prompt}\n{forex_group_guidance()}"
+            block = market.as_prompt_block() if market is not None else ""
+            prompt = f"{prompt}\n{forex_group_guidance(has_live_data=bool(block))}"
+            if block:
+                prompt = f"{prompt}\n\n{block}"
         return prompt
 
     @staticmethod

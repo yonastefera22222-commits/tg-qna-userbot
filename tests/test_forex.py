@@ -131,6 +131,20 @@ def test_shorthand_does_not_bypass_casual_chat() -> None:
         assert filter_message(chatter, _group(True)).should_process is False
 
 
+def test_live_price_toggle_only_shows_in_forex_mode() -> None:
+    from qna_bot.dashboard.keyboards import group_config_kb
+
+    group = _group(True)
+    buttons = [b for row in group_config_kb(group, 0, "d").inline_keyboard for b in row]
+    live = next(b for b in buttons if "Live Market Prices" in b.text)
+    assert live.callback_data == "gcfg:-100:fxlive:0:d"
+    assert "ON" in live.text
+
+    group.forex_enabled = False
+    buttons = [b for row in group_config_kb(group, 0, "d").inline_keyboard for b in row]
+    assert not any("Live Market Prices" in b.text for b in buttons)
+
+
 def test_forex_flag_defaults_off() -> None:
     assert GroupConfig(chat_id=-1, title="x").forex_enabled is False
 

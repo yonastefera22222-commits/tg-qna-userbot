@@ -98,6 +98,21 @@ NO_LIVE_DATA_GUIDANCE = (
     "leverage works, what drives a currency, how a pattern is interpreted) you "
     "must answer normally and precisely."
 )
+#: Swapped in when the feed did return figures. Without this the two blocks
+#: contradict each other - one hands over the price, the other forbids quoting
+#: one - and the model resolves the clash by refusing anyway.
+LIVE_DATA_PRESENT_GUIDANCE = (
+    "The prices in the LIVE MARKET DATA block were fetched moments ago and are "
+    "the ONLY prices you may state. Use them to answer the price question "
+    "directly: give the figure, and the timestamp or 'market closed' note that "
+    "accompanies it. For direction/trend questions, reason from the change and "
+    "levels actually present in that block - never from memory.\n"
+    "Do NOT use the phrase '" + NO_LIVE_DATA_ANSWER + "' when the block covers "
+    "the instrument asked about. Only refuse if the instrument is absent from "
+    "the block, and then say exactly: " + NO_LIVE_DATA_ANSWER + "\n"
+    "Never invent a level, forecast, target, event result or news item that is "
+    "not in that block."
+)
 
 
 def is_forex_question(text: str) -> bool:
@@ -130,12 +145,14 @@ def prompt_guidance(text: str) -> str:
     return FOREX_GUIDANCE
 
 
-def group_guidance() -> str:
+def group_guidance(*, has_live_data: bool = False) -> str:
     """Guidance for every answer in a Forex-mode group, question or not.
 
     Wider than :func:`prompt_guidance` on purpose: the honesty rule has to hold
     for phrasing the detector has never seen.
     """
+    if has_live_data:
+        return FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, LIVE_DATA_PRESENT_GUIDANCE)
     return FOREX_GUIDANCE
 
 

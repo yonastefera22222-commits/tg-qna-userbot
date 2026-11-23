@@ -86,6 +86,8 @@ def _group_settings_text(group: GroupConfig) -> str:
         "• <b>↩️ Reply to Question</b> replies directly to the host's message\n"
         "• <b>💱 Forex Mode</b> accepts pair shorthand (EURUSD?, GU bias) and\n"
         "   uses FX conventions; it never invents a live price\n"
+        "• <b>📈 Live Market Prices</b> fetches real quotes (gold, DXY, yields)\n"
+        "   so price questions get a timestamped number, not a refusal\n"
         f"• <b>🏷 Trigger Keywords:</b> {kw}"
     )
 
@@ -255,6 +257,8 @@ async def cb_group_cfg_update(
         group.vision_enabled = not group.vision_enabled
     elif field == "forex":
         group.forex_enabled = not group.forex_enabled
+    elif field == "fxlive":
+        group.forex_live_data = not group.forex_live_data
     elif field == "cooldown":
         group.cooldown_seconds = _next_in_cycle(_COOLDOWN_CYCLE, group.cooldown_seconds)
     elif field == "delay":
