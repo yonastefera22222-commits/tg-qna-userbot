@@ -27,7 +27,7 @@ from telethon.tl.types import (
 
 from ..ai.engine import AIEngine, AnswerResult
 from ..ai.providers import DEFAULT_SPEED_MODE, PROVIDERS
-from ..ai.text_cleanup import prepare_incoming
+from ..ai.text_cleanup import prepare_incoming, wants_inherited_image
 from ..storage.database import Database, GroupConfig
 from .filters import describe_reason, should_evaluate_message
 from .first_comment import FIRST_COMMENT_ANSWER, is_first_comment
@@ -652,13 +652,21 @@ class UserbotManager:
 
     @staticmethod
     def _message_has_image(event: events.NewMessage.Event) -> bool:
-        """True when the message carries a real photo or image document.
+        """True when the message carries a real photo or image document."""
+        return UserbotManager._payload_has_image(getattr(event, "message", None))
+
+    @staticmethod
+    def _payload_has_image(message: object) -> bool:
+        """True when a message object carries a real photo or image document.
 
         The types are checked explicitly rather than using truthiness: Telegram
         sets ``photo=None``/``document=None`` for plain text, and a loose check
         would misclassify text messages as images.
+
+        Takes the message rather than the event so a *replied-to* message can be
+        checked the same way: the poster is usually the message being replied to,
+        not the reply.
         """
-        message = getattr(event, "message", None)
         if message is None:
             return False
         if isinstance(getattr(message, "photo", None), MessageMediaPhoto | Photo):
@@ -678,9 +686,43 @@ class UserbotManager:
             return mime.startswith("image/")
         return False
 
+    #: How far back a replied-to message is fetched. One level only: the poster a
+    #: member answers directly. Chasing a chain of replies would happily walk up
+    #: through unrelated conversation and answer an old card nobody is asking about.
+    async def _replied_image_source(self, event: events.NewMessage.Event, group: GroupConfig):
+        """The message being replied to, when it is a photo worth reading.
+
+        Returns None when the reply has no target, the target is not an image, or
+        the group has photo answers switched off - so a group that never wanted
+        photos answered never fetches one either.
+        """
+        if not getattr(group, "vision_enabled", True):
+            return None
+        reply_to = getattr(getattr(event, "message", None), "reply_to_msg_id", None)
+        if not reply_to:
+            return None
+        try:
+            target = await event.get_reply_message()
+        except Exception as exc:  # noqa: BLE001 - a missing target is not fatal
+            logger.debug("Could not load the replied-to message: %s", exc)
+            return None
+        if target is None or not self._payload_has_image(target):
+            return None
+        return target
+
     async def _download_image(self, event: events.NewMessage.Event) -> tuple[bytes | None, str]:
         """Download the photo for vision models, rejecting anything too large."""
-        message = getattr(event, "message", None)
+        return await self._download_message_image(getattr(event, "message", None), event)
+
+    async def _download_message_image(
+        self, message: object, source: object
+    ) -> tuple[bytes | None, str]:
+        """Download an image from ``message``, using ``source`` to fetch bytes.
+
+        Split from :meth:`_download_image` so a *replied-to* message can supply
+        the picture: the file belongs to that message, but the client call that
+        fetches it is the same.
+        """
         mime = "image/jpeg"
         document = getattr(message, "document", None)
         if isinstance(document, Document) and str(
@@ -692,7 +734,7 @@ class UserbotManager:
             if size and size > self.MAX_IMAGE_BYTES:
                 logger.info("Skipping photo: %d bytes exceeds the size cap", size)
                 return None, mime
-            data = await event.download_media(file=bytes)
+            data = await source.download_media(file=bytes)
             if not data:
                 return None, mime
             payload = bytes(data)
@@ -816,6 +858,17 @@ class UserbotManager:
         # A photo is content too: giveaway questions are often a screenshot or a
         # picture of the question. Only text-less messages with no image are useless.
         has_image = self._message_has_image(event)
+        # ...and a picture can be one that was posted earlier. The common shape in
+        # a giveaway is the host posting a card and members answering *under it*:
+        # "What is the answer" as a reply, with no image of their own. Read on its
+        # own, that reply is a caption pointing at nothing, and the photo it is
+        # answering is one tap away in the reply. Resolving it here means the
+        # reply is judged as a photo question, which it is.
+        replied = None
+        if not has_image and wants_inherited_image(clean_text):
+            replied = await self._replied_image_source(event, group)
+            if replied is not None:
+                has_image = True
         if not text.strip() and not has_image:
             self._record(chat_id, event.sender_id, "", "skip:no_text")
             return
@@ -919,7 +972,11 @@ class UserbotManager:
         image_bytes: bytes | None = None
         mime = "image/jpeg"
         if has_image:
-            image_bytes, mime = await self._download_image(event)
+            if self._message_has_image(event):
+                image_bytes, mime = await self._download_image(event)
+            else:
+                assert replied is not None  # implied by `has_image` above
+                image_bytes, mime = await self._download_message_image(replied, event)
             if image_bytes is None:
                 self._record(
                     chat_id,
