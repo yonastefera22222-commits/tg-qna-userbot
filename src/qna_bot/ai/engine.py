@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import httpx
 
 from .forex import group_guidance as forex_group_guidance
+from .forex_math import solve_forex_math
 from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
 from .market import MarketFeed, MarketSnapshot, parse_period_query
 from .math_solver import try_solve_math
@@ -226,6 +227,23 @@ class AIEngine:
                     language=detect_language(text),
                 )
 
+        # 1a. Forex arithmetic - pip value, pip distance, position size, risk %.
+        #     Runs after the plain math solver so "15% of 240" keeps its existing
+        #     path, and before any AI call: these are exact formulas and a
+        #     giveaway cannot absorb a 500ms guess.
+        if forex_group and local_math_enabled and not image:
+            fx_answer = solve_forex_math(text)
+            if fx_answer is not None:
+                elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                return AnswerResult(
+                    answered=True,
+                    answer=fx_answer,
+                    provider="local_math",
+                    model="forex-formula",
+                    latency_ms=elapsed_ms,
+                    language=detect_language(text),
+                )
+
         # 1b. Period questions ("highest BTC price last week") are arithmetic
         #     over a real OHLC series, so they are computed here and returned
         #     without an AI call at all - the same reasoning as the math solver.
@@ -296,6 +314,7 @@ class AIEngine:
             text,
             forex_group=forex_group,
             market=market,
+            has_image=bool(image),
         )
         user_prompt = self._build_user_prompt(text, context_lines)
         effective_max_tokens = min(max_tokens, 48) if answer_style == "giveaway" else max_tokens
@@ -456,6 +475,7 @@ class AIEngine:
         *,
         forex_group: bool = False,
         market: MarketSnapshot | None = None,
+        has_image: bool = False,
     ) -> str:
         """Base prompt + language rules.
 
@@ -472,7 +492,7 @@ class AIEngine:
         # host may ask anything, and the honesty rule must always be present.
         if forex_group:
             block = market.as_prompt_block() if market is not None else ""
-            prompt = f"{prompt}\n{forex_group_guidance(has_live_data=bool(block))}"
+            prompt = f"{prompt}\n{forex_group_guidance(has_live_data=bool(block), has_image=has_image)}"
             if block:
                 prompt = f"{prompt}\n\n{block}"
         return prompt
