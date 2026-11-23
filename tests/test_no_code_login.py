@@ -100,15 +100,22 @@ def test_screen_can_always_ask_for_the_link_again() -> None:
     assert "wiz:loginlink" in callbacks
 
 
-def test_caption_explains_the_one_phone_route_first() -> None:
+def test_caption_admits_the_qr_route_needs_a_second_device() -> None:
+    """Telegram refuses in-app approval, so the screen must stop implying otherwise."""
     caption = _qr_caption(TOKEN_URL, page_url=PAGE_URL).lower()
-    assert "same phone" in caption
-    assert caption.index("same phone") < caption.index("second device")
+    assert "second device" in caption
+    assert "camera" in caption
+    assert "cannot be done from one phone" in caption
 
 
-def test_caption_mentions_the_qr_route_only_as_the_alternative() -> None:
+def test_caption_points_one_phone_users_at_the_email_code() -> None:
     caption = _qr_caption(TOKEN_URL, page_url=PAGE_URL)
-    assert "no second device" in caption.lower()
+    assert "Email Code" in caption
+
+
+def test_caption_explains_why_a_link_cannot_approve() -> None:
+    caption = _qr_caption(TOKEN_URL, page_url=PAGE_URL)
+    assert "Settings → Devices → Scan QR" in caption
 
 
 def test_caption_without_a_page_still_describes_the_qr_route() -> None:
@@ -128,11 +135,16 @@ def test_page_contains_the_live_token_link() -> None:
     assert 'href="tg://login?token=AQAAAA-b_cd123"' in page
 
 
-def test_page_offers_a_copy_paste_fallback() -> None:
-    """Some phone browsers refuse to follow tg:// from a web page."""
+def test_page_is_honest_when_telegram_refuses_the_link() -> None:
+    """Telegram answers a tapped login link with "go to Settings > Scan QR".
+
+    That is deliberate anti-phishing behaviour, so the page must not pretend the
+    link works: it says why, and sends one-phone users to the email code.
+    """
     page = render_login_page(_attempt())
-    assert "Copy the link" in page
-    assert "Saved Messages" in page
+    assert "Scan QR" in page
+    assert "Login With Email Code" in page
+    assert "another screen" in page
 
 
 def test_page_is_not_indexable_and_not_cached() -> None:
@@ -160,23 +172,28 @@ def test_page_attempt_id_is_json_encoded() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_otp_keypad_offers_the_no_code_route() -> None:
+def test_otp_keypad_offers_the_email_route() -> None:
     """The original dead end: no code arriving, and only Resend/Cancel on screen."""
     callbacks = {b.callback_data for b in _buttons(otp_keypad_kb(""))}
-    assert "wiz:login_qr" in callbacks
+    assert "wiz:emailcode" in callbacks
     assert "otp:resend" in callbacks
 
 
-def test_otp_keypad_escape_does_not_promise_the_dead_button() -> None:
-    escape = next(b for b in _buttons(otp_keypad_kb("")) if b.callback_data == "wiz:login_qr")
+def test_otp_keypad_escape_is_the_channel_that_delivers() -> None:
+    escape = next(b for b in _buttons(otp_keypad_kb("")) if b.callback_data == "wiz:emailcode")
+    assert "email" in escape.text.lower()
     assert "no code" in escape.text.lower()
-    assert "one tap" not in escape.text.lower()
 
 
-def test_login_methods_lead_with_the_no_code_route() -> None:
+def test_login_methods_lead_with_the_email_route() -> None:
     first = wizard_login_method_kb().inline_keyboard[0][0]
-    assert first.callback_data == "wiz:login_qr"
-    assert "no-code" in first.text.lower()
+    assert first.callback_data == "wiz:emailcode"
+    assert "email" in first.text.lower()
+
+
+def test_qr_is_labelled_as_needing_a_second_device() -> None:
+    qr = next(b for b in _buttons(wizard_login_method_kb()) if b.callback_data == "wiz:login_qr")
+    assert "second device" in qr.text.lower()
 
 
 def test_login_options_still_offer_every_route() -> None:
@@ -315,8 +332,8 @@ def test_app_delivery_warns_that_resend_will_not_help() -> None:
     assert delivery.next_channel is DeliveryChannel.SMS
     assert delivery.next_after == 60
     text = delivery.detail.lower()
-    assert "do not keep tapping resend" in text
-    assert "link login" in text
+    assert "suppressing the code" in text
+    assert "email" in text
 
 
 def test_delivery_carries_next_channel_for_every_type() -> None:
@@ -363,11 +380,10 @@ def test_login_client_does_not_identify_as_raw_telethon() -> None:
     assert "python" not in init.system_version.lower()
 
 
-def test_browser_login_is_the_primary_login_offer() -> None:
-    """The first option must be the route that works with one phone."""
+def test_email_login_is_the_primary_login_offer() -> None:
+    """Telegram's email channel is the one third-party apps still get."""
     from qna_bot.dashboard.keyboards import wizard_login_method_kb
 
     first = wizard_login_method_kb().inline_keyboard[0][0]
-    assert first.callback_data == "wiz:login_qr"
-    assert "no-code" in first.text.lower()
-    assert "sms" in first.text.lower()
+    assert first.callback_data == "wiz:emailcode"
+    assert "email" in first.text.lower()

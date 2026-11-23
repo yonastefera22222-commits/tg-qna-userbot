@@ -266,8 +266,19 @@ class UserbotManager:
         return await self._login.send_login_email_code(email)
 
     async def submit_login_email_code(self, code: str) -> LoginResult:
-        """Verify the emailed code; afterwards the real login code is delivered."""
+        """Verify the emailed setup code; afterwards the real login code is delivered."""
         return await self._login.submit_login_email_code(code)
+
+    async def use_login_email(self, email: str) -> LoginResult:
+        """Route the login code to an inbox — the channel that actually delivers."""
+        return await self._login.use_login_email(email)
+
+    async def submit_email_login_code(self, code: str) -> LoginResult:
+        """Verify a code that Telegram emailed as the login code; finishes the login."""
+        result = await self._login.submit_email_login_code(code)
+        if result.status is LoginStatus.OK:
+            return await self._finalize_pending_login()
+        return result
 
     @property
     def pending_email_length(self) -> int | None:

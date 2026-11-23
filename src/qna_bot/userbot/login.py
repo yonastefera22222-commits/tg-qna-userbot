@@ -43,6 +43,9 @@ from telethon.errors import (
     ApiIdPublishedFloodError,
     AuthRestartError,
     CodeInvalidError,
+    EmailInvalidError,
+    EmailUnconfirmedError,
+    EmailVerifyExpiredError,
     FloodError,
     FloodPremiumWaitError,
     FloodWaitError,
@@ -239,6 +242,8 @@ class DeliveryChannel(StrEnum):
     FLASH_CALL = "flash_call"
     MISSED_CALL = "missed_call"
     EMAIL = "email"
+    #: Telegram refuses every other channel and demands a login email instead.
+    EMAIL_SETUP = "email_setup"
     FRAGMENT = "fragment"
     IN_APP_PROMPT = "in_app_prompt"
     SETUP_REQUIRED = "setup_required"
@@ -327,9 +332,9 @@ def _describe_this_attempt(sent: object) -> CodeDelivery:
             "service chat</b> (look for “Telegram” with a blue shield ✓ at the very top "
             "of the chat list). If the app shows a <b>“Yes, it's me” / “Confirm login”</b> "
             "button, just tap it — you will not need to type a code at all.\n\n"
-            "⚠️ <b>If that chat stays empty</b>, do not keep tapping Resend: Telegram is "
-            "suppressing delivery, not losing it. Use the <b>link login</b> instead — it "
-            "needs no code delivery at all.",
+            "⚠️ <b>If that chat stays empty</b>, Telegram is suppressing the code, not "
+            "losing it — retrying only adds a flood wait. Tap <b>📧 Get the code by "
+            "email</b>: Telegram delivers that channel to third-party clients reliably.",
             length,
         )
     if isinstance(sent_type, auth_types.SentCodeTypeSms):
@@ -466,6 +471,9 @@ class PendingLogin:
     email_setup_required: bool = False
     email_setup_sent_to: str | None = None
     email_setup_length: int | None = None
+    #: The owner explicitly asked for the code by email, and Telegram agreed.
+    #: From then on the delivery channel is the inbox, not the app.
+    email_login_requested: bool = False
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
 
@@ -947,6 +955,183 @@ class PhoneLoginSession:
                 delivery=result.delivery,
             )
         return result
+
+    # -- switch the code onto the login email ---------------------------
+    async def use_login_email(self, email: str) -> LoginResult:
+        """Move the login code onto an email address. Works *during* a login.
+
+        This is the fix for the real dead end. Telegram stopped sending login
+        codes by SMS to third-party clients in Feb 2023, and since early 2026 it
+        also silently withholds the in-app code for many accounts: ``sendCode``
+        answers ``SentCodeTypeApp`` with a valid hash and nothing is ever
+        delivered (Telethon #4730). Retrying cannot help, and the QR route is
+        worse — Telegram refuses ``tg://login`` links opened inside its own app
+        (TDLib ``internalLinkTypeQrCodeAuthentication``: "must be scanned from
+        QR-code using in-app camera"), so it demands a second screen and a
+        camera.
+
+        The email channel is different: Telegram's authorization docs treat
+        ``auth.sentCodeTypeEmailCode`` as a first-class delivery method for
+        third-party apps, and it is delivered by Telegram's own mail servers.
+        ``account.sendVerifyEmailCode`` with an ``emailVerifyPurposeLoginSetup``
+        purpose is legal *inside* an in-flight login and returns the login code
+        straight back in ``account.emailVerifiedLogin.sentCode``, so the owner
+        never has to leave the chat or wait for a delivery that never comes.
+        """
+        pending = self._pending
+        if pending is None:
+            return LoginResult(
+                LoginStatus.ERROR, "No login in progress. Send your phone number again."
+            )
+
+        address = (email or "").strip()
+        if not _looks_like_email(address):
+            return LoginResult(
+                LoginStatus.ERROR,
+                "That does not look like an email address. Send one like "
+                "<code>you@gmail.com</code>.",
+            )
+
+        pending.touch()
+        await self._ensure_connected(pending.client)
+        try:
+            sent = await pending.client(
+                SendVerifyEmailCodeRequest(
+                    types.EmailVerifyPurposeLoginSetup(
+                        phone_number=pending.phone,
+                        phone_code_hash=pending.phone_code_hash,
+                    ),
+                    address,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Login-email switch failed: %s", exc)
+            return self._explain_email_failure(exc)
+
+        pattern = getattr(sent, "email_pattern", address)
+        length = getattr(sent, "length", None)
+        pending.email_setup_sent_to = address
+        pending.email_setup_length = length
+        pending.email_setup_required = False
+        await self._save()
+        logger.info("Login code routed to email %s", pattern)
+        return LoginResult(
+            LoginStatus.CODE_SENT,
+            f"📬 Telegram sent a login code to <b>{pattern}</b> "
+            f"({length or 5} digits). Send it here to finish logging in.",
+        )
+
+    def _explain_email_failure(self, exc: Exception) -> LoginResult:
+        """Say which reason Telegram gave, because the fix differs per reason."""
+        if isinstance(exc, FloodWaitError):
+            return _flood_result(exc, "email login code request")
+        if isinstance(exc, EmailInvalidError):
+            return LoginResult(
+                LoginStatus.ERROR,
+                "❌ Telegram rejected that email address. Send a normal mailbox such as "
+                "<code>you@gmail.com</code>.",
+            )
+        if isinstance(exc, EmailVerifyExpiredError):
+            return LoginResult(
+                LoginStatus.ERROR,
+                "⌛ That email verification expired. Tap 📧 Get the code by email to "
+                "start it again.",
+            )
+        if isinstance(exc, EmailUnconfirmedError):
+            return LoginResult(
+                LoginStatus.ERROR,
+                "📧 Telegram still considers that address unconfirmed. Send the "
+                "verification code from the email before the login code.",
+            )
+        name = type(exc).__name__
+        if name in {"EmailNotAllowedError", "EmailAddressNotAllowedError", "EMAIL_NOT_ALLOWED"}:
+            return LoginResult(
+                LoginStatus.ERROR,
+                "🚫 Telegram will not accept an email code for this account right now. "
+                "Try a different address, or use 📱 Phone + OTP and then 📷 Make a QR "
+                "Code from another device.",
+            )
+        if isinstance(exc, PhoneCodeExpiredError):
+            return LoginResult(
+                LoginStatus.ERROR,
+                "⌛ The login attempt expired. Send your phone number again, then choose "
+                "📧 Get the code by email.",
+            )
+        return translate_send_error(exc, "your account")
+
+    async def submit_email_login_code(self, raw_code: str) -> LoginResult:
+        """Verify the code Telegram emailed, then continue with the login code.
+
+        ``account.verifyEmail`` does **not** log you in: on success it returns
+        ``account.emailVerifiedLogin`` carrying a *fresh* ``auth.sentCode`` — the
+        login code for the next step. That code goes to the newly verified inbox
+        (the docs' "you will receive Telegram login codes via email and not
+        SMS"), so the owner reads one more email and types it once. Two emails
+        is the price of a channel that actually delivers.
+        """
+        pending = self._pending
+        if pending is None:
+            return LoginResult(
+                LoginStatus.ERROR, "No login in progress. Send your phone number again."
+            )
+
+        digits = "".join(ch for ch in (raw_code or "") if ch.isdigit())
+        if not digits:
+            return LoginResult(LoginStatus.ERROR, "Please send the code from your email.")
+
+        expected = pending.email_setup_length
+        if expected and len(digits) != expected:
+            return LoginResult(
+                LoginStatus.ERROR,
+                f"The email code should be <b>{expected} digits</b>, but {len(digits)} "
+                "were sent. Check the email again.",
+            )
+
+        pending.touch()
+        await self._ensure_connected(pending.client)
+        try:
+            verified = await pending.client(
+                VerifyEmailRequest(
+                    types.EmailVerifyPurposeLoginSetup(
+                        phone_number=pending.phone,
+                        phone_code_hash=pending.phone_code_hash,
+                    ),
+                    types.EmailVerificationCode(code=digits),
+                )
+            )
+        except SessionPasswordNeededError:
+            pending.code_verified = True
+            return LoginResult(
+                LoginStatus.TWO_FA_REQUIRED,
+                "Two-Step Verification (2FA) is enabled. Send your Telegram cloud password.",
+            )
+        except Exception as exc:
+            logger.warning("VerifyEmail (login code) failed: %s", exc)
+            return translate_signin_error(exc)
+
+        # Telegram hands back the login-code descriptor for the next step.
+        sent = getattr(verified, "sent_code", None)
+        if sent is None:  # pragma: no cover - guarded by the API contract
+            return LoginResult(
+                LoginStatus.ERROR,
+                "Telegram verified the email but did not send a login code. "
+                "Tap 🔄 Resend Code.",
+            )
+
+        pending.phone_code_hash = getattr(sent, "phone_code_hash", "") or pending.phone_code_hash
+        delivery = describe_delivery(sent)
+        pending.delivery = delivery
+        pending.code_length = delivery.length or pending.code_length
+        pending.email_setup_required = False
+        await self._save()
+        logger.info("Email verified; login code dispatched via %s", delivery.channel)
+
+        return LoginResult(
+            LoginStatus.CODE_SENT,
+            f"✅ Email verified. {delivery.title} — check that inbox (and spam) for the "
+            f"<b>{delivery.length or 5}-digit</b> login code and send it here.",
+            delivery=delivery,
+        )
 
     # -- resend ---------------------------------------------------------
     async def resend_code(self) -> LoginResult:

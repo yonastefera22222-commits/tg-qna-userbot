@@ -111,24 +111,40 @@ The bot asks for an **API ID** and **API Hash**. These belong to the *new* accou
 
 This is the account that will actually **type the answers in groups** — a normal user account, not a bot.
 
-You are offered four routes, in order of how likely each one is to work:
+You are offered four routes, in order of how likely each one is to work **with one phone**:
 
 | Route | When to use it |
 |---|---|
-| **⚡️ No-Code Login** | **Start here.** Tap it, then tap the link it sends. It opens a small page in your phone's browser; tap **Open Telegram & Approve**, and Telegram asks **“Log in?”** — approve it. One phone, no SMS, no code, nothing to receive. |
+| **📧 Login With Email Code** | **Start here.** Telegram emails the login code instead of sending it to the Telegram app or by SMS. This is the one channel it still delivers to third-party apps, so it does not fail silently. |
 | **Phone + OTP keypad** | If you know Telegram delivers codes to this account. Send the number in international format, e.g. `+251912345678` (country code, no leading `0`). |
-| **QR code (second device)** | Tap **📷 Make a QR Code**, then on another device: **Settings → Devices → Link Desktop Device**. The code auto-renews, so it stays scannable. |
+| **QR code (second device)** | Tap **📷 Make a QR Code**, then on another device: **Settings → Devices → Link Desktop Device**. The code auto-renews, so it stays scannable. **This route needs a camera and a second screen — see below.** |
 | **Paste StringSession** | Only if you already have a `Telethon` session string for that account. |
-
-> **Why not just a button in the chat?** Telegram only follows `tg://login?token=…` links that come from **outside** the app — never from a message or a keyboard button. That is why the login link is a **web page**: a browser counts as outside, so Telegram responds to it.
 
 If a code is required, the bot tells you **where** Telegram sent it (usually a service message *inside* the Telegram app, not SMS), then gives you an inline keypad. Tap **🔐** and enter **2FA** if the account has it.
 
-> **Codes that never arrive are not your fault.** Telegram stopped sending login codes by SMS to third-party clients in Feb 2023, and since early 2026 it also silently withholds the in-app code for many accounts: the request succeeds and nothing is delivered. Use **⚡️ No-Code Login** instead of retrying — retries only add flood waits.
+> **Codes that never arrive are not your fault.** Telegram stopped sending login codes by SMS to third-party clients in Feb 2023, and since early 2026 it also silently withholds the in-app code for many accounts: the request succeeds and nothing is delivered. Tap **📧 No code coming? Get it by email** instead of retrying — retries only add flood waits.
 
-#### If the login page needs a public URL
+#### Email login, step by step
 
-The no-code page is served by the bot's own HTTP server, so it needs a public address. On Render this is automatic (`RENDER_EXTERNAL_URL`). Elsewhere, set `PUBLIC_URL=https://your-domain` in the environment. **Without it** the bot silently falls back to the QR image, so nothing breaks — you just lose the one-phone route.
+1. Tap **📧 Login With Email Code**.
+2. Send the email address to use.
+3. Telegram emails a short verification code — send it to the bot.
+4. The bot verifies it with Telegram, which then sends the **login code to that same inbox** — send that too.
+5. If the account has 2FA, send the cloud password.
+
+> The address becomes this account's **Telegram login email**. That is a real account change Telegram makes, and it is what makes future logins reliable.
+
+#### Why the QR code cannot be done on one phone
+
+Telegram **refuses** to let an app approve a QR login from a link. Its own TDLib documentation is explicit about `internalLinkTypeQrCodeAuthentication`: the token *"must be scanned from QR-code using in-app camera"*. Tapping such a link inside Telegram only shows:
+
+> *"This code can be used to allow someone to log in to your Telegram account. To confirm Telegram login, please go to Settings > Devices > Scan QR and scan the code."*
+
+This is deliberate anti-phishing design — otherwise a link in any chat could hand your account to a stranger — so **no workaround exists**. A QR login always needs the camera on a second screen. If you only have one phone, use the **email code**.
+
+#### If you do want the QR route
+
+The bot's HTTP server can also show the login token as a web page (`/login/<id>`) for the case where your browser *does* hand the link to Telegram. It needs a public address: on Render this is automatic (`RENDER_EXTERNAL_URL`); elsewhere set `PUBLIC_URL=https://your-domain`. Without either, the bot silently falls back to the QR image only.
 
 ### Wizard Step 3 / 4 — AI provider and key
 
@@ -223,7 +239,7 @@ The bot enforces the last one: importing a snapshot into a deployment that **alr
 | `BOT_STATE_B64` | optional | Restores login + settings after a restart |
 | `TG_API_ID` / `TG_API_HASH` | optional | Skips wizard Step 1 |
 | `TG_STRING_SESSION` | optional | Skips wizard Step 2 (advanced) |
-| `PUBLIC_URL` | optional | Base URL for the no-code login page. Render sets `RENDER_EXTERNAL_URL` automatically; without either, the bot falls back to the QR image |
+| `PUBLIC_URL` | optional | Base URL for the browser login page (`/login/<id>`). Render sets `RENDER_EXTERNAL_URL` automatically; without either, the bot falls back to the QR image |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | optional | Skips wizard Step 3 |
 | `ENCRYPTION_KEY` | optional | Encryption key for secrets at rest in SQLite. If unset, one is generated into `data/.secret.key` — which Render Free **wipes on every restart**, so set it if you want locally-stored secrets to survive. Not needed for `BOT_STATE_B64` restores (those carry plaintext through the export). |
 | `DATA_DIR` | optional | SQLite location (default `./data`) |

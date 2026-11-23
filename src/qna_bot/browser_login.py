@@ -368,11 +368,11 @@ _PAGE_TEMPLATE = """<!doctype html>
 <body>
   <main class="card">
     <h1>Log in with Telegram</h1>
-    <p class="sub">One tap. No code to type, and nothing to receive.</p>
+    <p class="sub">Approve this session from the phone that is already signed in.</p>
 
-    <a id="main" class="btn" href="{url}" rel="noreferrer">Open Telegram &amp; Approve</a>
+    <a id="main" class="btn" href="{url}" rel="noreferrer">Open Telegram</a>
     <button id="copy" class="btn secondary" type="button" hidden>
-      Buttons do nothing here? Copy the link
+      Copy the link instead
     </button>
     <p class="hint" id="timer">
       Link renews by itself &middot; <span class="timer">{seconds_left}s</span> left
@@ -380,17 +380,20 @@ _PAGE_TEMPLATE = """<!doctype html>
 
     <div id="state" class="state ok" hidden></div>
 
-    <ol id="fallback" hidden>
-      <li>Tap <b>Copy the link</b> above.</li>
-      <li>Open <b>Telegram</b> &rarr; <b>Saved Messages</b>.</li>
-      <li>Paste the link into a message to yourself and tap it there.</li>
-      <li>Telegram asks <b>&ldquo;Log in?&rdquo;</b> &mdash; tap <b>Approve</b>.</li>
-    </ol>
-    <p class="hint" id="windowhint" hidden>
-      Already on your phone? Your browser may not be allowed to open Telegram from
-      a web page. Use <b>Copy the link</b> &rarr; paste it in <b>Saved Messages</b>
-      &rarr; tap it there.
+    <p class="hint" id="rejected" hidden>
+      <b>Telegram did not offer an Approve prompt.</b> It answered with
+      <i>&ldquo;go to Settings &rarr; Devices &rarr; Scan QR&rdquo;</i>. That is
+      deliberate: Telegram never lets an app approve a login from a link, because
+      that would make phishing trivial. There is no way around it on one phone
+      &mdash; go back to the bot and use <b>Login With Email Code</b>.
     </p>
+
+    <ol id="fallback" hidden>
+      <li>Open this page on <b>another screen</b> (a laptop, tablet, TV).</li>
+      <li>On your phone: <b>Telegram</b> &rarr; <b>Settings</b> &rarr; <b>Devices</b>
+          &rarr; <b>Link Desktop Device</b>.</li>
+      <li>Point the phone&rsquo;s camera at the QR code on that screen.</li>
+    </ol>
   </main>
 
 <script>
@@ -401,7 +404,6 @@ _PAGE_TEMPLATE = """<!doctype html>
   var mainBtn = document.getElementById('main');
   var copyBtn = document.getElementById('copy');
   var fallback = document.getElementById('fallback');
-  var windowHint = document.getElementById('windowhint');
   var copyLink = null;
   var stopped = false;
 
@@ -412,9 +414,14 @@ _PAGE_TEMPLATE = """<!doctype html>
   }}
 
   function showFallback() {{
+    // A browser tab is the only context Telegram might honour a tg:// login
+    // link from. When it does not, the honest answer is a QR scan from another
+    // screen or the email code - not a copy/paste trick, because Telegram
+    // rejects these links in *every* in-app context (messages, buttons, the
+    // built-in browser, mini apps).
     copyBtn.hidden = false;
+    document.getElementById('rejected').hidden = false;
     fallback.hidden = false;
-    windowHint.hidden = false;
   }}
 
   copyBtn.addEventListener('click', function () {{
