@@ -192,20 +192,31 @@ def prompt_guidance(text: str) -> str:
     return FOREX_GUIDANCE
 
 
-#: A photograph of a chart carries the numbers the question is about, so the
-#: "no feed" rule must not fire on one. Without this a chart photo was answered
-#: "No live data" while the price sat in plain sight on the image.
-CHART_IMAGE_GUIDANCE = (
-    "The message includes an image: a trading chart, a position screenshot or a "
-    "broker panel. Read the values out of the image itself - price scale, last "
-    "price, high/low markers, candle highs and lows, indicator values, symbol, "
-    "timeframe - and answer from those. Those numbers ARE the data for this "
-    "question: never reply '" + NO_LIVE_DATA_ANSWER + "' when the answer is "
-    "visible in the picture.\n"
-    "Read the current price from the price axis against the latest candle, not "
-    "from an unrelated label elsewhere on the screen. Name the instrument and "
-    "timeframe when the image shows them (symbol, axis labels, candle spacing). "
-    "If a value is genuinely illegible, say which one, rather than guessing it."
+#: A photograph may be a chart (numbers inside it) or just a decorative poster
+#: with the question printed on it. Both are common in trading giveaways, and
+#: guessing which one it is from the bytes is unreliable - so the rule is
+#: written for both cases instead of only for charts.
+#:
+#: This used to *replace* the live-data rule with a chart-only instruction. That
+#: inverted the failure: a poster image told the model "the picture is the data",
+#: so it read a number off an unrelated graphic instead of using the feed, and a
+#: genuine chart screenshot never got the feed as a cross-check either.
+IMAGE_GUIDANCE = (
+    "The message includes an image. Decide what it is before using it:\n"
+    "- If it shows a chart, a position screenshot or a broker panel, read the "
+    "numbers out of it: price axis against the latest candle, high/low markers, "
+    "candle extremes, indicator values, symbol and timeframe. Say the instrument "
+    "and timeframe when the image shows them.\n"
+    "- If it is a poster, banner or meme, the image carries no price data - it is "
+    "only decoration around the question. Answer the question from the text and "
+    "from any LIVE MARKET DATA block; do NOT read a number off the artwork.\n"
+    "- Read the current price from the price axis, not from an unrelated label "
+    "elsewhere on the screen, and never present a decorative figure as a quote.\n"
+    "- If a value you need is genuinely illegible, say which one rather than "
+    "guessing it.\n"
+    "A value visible in the picture and a value in the LIVE MARKET DATA block are "
+    "both usable; if the question names a window (this week, last week, today), "
+    "prefer the computed figure you were given over an eyeballed one."
 )
 
 
@@ -214,14 +225,39 @@ def group_guidance(*, has_live_data: bool = False, has_image: bool = False) -> s
 
     Wider than :func:`prompt_guidance` on purpose: the honesty rule has to hold
     for phrasing the detector has never seen.
-    """
-    if has_image:
-        # The picture is the feed; the refusal rule must not fire on a chart.
-        return FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, CHART_IMAGE_GUIDANCE)
-    if has_live_data:
-        return FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, LIVE_DATA_PRESENT_GUIDANCE)
-    return FOREX_GUIDANCE
 
+    The three cases are additive, not exclusive. An image and a live feed can
+    both be present, and swapping one rule for another is how the prompt ends up
+    telling the model to trust a poster's artwork *and* to refuse a price it was
+    just handed.
+    """
+    if has_live_data:
+        guidance = FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, LIVE_DATA_PRESENT_GUIDANCE)
+    elif has_image:
+        # No feed, but the answer may still be visible in a chart screenshot, so
+        # the flat refusal has to be softened - while staying honest about
+        # posters that carry no data at all.
+        guidance = FOREX_GUIDANCE.replace(NO_LIVE_DATA_GUIDANCE, LIVE_DATA_IN_IMAGE_GUIDANCE)
+    else:
+        guidance = FOREX_GUIDANCE
+    if has_image:
+        guidance = f"{guidance}\n{IMAGE_GUIDANCE}"
+    return guidance
+
+
+#: Used when there is no feed but an image is attached. Keeps the no-invention
+#: rule intact while allowing a chart screenshot to be the source.
+LIVE_DATA_IN_IMAGE_GUIDANCE = (
+    "You do NOT have a live market feed for this message. If the question asks "
+    "for a current price, a level today, or a window's high/low, use the figure "
+    "visible in the attached image when it genuinely shows one; if the image is "
+    "only decoration and carries no price data, do NOT invent one and do NOT "
+    "recall an old price as current - reply with exactly: "
+    + NO_LIVE_DATA_ANSWER + "\n"
+    "Definitional, mechanical and economic questions (what a pip is, how "
+    "leverage works, what drives a currency, how a pattern is interpreted) you "
+    "must answer normally and precisely."
+)
 
 #: Appended for Forex groups. Written as rules, not vibes.
 FOREX_GUIDANCE = (

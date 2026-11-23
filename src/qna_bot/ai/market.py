@@ -34,7 +34,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -325,6 +325,17 @@ class PeriodQuery:
             return 1
         return 7 if "week" in self.period else 30
 
+    @property
+    def is_calendar_week(self) -> bool:
+        """True for "this week", which starts on Monday - not 7 days ago.
+
+        A giveaway host asking "the highest price this week" on a Tuesday means
+        Monday and Tuesday, not the last seven days. Trailing-seven was close
+        enough to look right and wrong often enough to matter, which is the
+        worst combination for a competition answer.
+        """
+        return self.period == "this_week"
+
 
 def parse_period_query(text: str) -> PeriodQuery | None:
     """Detect a "high/low/close over a past window" question.
@@ -499,55 +510,10 @@ class MarketFeed:
         if not instrument or instrument not in HISTORY_INSTRUMENTS:
             return None
 
-        ticker = HISTORY_INSTRUMENTS[instrument]
-        days = query.days
-        client = await self._get_client()
-        resp = await client.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-            params={"interval": "1d", "range": f"{max(days, 5)}d"},
-        )
-        resp.raise_for_status()
-        result = ((resp.json().get("chart") or {}).get("result") or [None])[0]
-        if not result:
-            return None
-
-        timestamps = result.get("timestamp") or []
-        quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-        highs = quotes.get("high") or []
-        lows = quotes.get("low") or []
-        opens = quotes.get("open") or []
-        closes = quotes.get("close") or []
-
-        # Pair each day with its bar, dropping the null bars Yahoo emits when a
-        # market was shut (weekends, holidays). Those nulls are why "today" is
-        # always the LAST element: on a Sunday the final bars are empty and the
-        # live one is appended after them.
-        bars: list[tuple[datetime, float, float, float, float]] = []
-        def at(series: list, idx: int) -> float | None:
-            return series[idx] if idx < len(series) else None
-
-        # A bar is usable when the field the question needs is present. Yahoo
-        # routinely leaves one field null on a still-forming candle, and
-        # dropping the whole bar for that would silently shorten the window -
-        # which is how "the high last week" comes back as the week before.
-        for idx, stamp in enumerate(timestamps):
-            h = at(highs, idx)
-            low = at(lows, idx)
-            o = at(opens, idx)
-            c = at(closes, idx)
-            if h is None or low is None:
-                continue
-            bars.append(
-                (
-                    datetime.fromtimestamp(int(stamp), tz=UTC),
-                    float(h),
-                    float(low),
-                    float(o) if o is not None else float(c if c is not None else h),
-                    float(c) if c is not None else float(o if o is not None else low),
-                )
-            )
+        bars = await self.ohlc_bars(instrument, days=query.days)
         if not bars:
             return None
+
 
         # Drop today's still-forming bar from the *completed* pool: an
         # incomplete candle makes "highest price last week" wrong the moment it
@@ -567,7 +533,18 @@ class MarketFeed:
             selected = [today_bar] if today_bar else pool[-1:]
         elif query.period == "yesterday":
             selected = pool[-1:]
-        elif query.period in ("this_week", "this_month"):
+        elif query.is_calendar_week:
+            # "This week" is Monday-to-now, not a trailing seven days. On a
+            # Tuesday the difference is the whole weekend before it.
+            monday = (now - timedelta(days=now.weekday())).date()
+            selected = [b for b in [*pool, *( [today_bar] if today_bar else [])]
+                        if b[0].date() >= monday]
+            if not selected:
+                # A brand-new week with no bars yet (or a market that has not
+                # opened): fall back to the most recent session rather than
+                # returning nothing and losing the question.
+                selected = pool[-1:]
+        elif query.period == "this_month":
             # Trailing window ending now, today's partial bar included.
             selected = pool[-window:]
             if today_bar is not None:
@@ -603,6 +580,69 @@ class MarketFeed:
             end=selected[-1][0],
             decimals=_decimals_for(instrument),
         )
+
+    async def ohlc_bars(
+        self, instrument: str, *, days: int = 7
+    ) -> list[tuple[datetime, float, float, float, float]]:
+        """Daily (timestamp, high, low, open, close) bars straight from Yahoo.
+
+        Shared by the period-answer path and by the photo path: a chart photo
+        showing BTC against *this week's* series needs the same numbers, and
+        computing "the high this week" from a real series beats asking a model
+        to read an axis.
+        """
+        ticker = HISTORY_INSTRUMENTS.get(instrument)
+        if ticker is None:
+            return []
+        client = await self._get_client()
+        try:
+            resp = await client.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                params={"interval": "1d", "range": f"{max(days, 5)}d"},
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("OHLC fetch failed for %s: %s", instrument, exc)
+            return []
+
+        result = ((resp.json().get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            return []
+
+        timestamps = result.get("timestamp") or []
+        quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        highs = quotes.get("high") or []
+        lows = quotes.get("low") or []
+        opens = quotes.get("open") or []
+        closes = quotes.get("close") or []
+
+        def at(series: list, idx: int) -> float | None:
+            return series[idx] if idx < len(series) else None
+
+        # Pair each day with its bar, dropping the null bars Yahoo emits when a
+        # market was shut (weekends, holidays). A bar is usable when the fields
+        # the question needs are present: Yahoo routinely leaves one field null
+        # on a still-forming candle, and dropping the whole bar for that would
+        # silently shorten the window - which is how "the high last week" comes
+        # back as the week before.
+        bars: list[tuple[datetime, float, float, float, float]] = []
+        for idx, stamp in enumerate(timestamps):
+            h = at(highs, idx)
+            low = at(lows, idx)
+            o = at(opens, idx)
+            c = at(closes, idx)
+            if h is None or low is None:
+                continue
+            bars.append(
+                (
+                    datetime.fromtimestamp(int(stamp), tz=UTC),
+                    float(h),
+                    float(low),
+                    float(o) if o is not None else float(c if c is not None else h),
+                    float(c) if c is not None else float(o if o is not None else low),
+                )
+            )
+        return bars
 
     async def _quote(self, instrument: str) -> Quote | None:
         """Try sources in order; one failing must not prevent the next."""
