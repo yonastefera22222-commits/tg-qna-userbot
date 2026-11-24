@@ -39,6 +39,14 @@ class EnvConfig:
     groq_api_key: str | None
     gemini_api_key: str | None
     openrouter_api_key: str | None
+    #: Exness Trader API credentials. The bot fetches every Forex price from the
+    #: owner's own Exness account, so these are what make live prices possible
+    #: at all. Blank means the bot answers "no live data" rather than quoting
+    #: some other venue.
+    exness_api_key: str | None
+    exness_private_key: str | None
+    exness_account_id: str | None
+    exness_gateway_url: str | None
     bot_state_b64: str | None
     port: int | None
     #: Public base URL of this deployment, used to build the browser login page.
@@ -79,6 +87,10 @@ def load_env_config() -> EnvConfig:
         groq_api_key=(os.getenv("GROQ_API_KEY") or "").strip() or None,
         gemini_api_key=(os.getenv("GEMINI_API_KEY") or "").strip() or None,
         openrouter_api_key=(os.getenv("OPENROUTER_API_KEY") or "").strip() or None,
+        exness_api_key=(os.getenv("EXNESS_API_KEY") or "").strip() or None,
+        exness_private_key=(os.getenv("EXNESS_PRIVATE_KEY") or "").strip() or None,
+        exness_account_id=(os.getenv("EXNESS_ACCOUNT_ID") or "").strip() or None,
+        exness_gateway_url=(os.getenv("EXNESS_GATEWAY_URL") or "").strip() or None,
         bot_state_b64=(os.getenv("BOT_STATE_B64") or "").strip() or None,
         port=_parse_int(os.getenv("PORT")),
         public_url=_normalise_public_url(

@@ -431,23 +431,30 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
         if not live_on:
             lines.append("📈 <b>Live prices:</b> OFF for all Forex groups")
         else:
-            probe = await ctx.ai.market_feed.snapshot("EURUSD and gold")
-            if probe.is_empty():
+            feed = ctx.ai.market_feed
+            if not await feed.configured():
                 lines.append(
-                    "🔴 <b>Live prices:</b> feed unreachable from this server "
-                    f"(failed: {html.escape(', '.join(probe.failed) or 'unknown')}) — "
-                    "price questions will answer <code>No live data</code>"
+                    "🔴 <b>Live prices:</b> Exness not connected — "
+                    "AI menu → 📈 Exness Prices to add the API key"
                 )
             else:
-                sample = "; ".join(q.label(detailed=True) for q in probe.quotes[:3])
-                lines.append(f"🟢 <b>Live prices:</b> {html.escape(sample)}")
-                for q in probe.quotes:
-                    if q.kind == "daily_fix":
+                probe = await feed.snapshot("EURUSD and gold")
+                if probe.is_empty():
+                    reason = feed.last_error or "no price returned"
+                    lines.append(
+                        "🔴 <b>Live prices:</b> Exness unreachable "
+                        f"(<code>{html.escape(reason)}</code>) — "
+                        "price questions will answer <code>No live data</code>"
+                    )
+                else:
+                    sample = "; ".join(q.label(detailed=True) for q in probe.quotes[:3])
+                    lines.append(
+                        f"🟢 <b>Live prices:</b> {html.escape(sample)}"
+                    )
+                    if any(q.kind == "market_closed" for q in probe.quotes):
                         lines.append(
-                            "   <i>daily fix only — intraday sources were blocked "
-                            "from this server</i>"
+                            "   <i>market closed — these are the last Exness ticks</i>"
                         )
-                        break
 
     # Per-group verdict
     if enabled:

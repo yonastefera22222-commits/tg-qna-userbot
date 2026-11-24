@@ -17,6 +17,12 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from exness_fixtures import (
+    daily_bars_from_yahoo_shaped,
+    exness_response,
+    is_exness_request,
+    settings_loader,
+)
 
 from qna_bot.ai.engine import AIEngine
 from qna_bot.ai.market import MarketFeed, parse_period_query
@@ -45,15 +51,18 @@ PAYLOAD = {
 }
 
 
+_DAILY = daily_bars_from_yahoo_shaped(PAYLOAD)
+
+
 def _engine(ocr: str) -> tuple[AIEngine, list[str]]:
     """Engine whose vision model only ever reports `ocr`."""
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if "yahoo" in url:
-            seen.append("yahoo")
-            return httpx.Response(200, json=PAYLOAD)
+        if is_exness_request(url):
+            seen.append("exness")
+            return exness_response(request, _DAILY)
         body = request.read().decode("utf-8", "replace")
         if AIEngine.TRANSCRIBE_PROMPT in body:
             seen.append("transcribe")
@@ -66,7 +75,11 @@ def _engine(ocr: str) -> tuple[AIEngine, list[str]]:
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
     return engine, seen
 
@@ -462,8 +475,8 @@ async def test_transcribed_question_is_flagged_as_coming_from_the_image() -> Non
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if "yahoo" in url:
-            return httpx.Response(200, json=PAYLOAD)
+        if is_exness_request(url):
+            return exness_response(request, _DAILY)
         import json
 
         body = json.loads(request.read())
@@ -482,7 +495,11 @@ async def test_transcribed_question_is_flagged_as_coming_from_the_image() -> Non
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
 
     result = await _ask(engine, text="answer below")
@@ -523,8 +540,8 @@ async def test_amharic_transcription_gets_amharic_token_headroom() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         import json
 
-        if "yahoo" in str(request.url):
-            return httpx.Response(200, json=PAYLOAD)
+        if is_exness_request(str(request.url)):
+            return exness_response(request, _DAILY)
         body = json.loads(request.read())
         if AIEngine.TRANSCRIBE_PROMPT in body["messages"][0]["content"]:
             return httpx.Response(
@@ -544,7 +561,11 @@ async def test_amharic_transcription_gets_amharic_token_headroom() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
 
     await _ask(engine)
