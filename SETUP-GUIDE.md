@@ -50,6 +50,28 @@ Your repo: `github.com/yonastefera22222-commits/tg-qna-userbot` → click **Fork
 4. It asks for the `sync: false` variables — enter **`BOT_TOKEN`** and **`OWNER_ID`** now (from Steps 1–2).
 5. Click **Apply** / **Create**.
 
+**Two things that make a blueprint deploy look dead when it isn't:**
+
+> **`OWNER_ID` and `ENCRYPTION_KEY` are generated once you type a value.** If you
+> skip `ENCRYPTION_KEY`, the bot generates one into the container disk — and Render
+> Free wipes that disk on every restart, which throws away the encrypted Telegram
+> session with it. Generate a key first and paste it in so the value is stable:
+>
+> ```bash
+> python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+> ```
+>
+> **It must be 32 url-safe base64 bytes** (44 characters ending in `=`). A random
+> string from Render's "Generate" button will not work — if you paste one, the
+> bot now logs a clear `ENCRYPTION_KEY is not a valid Fernet key` warning and keeps
+> running, but every secret stored under the old key becomes unreadable.
+
+> **Nothing is enabled yet, so silence is expected.** A fresh deployment has no
+> groups in it. While the logs show `No saved Telethon session yet`, the bot is
+> waiting for `/setup`, not broken. After setup, open
+> **/dashboard → 👥 Select & Configure Groups** — that first open imports your
+> joined groups — then tap each group you want answered.
+
 ### Option B — Web Service (manual)
 
 **New +** → **Web Service** → pick the repo, then set exactly:
@@ -172,6 +194,8 @@ If a login code never arrives, send **`/logindiagnose`** — it prints where Tel
 
 1. Send a real question in one of the selected groups, or use the dashboard's **🧪 Live Q&A Simulator** to test without waiting for a giveaway.
 2. If nothing happens, send **`/diag`** to the bot. It prints, per group, exactly why each message was or was not answered, plus the last 8 decisions.
+
+> **`/diag` is the first thing to read, always.** It states plainly whether the group list is empty, whether no group is enabled, whether the responder is paused, whether the AI key is missing, and whether the only messages arriving came from the bot's own account. Every one of those is a different fix, and none of them throw an error anywhere else.
 3. **`/testanswer`** runs one question through the local filter *and* the AI stage and shows both results.
 
 ---
@@ -218,8 +242,12 @@ The bot enforces the last one: importing a snapshot into a deployment that **alr
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Service shows a **frowning face / "deploy failed"** and never goes Live | Almost always a build or boot crash, not Telegram | Read **Logs** — the last line names the cause. A bad `ENCRYPTION_KEY` is now logged as a warning and no longer stops the boot |
 | Bot asks for a **pairing code** | `OWNER_ID` missing or wrong | Check Render env; read the code from Logs |
 | Dashboard says **⛔ Unauthorized** | You are messaging from a different Telegram account than `OWNER_ID` | Use the right account, or correct `OWNER_ID` |
+| Bot is **Live** but silent, `/diag` says **No groups synced yet** | Fresh deploy: the group list is empty | `/dashboard` → 👥 Select & Configure Groups (first open imports your groups), then enable the ones to answer in |
+| Logs show `No saved Telethon session yet` | Setup wizard has not been run | Send `/start` to the bot and finish the wizard |
+| Logs show `ENCRYPTION_KEY is not a valid Fernet key` | Something other than a Fernet key was pasted | Generate one with `Fernet.generate_key()` and set it; secrets stored under the old key cannot be read |
 | Bot is **Live** but silent | Userbot not logged in, or paused | `/diag` → follow the verdict line |
 | Answers **never appear** in groups | Logged-in account is not an admin there, or group not enabled | `/diag` shows the per-group skip reason |
 | Logged out after every deploy | No `BOT_STATE_B64` | Step 8 |
@@ -242,6 +270,6 @@ The bot enforces the last one: importing a snapshot into a deployment that **alr
 | `PUBLIC_URL` | optional | Base URL for the browser login page (`/login/<id>`). Render sets `RENDER_EXTERNAL_URL` automatically; without either, the bot falls back to the QR image |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | optional | Skips wizard Step 3 |
 | `EXNESS_API_KEY` / `EXNESS_PRIVATE_KEY` / `EXNESS_ACCOUNT_ID` / `EXNESS_GATEWAY_URL` | optional | Skips the Exness step of the AI menu. All four are needed together: every Forex price is read from your own Exness trading account (read-only key), and without them Forex groups answer `No live data` |
-| `ENCRYPTION_KEY` | optional | Encryption key for secrets at rest in SQLite. If unset, one is generated into `data/.secret.key` — which Render Free **wipes on every restart**, so set it if you want locally-stored secrets to survive. Not needed for `BOT_STATE_B64` restores (those carry plaintext through the export). |
+| `ENCRYPTION_KEY` | recommended | Encryption key for secrets at rest in SQLite. **Must be 32 url-safe base64 bytes** — generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. If unset, one is generated into `data/.secret.key`, which Render Free **wipes on every restart**, taking the encrypted account session with it. An invalid value is logged as an error and ignored rather than stopping the boot. Not needed for `BOT_STATE_B64` restores (those carry plaintext through the export). |
 | `DATA_DIR` | optional | SQLite location (default `./data`) |
 | `PORT` | auto on Render | Enables the `/health` server |

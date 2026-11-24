@@ -41,7 +41,18 @@ async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
         await db.set_setting("owner_id", env.owner_id)
         logger.info("Owner claimed from OWNER_ID=%s", env.owner_id)
 
-    if env.bot_state_b64 and not await db.get_setting("tg_session"):
+    # Three states, and conflating them is how a blueprint deploy reaches a
+    # confusing middle: DB already has its own session (never touch it), DB is
+    # empty (import), DB holds *something* but no session (a session could not be
+    # decrypted, or a half-finished setup) - then the snapshot is the only way
+    # back in, so it must still be applied.
+    db_has_session = bool(await db.get_setting("tg_session"))
+    if env.bot_state_b64 and db_has_session:
+        logger.info(
+            "BOT_STATE_B64 is set but this deployment already has its own Telegram "
+            "session; leaving the live configuration alone."
+        )
+    elif env.bot_state_b64:
         try:
             n_settings, n_groups = await db.import_state_b64(env.bot_state_b64)
             logger.info(
@@ -50,7 +61,12 @@ async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
                 n_groups,
             )
         except Exception as exc:
-            logger.error("Failed to import BOT_STATE_B64: %s", exc)
+            logger.error(
+                "Failed to import BOT_STATE_B64 (%s: %s). The service will still "
+                "start; re-run /setup or paste a fresh snapshot.",
+                type(exc).__name__,
+                exc,
+            )
 
     # A session from the snapshot is refused above when this deployment already
     # has an owner, so only fill these in when they are genuinely empty.
@@ -101,11 +117,45 @@ async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
         await db.set_setting("primary_model", PROVIDERS[first_seeded_provider].default_model)
 
 
+def _build_cipher(env: EnvConfig) -> SecretCipher:
+    """Build the secret cipher, degrading instead of crashing on a bad key.
+
+    A blueprint deploy is where this bites: Render's ``generateValue`` produces a
+    random string, and ``Fernet`` requires exactly 32 url-safe base64 bytes. A
+    wrong value therefore raised straight out of ``SecretCipher.from_env_or_file``
+    during boot, and the service died with a frowning face and no useful log -
+    the bot simply "not responding", with nothing in Telegram to explain it.
+
+    A bad key costs stored secrets, not the deployment: falling back to a
+    generated key file still gives a working bot, and the warning below tells the
+    owner exactly what to paste instead.
+    """
+    if env.encryption_key:
+        try:
+            return SecretCipher.from_env_or_file(env.encryption_key, env.secret_key_path)
+        except Exception as exc:  # noqa: BLE001 - never let config kill the boot
+            logger.error("=" * 60)
+            logger.error("ENCRYPTION_KEY is not a valid Fernet key (%s).", exc)
+            logger.error(
+                "It must be 32 url-safe base64-encoded bytes. Generate one with:"
+            )
+            logger.error(
+                "  python -c \"from cryptography.fernet import Fernet; "
+                'print(Fernet.generate_key().decode())"'
+            )
+            logger.error(
+                "Continuing with a generated key file instead. Anything already "
+                "encrypted with the old key cannot be read."
+            )
+            logger.error("=" * 60)
+    return SecretCipher.from_env_or_file(None, env.secret_key_path)
+
+
 async def async_main() -> None:
     env = load_env_config()
     _setup_logging(env.log_level)
 
-    cipher = SecretCipher.from_env_or_file(env.encryption_key, env.secret_key_path)
+    cipher = _build_cipher(env)
     db = Database(env.db_path, cipher)
     await db.connect()
     await _seed_env_defaults(env, db)

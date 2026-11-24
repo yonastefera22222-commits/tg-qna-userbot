@@ -11,12 +11,24 @@ services:
         value: "3.12.7"
       - key: BOT_TOKEN
         sync: false
+      # Strongly recommended, but deliberately NOT required at deploy time: a
+      # blueprint deploy that blocks on a missing OWNER_ID looks like a broken
+      # service. Without it the bot prints a 6-character pairing code in the
+      # Render logs, and the first person to send that code to the bot owns it.
       - key: OWNER_ID
         sync: false
       - key: BOT_STATE_B64
         sync: false
       - key: LOG_LEVEL
         value: INFO
+      # Encryption key for secrets at rest (Telegram session, API keys).
+      # Render Free wipes the disk on every restart, which loses the generated
+      # key file and with it every stored secret. Must be 32 url-safe base64
+      # bytes - generate with:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      # Left blank the bot still runs, but a bad value is logged and ignored.
+      - key: ENCRYPTION_KEY
+        sync: false
       # Exness Trader API: every Forex price is read from the owner's own
       # trading account. Optional here - the dashboard's AI menu can collect
       # them instead - but if set, all four are required.

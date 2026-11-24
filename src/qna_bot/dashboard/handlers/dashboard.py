@@ -414,6 +414,17 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
             "<i>(a userbot cannot answer itself)</i>"
         )
 
+    # A brand-new deployment - a Render blueprint deploy especially - starts with
+    # an empty group table: nothing is enabled until the owner opens the group
+    # menu, which silently syncs. "Not responding" is then literally true and not
+    # a bug, so say so here instead of leaving them to guess.
+    if not groups:
+        lines.append(
+            "⬛ <b>No groups synced yet</b> — the bot has nothing to answer in. "
+            "Open /dashboard → 👥 Select &amp; Configure Groups: it syncs your "
+            "joined groups on first open, then tap a group to enable it."
+        )
+
     ai_ok = bool(await ctx.db.get_all_provider_keys())
     primary = str(await ctx.db.get_setting("primary_provider", "—"))
     primary_model = str(await ctx.db.get_setting("primary_model", "—"))
@@ -516,7 +527,16 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
     elif not global_on:
         lines.append("⏸ The responder is paused. Tap /dashboard → Resume Responder.")
     elif not enabled:
-        lines.append("⬛ No groups are enabled. Tap /dashboard → Select & Configure Groups.")
+        if not groups:
+            lines.append(
+                "⬛ No groups are enabled — none have been synced yet. Tap /dashboard → "
+                "👥 Select &amp; Configure Groups (it imports your joined groups), then "
+                "enable the ones the bot should answer in."
+            )
+        else:
+            lines.append(
+                "⬛ No groups are enabled. Tap /dashboard → Select &amp; Configure Groups."
+            )
     elif not ai_ok:
         lines.append("🔴 No AI API key saved. Re-run Step 3 in /setup.")
     elif counters["messages_seen"] == 0 and counters.get("own_messages"):
