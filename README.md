@@ -47,7 +47,7 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
     - **🧩 Every Poster Arrangement**: the question is found whether it is a single line, stacked across five lines of artwork, split mid-phrase, numbered among other questions, written as `BTCUSDT`, prefixed with a `$`, wrapped in hashtags, or missing its question mark. Captions are handled too: none at all, a stub like *"answer below"* or *"🔥🔥"*, an `@channel` credit, or a paragraph of promo copy with the question only on the card — each of those is read from the picture rather than answered literally.
     - **🇪🇹 Amharic Posters**: *"በExness BTC ገበታ ላይ ይህ ሳምንት ከፍተኛው ዋጋ ስንት ነው?"* is parsed and computed exactly like the English version — the period words (*ይህ ሳምንት* this week, *ያለፈው ሳምንት* last week, *ዛሬ* today, *ትናንት* yesterday) and the aggregations (*ከፍተኛው* highest, *ዝቅተኛው* lowest) are understood directly, and instruments can be written as `BTC` or *ቢቲሲ*.
     - **📊 Past-Period Market Questions (with the Forex mode)**: "on the Exness BTC chart, what was the highest price last week?" is **computed locally** from real daily OHLC data, not guessed by a model. Highest/lowest/open/close/change over **today, yesterday, this week, last week, this month and last month** work for **BTC, ETH, SOL, XRP, DOGE, BNB, LTC**, plus gold, silver and DXY. The answer is the bare figure (`66055.10`) and the model is never called — a model asked to eyeball a series of bars will eventually pick the wrong one, so the arithmetic happens in code. Today's still-forming candle is excluded from "last week" so a half-finished day can't become the weekly high, and crypto is quoted to 2 decimals, not FX's 5. **"This week" means Monday-to-now**, not a trailing seven days — on a Tuesday the trailing version includes the previous weekend, which is close enough to look right and wrong often enough to lose a competition.
-    - **📈 Live Market Prices (with the Forex mode)**: the refusal above stops being the answer once prices are switched on. The bot fetches **real quotes at answer time** — FX pairs, gold and silver, the **DXY** dollar index and the **US 10-year yield** — from **keyless, free** sources (`query1.finance.yahoo.com`, `api.gold-api.com`) with **ECB reference rates** (`api.frankfurter.dev`) as the fallback when a live source is blocked. The model is handed the numbers and told they are *the only prices it may state*, so "EURUSD now?" gets a real figure instead of a refusal. **Replies are just the number** — `EURUSD 1.09840` — with no timestamp, no "as of", and no mention of a feed, so an answer reads like a trader typing a price rather than a machine reporting one. When the market is closed the reply says `market closed` instead of presenting Friday's close as live. Costs one extra ~200–400 ms feed call, only in Forex groups that have it enabled, and it is cached for 30 s so a burst of giveaway questions pays for it once.
+    - **📈 Live Market Prices from Exness (with the Forex mode)**: the refusal above stops being the answer once prices are switched on. The bot reads **real prices at answer time from your own Exness trading account** via the Exness Trader API — FX pairs, gold and silver, crypto, with the account's own symbol suffixes (`EURUSDm`, `XAUUSDc`) discovered automatically. There is **no fallback to another vendor**: if Exness is not connected or unreachable, the answer is `No live data` rather than a different venue's number. The model is handed the figures and told they are *the only prices it may state*, so "EURUSD now?" gets a real figure instead of a refusal. **Replies are just the number** — `EURUSD 1.09840` — with no timestamp, no "as of", and no mention of a feed, so an answer reads like a trader typing a price rather than a machine reporting one. When the market is closed the reply says `market closed` instead of presenting Friday's close as live. Costs one extra ~200–400 ms feed call, only in Forex groups that have it enabled, and it is cached for 30 s so a burst of giveaway questions pays for it once.
     - **⏱ Cooldown**, **⏳ Optional Human Delay**, **🏷 Custom Trigger Keywords**, and **🧠 Context Messages**.
 - **🤖 Multi-Provider Fast & Free AI + Automatic Fallback**:
   - **⚡ Groq** (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`, ~500–1000 tok/s — ideal primary for speed giveaways). Retired model IDs are detected automatically and swapped for the live replacement, so a stale model never looks like a bad API key.
@@ -64,19 +64,55 @@ Turn your Telegram account into an ultra-fast, free AI Q&A userbot designed for 
 
 ---
 
-### 📈 Where the prices come from
+### 📈 Where the prices come from: Exness
 
-Forex mode can answer price questions from **free, keyless** sources — no signup, no API key, nothing to paste into Render:
+Every Forex price the bot posts is read from **your own Exness trading account** through the
+**Exness Trader API** — the same venue and the same feed the host scoring the giveaway is looking at.
+That matters because a giveaway is graded against the Exness terminal: a tick from another liquidity
+pool can sit pips away, and pips *are* the answer.
 
-| Source | Used for | Freshness |
+There is **one source and no fallback**. If Exness is unreachable, the answer says `No live data`
+rather than quoting another broker or a central-bank reference rate under a Forex group's nose.
+
+| What | Endpoint | Used for |
 |---|---|---|
-| `query1.finance.yahoo.com` | FX pairs, gold/silver futures, DXY, US 10Y | intraday |
-| `api.gold-api.com` | gold/silver spot (fallback) | intraday |
-| `api.frankfurter.dev` (ECB) | any pair, when live sources are blocked | one official fix per working day |
+| Access Point discovery | `GET /v1/trading/access-point` on the Gateway host | resolve the account's host, cached for an hour |
+| Account instruments | `GET /v1/configuration/accounts/{id}/instruments` | pick the account's own symbol (`EURUSD`, `EURUSDm`, …) |
+| Live price | `GET /v1/market-data/accounts/{id}/candles` (`M1`, `bid`) | the newest tick, per question |
+| Period history | same endpoint, `D1` | “highest price last week”, computed locally |
 
-**Check it on your own deploy:** send `/diag`. If Forex groups are enabled you get a line like `🟢 Live prices: EURUSD 1.09840 (…UTC)` — that is a real probe from your server, not a claim. `🔴 … feed unreachable` means Render could not reach the endpoints, and price questions fall back to `No live data`. Every fetch is best-effort: a dead feed never blocks an answer.
+Requests are signed with **Ed25519** (`EXN-API-KEY`, `EXN-TIMESTAMP`, `EXN-DATA`, `EXN-SIGN`, …,
+base64url without padding) exactly as Exness documents, and the account's Access Point is discovered
+first — Exness has no fixed public quote host.
 
-> **Freshness without exposure.** FX trades 24/5, so on a weekend the newest quote is Friday's close. The bot marks that `market closed` and never presents it as the live price; if only the ECB fix is reachable it marks it `daily fix`. The full timestamp is kept out of group replies on purpose — it is shown on your own `/diag` screen, where it is useful, and nowhere the group can see.
+#### Connecting it (2 minutes, once)
+
+Exness publishes **no anonymous quote feed** — quotes are account-scoped, and the API is for Exness
+trading accounts only. So you need four values from your Exness Personal Area:
+
+1. Sign in → **Key Management** → **Create API key**
+2. Scope: **Trading — Read-only** (the bot never places an order), and select the account you trade
+3. Copy the **API key** (`exnsk-…`) and the **private signing key** shown once at creation
+4. Note your **trading account number** and the **Gateway host** from the **DNS widget**
+
+Then in the dashboard bot: **`/dashboard` → 🤖 AI Providers & Models → 📈 Exness Prices**, and paste
+each value when asked. Key and private key are deleted from the chat and stored encrypted; the menu
+shows a ✅ per field. Finish with **🔌 Test Connection**, which resolves your host and reads a real
+price — that is a live round trip, not a claim.
+
+Prefer environment variables? Set `EXNESS_API_KEY`, `EXNESS_PRIVATE_KEY`, `EXNESS_ACCOUNT_ID` and
+`EXNESS_GATEWAY_URL` on Render; env wins over anything saved in the dashboard.
+
+**Check it on your own deploy:** send `/diag`. If Forex groups are enabled you get either
+`🟢 Live prices: EURUSD 1.09840 (Exness EURUSDm, …UTC)` — a real probe from your server — or a
+specific reason (`Exness not connected`, or the error code: `1000` bad key, `1001` signature,
+`1002`/`403` account access, `4000` instrument not on that account). Price questions answer
+`No live data` whenever that line is red, and `/diag` tells you which of the four values to fix.
+
+> **Freshness without exposure.** FX trades 24/5, so on a weekend the newest candle is Friday's
+> close. The bot marks that `market closed` and never presents it as the live price. The full
+> timestamp and the exact Exness symbol stay out of group replies on purpose — they are shown on
+> your own `/diag` screen, where they help, and nowhere the group can see.
 
 ## ☁️ Deploying to Render Free Tier (Step-by-Step)
 

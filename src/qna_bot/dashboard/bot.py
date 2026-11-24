@@ -13,7 +13,13 @@ from aiogram.types import BotCommand, CallbackQuery, Message, TelegramObject
 
 from ..storage.fsm import SQLiteStorage
 from .context import AppContext
-from .handlers import ai_router, dashboard_router, groups_router, wizard_router
+from .handlers import (
+    ai_router,
+    dashboard_router,
+    exness_router,
+    groups_router,
+    wizard_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +106,10 @@ def create_dashboard_bot(ctx: AppContext) -> tuple[Bot, Dispatcher]:
     # handlers must therefore come before the catch-all.
     dp.include_router(groups_router)
     dp.include_router(ai_router)
+    # After ai_router (the Exness menu is reached from it) and before the
+    # dashboard router, whose catch-all-free commands never overlap these
+    # state-scoped text handlers.
+    dp.include_router(exness_router)
     dp.include_router(dashboard_router)
     dp.include_router(wizard_router)  # last: contains the catch-all
 

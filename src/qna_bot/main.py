@@ -85,6 +85,17 @@ async def _seed_env_defaults(env: EnvConfig, db: Database) -> None:
         if first_seeded_provider is None:
             first_seeded_provider = provider
 
+    # Exness credentials: env wins over the database, exactly like the AI keys,
+    # so a host can be provisioned without anyone opening the dashboard.
+    for setting, value in (
+        ("exness_api_key", env.exness_api_key),
+        ("exness_private_key", env.exness_private_key),
+        ("exness_account_id", env.exness_account_id),
+        ("exness_gateway_url", env.exness_gateway_url),
+    ):
+        if value:
+            await db.set_setting(setting, value)
+
     if first_seeded_provider and await db.get_setting("primary_provider") is None:
         await db.set_setting("primary_provider", first_seeded_provider)
         await db.set_setting("primary_model", PROVIDERS[first_seeded_provider].default_model)
@@ -100,6 +111,12 @@ async def async_main() -> None:
     await _seed_env_defaults(env, db)
 
     ai_engine = AIEngine()
+    # Forex answers are priced from the owner's own Exness account. The loader
+    # is a thunk, not a snapshot, so a key saved from the dashboard applies to
+    # the very next answer.
+    ai_engine.attach_market_settings(
+        lambda: db.get_settings(AIEngine.MARKET_SETTING_KEYS)
+    )
     await ai_engine.start()
 
     userbot = UserbotManager(db=db, ai_engine=ai_engine)

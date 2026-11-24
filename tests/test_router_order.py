@@ -109,15 +109,38 @@ def test_production_registration_order_is_wizard_last() -> None:
 
 
 def test_ai_menu_states_cover_every_state_the_ai_router_handles() -> None:
-    """Any state ai_settings waits on must be in the skip set."""
+    """Any state a secret-entry router waits on must be in the skip set.
+
+    Two routers now collect credentials - AI provider keys and Exness API keys -
+    and both must be shielded from the wizard's catch-all. Checking only the
+    first would let the second be silently swallowed.
+    """
     import inspect
 
-    from qna_bot.dashboard.handlers import ai_settings
+    from qna_bot.dashboard.handlers import ai_settings, exness
 
-    source = inspect.getsource(ai_settings)
+    for module in (ai_settings, exness):
+        source = inspect.getsource(module)
+        for state in AI_MENU_STATES:
+            group, _, short = state.partition(":")
+            # Only the states this module actually owns.
+            if f"{group}." not in source and group != "DashboardStates":
+                continue
+            if f"{group}.{short}" not in source:
+                continue
+            assert f"{group}.{short}" in source, f"{short} not used by {module.__name__}?"
+
+    ai_source = inspect.getsource(ai_settings)
     for state in AI_MENU_STATES:
-        short = state.split(":")[1]
-        assert f"DashboardStates.{short}" in source, f"{short} not used by ai_settings?"
+        group, _, short = state.partition(":")
+        if group == "DashboardStates":
+            assert f"DashboardStates.{short}" in ai_source, f"{short} not used by ai_settings?"
+
+    exness_source = inspect.getsource(exness)
+    for name in ("waiting_api_key", "waiting_private_key", "waiting_account_id",
+                 "waiting_gateway_url"):
+        assert f"ExnessStates:{name}" in AI_MENU_STATES
+        assert f"ExnessStates.{name}" in exness_source
 
 
 def test_wizard_states_are_not_in_the_skip_set() -> None:

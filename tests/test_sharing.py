@@ -194,6 +194,10 @@ async def test_owner_env_wins_over_a_pasted_backup_at_boot(tmp_path) -> None:
             groq_api_key=None,
             gemini_api_key=None,
             openrouter_api_key=None,
+            exness_api_key=None,
+            exness_private_key=None,
+            exness_account_id=None,
+            exness_gateway_url=None,
         )
         await _seed_env_defaults(env, other)
 
@@ -223,6 +227,10 @@ async def test_own_env_keys_are_not_overwritten_by_a_snapshot(tmp_path) -> None:
             groq_api_key="gsk_THEIRS",
             gemini_api_key=None,
             openrouter_api_key=None,
+            exness_api_key="exnsk-THEIRS",
+            exness_private_key=None,
+            exness_account_id=None,
+            exness_gateway_url=None,
         )
         await _seed_env_defaults(env, other)
         # Env keys are seeded after the import, so they win.

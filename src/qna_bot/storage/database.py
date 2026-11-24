@@ -24,6 +24,10 @@ SECRET_SETTING_KEYS = frozenset(
         "api_key_groq",
         "api_key_gemini",
         "api_key_openrouter",
+        # Exness Trader API credentials. The private key signs every request,
+        # so it is as sensitive as any AI key and is encrypted the same way.
+        "exness_api_key",
+        "exness_private_key",
     }
 )
 

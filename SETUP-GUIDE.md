@@ -241,6 +241,7 @@ The bot enforces the last one: importing a snapshot into a deployment that **alr
 | `TG_STRING_SESSION` | optional | Skips wizard Step 2 (advanced) |
 | `PUBLIC_URL` | optional | Base URL for the browser login page (`/login/<id>`). Render sets `RENDER_EXTERNAL_URL` automatically; without either, the bot falls back to the QR image |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | optional | Skips wizard Step 3 |
+| `EXNESS_API_KEY` / `EXNESS_PRIVATE_KEY` / `EXNESS_ACCOUNT_ID` / `EXNESS_GATEWAY_URL` | optional | Skips the Exness step of the AI menu. All four are needed together: every Forex price is read from your own Exness trading account (read-only key), and without them Forex groups answer `No live data` |
 | `ENCRYPTION_KEY` | optional | Encryption key for secrets at rest in SQLite. If unset, one is generated into `data/.secret.key` — which Render Free **wipes on every restart**, so set it if you want locally-stored secrets to survive. Not needed for `BOT_STATE_B64` restores (those carry plaintext through the export). |
 | `DATA_DIR` | optional | SQLite location (default `./data`) |
 | `PORT` | auto on Render | Enables the `/health` server |

@@ -17,3 +17,14 @@ services:
         sync: false
       - key: LOG_LEVEL
         value: INFO
+      # Exness Trader API: every Forex price is read from the owner's own
+      # trading account. Optional here - the dashboard's AI menu can collect
+      # them instead - but if set, all four are required.
+      - key: EXNESS_API_KEY
+        sync: false
+      - key: EXNESS_PRIVATE_KEY
+        sync: false
+      - key: EXNESS_ACCOUNT_ID
+        sync: false
+      - key: EXNESS_GATEWAY_URL
+        sync: false

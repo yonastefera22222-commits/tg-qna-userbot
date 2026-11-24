@@ -316,7 +316,9 @@ _SPEED_LABELS = {"fast": "⚡ Fastest", "balanced": "⚖️ Balanced", "smart": 
 SPEED_CYCLE = ("fast", "balanced", "smart")
 
 
-def ai_menu_kb(has_fallback: bool, speed_mode: str = "fast") -> InlineKeyboardMarkup:
+def ai_menu_kb(
+    has_fallback: bool, speed_mode: str = "fast", *, exness_ready: bool = False
+) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Switch Primary Provider", callback_data="ai:pick_primary")
     b.button(text="🧠 Change Primary Model", callback_data="ai:pick_primary_model")
@@ -329,8 +331,37 @@ def ai_menu_kb(has_fallback: bool, speed_mode: str = "fast") -> InlineKeyboardMa
         callback_data="ai:pick_fallback",
     )
     b.button(text="🔑 Add / Update API Keys", callback_data="ai:manage_keys")
+    b.button(
+        text="📈 Exness Prices: " + ("CONNECTED" if exness_ready else "NOT CONNECTED"),
+        callback_data="exn:menu",
+    )
     b.button(text="⚡ Benchmark All Configured Providers", callback_data="ai:benchmark")
     b.button(text="⬅️ Dashboard", callback_data="dash:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def exness_menu_kb(configured: dict[str, bool]) -> InlineKeyboardMarkup:
+    """Credential entry for the Exness Trader API, one field per button."""
+    b = InlineKeyboardBuilder()
+    b.button(
+        text=("✅ " if configured["api_key"] else "⬜ ") + "1. API Key",
+        callback_data="exn:set:api_key",
+    )
+    b.button(
+        text=("✅ " if configured["private_key"] else "⬜ ") + "2. Private Signing Key",
+        callback_data="exn:set:private_key",
+    )
+    b.button(
+        text=("✅ " if configured["account_id"] else "⬜ ") + "3. Trading Account ID",
+        callback_data="exn:set:account_id",
+    )
+    b.button(
+        text=("✅ " if configured["gateway_url"] else "⬜ ") + "4. Gateway Host",
+        callback_data="exn:set:gateway_url",
+    )
+    b.button(text="🔌 Test Connection", callback_data="exn:test")
+    b.button(text="⬅️ AI Providers", callback_data="ai:menu")
     b.adjust(1)
     return b.as_markup()
 

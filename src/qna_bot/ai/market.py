@@ -1,4 +1,4 @@
-"""Live market data for Forex groups.
+"""Live market data for Forex groups, sourced from Exness.
 
 A language model has no market feed. Until now a Forex-group answer could only
 refuse live questions ("No live data"), which is honest but useless when the
@@ -10,21 +10,24 @@ cutoff, so any figure the model produces from memory is stale by definition.
 Every number here is fetched at answer time and carries the timestamp of the
 quote, and the prompt is told to use these figures only.
 
-Sources (all keyless, all free):
+The single source is the **Exness Trader API** (see :mod:`.exness`), read over
+the owner's own trading account. That is not a stylistic choice:
 
-``Yahoo Finance chart API``
-    Primary. Covers FX pairs, gold/silver futures, the dollar index and the US
-    10-year yield, with intraday freshness.
-``gold-api.com``
-    Keyless gold spot, used when Yahoo does not cover the instrument.
-``Frankfurter (ECB)``
-    Official ECB reference rates, one fix per working day. Used when the live
-    sources fail; it is a *daily* fix, never quote it as an intraday price.
+* A giveaway is scored against the Exness terminal in front of the host. A tick
+  from a different liquidity pool can be pips off, and pips are the answer.
+* Exness publishes no anonymous quote feed - quotes are account-scoped - so
+  "Exness data" and "credentials configured" are the same condition.
 
-Freshness is the whole product here. A trader who is told "EURUSD 1.0984" when
-the last tick was three days old is worse off than one who is told nothing, so
-every digest records when each figure was taken and what it is (live quote vs.
-official daily fix), and says so in the prompt.
+There is deliberately **no fallback to another vendor**. If Exness is not
+connected, is unreachable, or the market is shut, the digest is empty (or says
+"market closed") and the answer says no live data. Substituting a different
+broker's or a central bank's number under a Forex group's nose is exactly the
+fabrication this module exists to prevent: a wrong price posted confidently is
+worse than an admitted gap.
+
+Freshness is the rest of the product. A trader told "EURUSD 1.0984" when the
+last tick was three days old is worse off than one who is told nothing, so every
+digest records when the figure was taken and labels a shut market as shut.
 """
 
 from __future__ import annotations
@@ -33,23 +36,36 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import httpx
 
+from .exness import (
+    HISTORY_TIMEFRAME,
+    QUOTE_CANDLE_COUNT,
+    QUOTE_STALE_MINUTES,
+    QUOTE_TIMEFRAME,
+    ExnessClient,
+    ExnessCredentialsMissing,
+    ExnessError,
+    credentials_from,
+)
+
 logger = logging.getLogger(__name__)
 
 #: A quote older than this is not "now". FX trades ~24/5, so a weekend gap is
 #: normal and must be labelled as such rather than hidden.
-STALE_AFTER_MINUTES = 20
-#: Daily ECB fixes are only ever as fresh as the last working day.
-DAILY_FIX_MAX_AGE_HOURS = 96
+STALE_AFTER_MINUTES = int(QUOTE_STALE_MINUTES)
 #: Whole-digest cache. A giveaway fires several questions within seconds of
 #: each other; re-fetching for each one would add latency and burn rate limits.
 CACHE_TTL_SECONDS = 30.0
 #: Never let a slow feed delay an answer more than this.
-FEED_TIMEOUT_SECONDS = 4.0
+FEED_TIMEOUT_SECONDS = 6.0
+#: How many daily bars to keep warm. Two months covers the longest period
+#: question ("last month") without paying for history nobody asked about.
+HISTORY_BARS = 64
 
 
 #: Amharic names for the instruments a giveaway asks about, mapped to the
@@ -126,38 +142,42 @@ _BARE_MAP = {
     "DXY": "DXY",
     "US10Y": "US10Y",
 }
-_INDEX_INSTRUMENTS = {
-    "DXY": ("DX-Y.NYB", "DXY", "US Dollar Index"),
-    "US10Y": ("^TNX", "US10Y", "US 10-year yield (percent)"),
-}
-#: Everything the feed can quote. Gold futures are the liquidity reference.
-_YAHOO_SYMBOLS: dict[str, tuple[str, str, str]] = {
-    "XAUUSD": ("GC=F", "XAUUSD", "gold futures (front month)"),
-    "XAGUSD": ("SI=F", "XAGUSD", "silver futures (front month)"),
-    **_INDEX_INSTRUMENTS,
-}
 
-#: Crypto instruments and their Yahoo tickers. These are also the instruments
-#: eligible for period questions ("what was the high last week").
+#: Everything the feed will quote. Membership here is only *recognition* - an
+#: instrument the bot can name is not necessarily one the owner's Exness account
+#: can quote, and the account's own instrument list decides that at fetch time.
+#: Crypto instruments the feed will ask Exness for. Around the clock, so a
+#: period question about them never carries a "market closed" caveat.
 _CRYPTO_SYMBOLS: dict[str, str] = {
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
-    "SOLUSD": "SOL-USD",
-    "XRPUSD": "XRP-USD",
-    "DOGEUSD": "DOGE-USD",
-    "BNBUSD": "BNB-USD",
-    "LTCUSD": "LTC-USD",
+    "BTCUSD": "BTCUSD",
+    "ETHUSD": "ETHUSD",
+    "SOLUSD": "SOLUSD",
+    "XRPUSD": "XRPUSD",
+    "DOGEUSD": "DOGEUSD",
+    "BNBUSD": "BNBUSD",
+    "LTCUSD": "LTCUSD",
 }
 
-#: Instruments whose OHLC history is fetched from the same free chart endpoint.
-#: Metals and indices are included because "last week's high" is just as fair a
-#: question about gold as about Bitcoin.
-HISTORY_INSTRUMENTS: dict[str, str] = {
-    **_CRYPTO_SYMBOLS,
-    "XAUUSD": "GC=F",
-    "XAGUSD": "SI=F",
-    "DXY": "DX-Y.NYB",
-}
+FEEDABLE_INSTRUMENTS: frozenset[str] = frozenset(
+    {
+        *_CRYPTO_SYMBOLS,
+        "XAUUSD",
+        "XAGUSD",
+        "DXY",
+        "US10Y",
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+        "EURGBP", "EURJPY", "GBPJPY", "EURAUD", "EURCHF", "EURCAD", "EURNZD",
+        "GBPCHF", "GBPAUD", "GBPCAD", "GBPNZD", "AUDJPY", "CADJPY", "CHFJPY",
+        "NZDJPY", "AUDCAD", "AUDCHF", "AUDNZD", "NZDCAD", "NZDCHF", "CADCHF",
+        "USDSGD", "USDZAR", "USDTRY", "USDMXN", "USDNOK", "USDSEK",
+        "USDPLN", "USDHUF", "USDCZK", "USDCNH", "USDINR",
+    }
+)
+
+#: Instruments eligible for period questions ("highest price last week").
+#: These are answered from the account's own daily candles, never a model.
+HISTORY_INSTRUMENTS: frozenset[str] = FEEDABLE_INSTRUMENTS
+
 
 _PAIR_RE = re.compile(r"^([A-Z]{3})/?([A-Z]{3})$")
 #: Bare metals and the yield/index tokens a trader types on their own.
@@ -174,8 +194,9 @@ _NICKNAME_RE = re.compile(
 )
 _PAIR_TOKEN_RE = re.compile(_TICKER_START + r"([A-Z]{3})\s*[/\-]?\s*([A-Z]{3})" + _TICKER_END)
 
-#: Currencies Frankfurter publishes (ECB reference set).
-_ECB_CURRENCIES = {
+#: Currencies that can form a spot pair. Recognition only - the owner's Exness
+#: account decides which of these it actually quotes.
+_PAIR_CURRENCIES = {
     "USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "CNY", "SEK",
     "NOK", "DKK", "HKD", "INR", "MXN", "ZAR", "TRY", "SGD", "PLN", "CZK",
     "HUF", "RON", "BRL", "ILS", "KRW", "PHP", "THB", "MYR", "IDR", "ISK",
@@ -188,8 +209,9 @@ class Quote:
 
     instrument: str
     price: float
-    #: "live" (intraday quote), "daily_fix" (official once-a-day reference) or
-    #: "futures" (a dated contract, not spot).
+    #: "live" (an Exness tick from a trading session that is still open) or
+    #: "market_closed" (the last tick before the market shut - still a real
+    #: Exness price, but never presentable as the current one).
     kind: str
     source: str
     as_of: datetime
@@ -197,6 +219,9 @@ class Quote:
     #: Raw digits a trader would quote. JPY pairs need 4 dp, metals 2, FX 5.
     decimals: int = 5
     note: str = ""
+    #: Which Exness symbol answered, e.g. ``EURUSDm`` on a mini account. The
+    #: owner's diagnostics show it; group replies never do.
+    symbol: str = ""
 
     @property
     def age_minutes(self) -> float:
@@ -216,17 +241,19 @@ class Quote:
         """
         stamp = self.as_of.strftime("%Y-%m-%d %H:%M UTC")
         if detailed:
-            if self.kind == "daily_fix":
-                return f"{self.instrument} {self.formatted()} (official ECB daily fix, {self.as_of:%Y-%m-%d})"
-            if self.age_minutes > STALE_AFTER_MINUTES:
-                return f"{self.instrument} {self.formatted()} (last tick {stamp}, market closed)"
-            return f"{self.instrument} {self.formatted()} ({stamp})"
+            # Owner diagnostics: the clock, the venue and the exact symbol all
+            # help when a price looks wrong. This never reaches a group.
+            symbol = f" {self.symbol}" if self.symbol and self.symbol != self.instrument else ""
+            if self.kind == "market_closed":
+                return (
+                    f"{self.instrument} {self.formatted()} "
+                    f"(Exness{symbol}, last tick {stamp}, market closed)"
+                )
+            return f"{self.instrument} {self.formatted()} (Exness{symbol}, {stamp})"
         # A closed market still needs saying: without it the model would present
         # Friday's close as the live price. A bare state tag does that without
         # exposing a clock.
-        if self.kind == "daily_fix":
-            return f"{self.instrument} {self.formatted()} (daily fix)"
-        if self.age_minutes > STALE_AFTER_MINUTES:
+        if self.kind == "market_closed":
             return f"{self.instrument} {self.formatted()} (market closed)"
         return f"{self.instrument} {self.formatted()}"
 
@@ -271,22 +298,13 @@ class MarketSnapshot:
             return ""
         numbers = "\n".join(f"- {q.label()}" for q in self.quotes)
         caveats: list[str] = []
-        if any(q.kind == "daily_fix" for q in self.quotes):
-            caveats.append(
-                "Figures marked 'daily fix' are a once-a-day reference rate, not an "
-                "intraday price; never call them the current price."
-            )
         if any(
-            q.kind != "daily_fix" and q.age_minutes > STALE_AFTER_MINUTES for q in self.quotes
+            q.kind == "market_closed" or q.age_minutes > STALE_AFTER_MINUTES
+            for q in self.quotes
         ):
             caveats.append(
                 "Figures marked 'market closed' are the last available tick. Say the "
                 "market is closed; never present them as live."
-            )
-        if any(q.kind == "futures" for q in self.quotes):
-            caveats.append(
-                "XAUUSD here is the front-month COMEX future, which trades a little "
-                "above spot gold; call it gold futures, not spot."
             )
         extra = ("\n" + "\n".join(caveats)) if caveats else ""
         return (
@@ -445,9 +463,9 @@ def normalise_instrument(token: str) -> str | None:
         base, quote = pair.groups()
         if base in _METALS:
             return f"{base}USD" if quote == "USD" else None
-        if base in _ECB_CURRENCIES and quote in _ECB_CURRENCIES:
+        if base in _PAIR_CURRENCIES and quote in _PAIR_CURRENCIES:
             return f"{base}{quote}"
-    if cleaned in _YAHOO_SYMBOLS:
+    if cleaned in FEEDABLE_INSTRUMENTS:
         return cleaned
     return None
 
@@ -492,29 +510,95 @@ def instruments_in(text: str, *, limit: int = 4) -> list[str]:
 
 
 class MarketFeed:
-    """Fetches and caches quotes. Safe to share across groups."""
+    """Fetches and caches Exness quotes. Safe to share across groups.
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    The feed holds no credentials of its own. The owner's Exness settings live
+    in the database, and ``settings_loader`` is a zero-argument awaitable that
+    returns them - so a key saved from the dashboard takes effect on the next
+    answer without a restart, and the keys never sit in a long-lived object.
+
+    ``client`` is injectable for tests; the sandbox has no outbound TLS, so
+    every market test drives a stubbed transport.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        settings_loader: Callable[[], Awaitable[dict]] | None = None,
+    ) -> None:
         self._client = client
         self._own_client = client is None
+        self._settings_loader = settings_loader
         # Keyed by instrument list: a cache hit must never hand back a digest
         # for different instruments than the question asked about.
         self._cache: dict[str, tuple[float, MarketSnapshot]] = {}
+        self._bar_cache: dict[str, tuple[float, list[tuple[datetime, float, float, float, float]]]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # One client per credential set. Rebuilt when the owner changes keys;
+        # the cached Access Point lives with it.
+        self._exness: ExnessClient | None = None
+        self._exness_fingerprint: tuple[str, str, str, str] | None = None
+        #: Why the last fetch failed, for ``/diag``. Never shown in a group.
+        self.last_error: str | None = None
+        self.last_error_kind: str | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0),
-                headers={"User-Agent": "Mozilla/5.0 (compatible; tg-qna-userbot)"},
-                follow_redirects=True,
+                # Exness discovery plus one candle read from a cold start is
+                # two round trips; the per-instrument timeout below is the
+                # real guard on an answer.
+                timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0),
+                headers={"User-Agent": "tg-qna-userbot/exness"},
+                follow_redirects=False,
             )
         return self._client
 
     async def close(self) -> None:
+        if self._exness is not None:
+            # The Exness client shares ours when one was injected; only close
+            # what this object owns.
+            if self._own_client:
+                await self._exness.aclose()
+            self._exness = None
         if self._own_client and self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    # -- credentials ----------------------------------------------------
+    async def _credentials(self):
+        """Current owner settings, or raise ``ExnessCredentialsMissing``."""
+        if self._settings_loader is None:
+            raise ExnessCredentialsMissing("Exness settings are not wired up")
+        return credentials_from(await self._settings_loader())
+
+    async def exness(self) -> ExnessClient:
+        """The signed client for the owner's *current* credentials."""
+        credentials = await self._credentials()
+        fingerprint = (
+            credentials.api_key,
+            credentials.private_key,
+            credentials.account_id,
+            credentials.gateway_url,
+        )
+        if self._exness is not None and self._exness_fingerprint != fingerprint:
+            # Keys were rotated from the dashboard: drop the old host cache too.
+            self._exness = None
+        if self._exness is None:
+            self._exness = ExnessClient(
+                credentials=credentials, client=await self._get_client()
+            )
+            self._exness_fingerprint = fingerprint
+        return self._exness
+
+    async def configured(self) -> bool:
+        """True when every Exness setting the API needs is present."""
+        try:
+            await self._credentials()
+        except ExnessCredentialsMissing:
+            return False
+        return True
 
     async def snapshot(self, text: str) -> MarketSnapshot:
         """Best-effort snapshot for the instruments a question mentions."""
@@ -533,6 +617,8 @@ class MarketFeed:
 
     async def _fetch_all(self, instruments: list[str]) -> MarketSnapshot:
         snapshot = MarketSnapshot()
+        self.last_error = None
+        self.last_error_kind = None
 
         async def one(instrument: str) -> Quote | None:
             try:
@@ -541,8 +627,10 @@ class MarketFeed:
                 )
             except TimeoutError:
                 logger.info("Market feed timeout for %s", instrument)
+                await self._record_failure(RuntimeError("Exness timed out"))
             except Exception as exc:  # noqa: BLE001 - a feed must never break an answer
                 logger.info("Market feed failed for %s: %s", instrument, exc)
+                await self._record_failure(exc)
             return None
 
         results = await asyncio.gather(*(one(i) for i in instruments))
@@ -639,173 +727,105 @@ class MarketFeed:
     async def ohlc_bars(
         self, instrument: str, *, days: int = 7
     ) -> list[tuple[datetime, float, float, float, float]]:
-        """Daily (timestamp, high, low, open, close) bars straight from Yahoo.
+        """Daily (timestamp, high, low, open, close) bars straight from Exness.
 
         Shared by the period-answer path and by the photo path: a chart photo
         showing BTC against *this week's* series needs the same numbers, and
         computing "the high this week" from a real series beats asking a model
         to read an axis.
+
+        Bars are cached briefly per instrument: a giveaway can fire three
+        period questions in a row, and each one asking Exness for the same two
+        months of daily candles would be both slow and rate-limit hungry.
         """
-        ticker = HISTORY_INSTRUMENTS.get(instrument)
-        if ticker is None:
+        if instrument not in HISTORY_INSTRUMENTS:
             return []
-        client = await self._get_client()
+
+        cached = self._bar_cache.get(instrument)
+        if cached is not None and (time.monotonic() - cached[0]) < CACHE_TTL_SECONDS:
+            return cached[1]
+
         try:
-            resp = await client.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-                params={"interval": "1d", "range": f"{max(days, 5)}d"},
+            client = await self.exness()
+            try:
+                available = await client.available_instruments()
+            except ExnessError:
+                available = set()
+            candles = await client.candles(
+                instrument,
+                timeframe=HISTORY_TIMEFRAME,
+                count=max(days, 10) + 2,
+                instruments=available or None,
             )
-            resp.raise_for_status()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a feed must never break an answer
             logger.warning("OHLC fetch failed for %s: %s", instrument, exc)
+            await self._record_failure(exc)
             return []
 
-        result = ((resp.json().get("chart") or {}).get("result") or [None])[0]
-        if not result:
-            return []
-
-        timestamps = result.get("timestamp") or []
-        quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-        highs = quotes.get("high") or []
-        lows = quotes.get("low") or []
-        opens = quotes.get("open") or []
-        closes = quotes.get("close") or []
-
-        def at(series: list, idx: int) -> float | None:
-            return series[idx] if idx < len(series) else None
-
-        # Pair each day with its bar, dropping the null bars Yahoo emits when a
-        # market was shut (weekends, holidays). A bar is usable when the fields
-        # the question needs are present: Yahoo routinely leaves one field null
-        # on a still-forming candle, and dropping the whole bar for that would
-        # silently shorten the window - which is how "the high last week" comes
-        # back as the week before.
-        bars: list[tuple[datetime, float, float, float, float]] = []
-        for idx, stamp in enumerate(timestamps):
-            h = at(highs, idx)
-            low = at(lows, idx)
-            o = at(opens, idx)
-            c = at(closes, idx)
-            if h is None or low is None:
-                continue
-            bars.append(
-                (
-                    datetime.fromtimestamp(int(stamp), tz=UTC),
-                    float(h),
-                    float(low),
-                    float(o) if o is not None else float(c if c is not None else h),
-                    float(c) if c is not None else float(o if o is not None else low),
-                )
-            )
+        bars = [
+            (bar.time, bar.high, bar.low, bar.open, bar.close)
+            for bar in candles
+            # A bar Exness has not filled yet comes back all-zero; keeping it
+            # would make "the high last week" report 0 as the low.
+            if bar.high > 0 and bar.low > 0
+        ]
+        self._bar_cache[instrument] = (time.monotonic(), bars)
         return bars
 
     async def _quote(self, instrument: str) -> Quote | None:
-        """Try sources in order; one failing must not prevent the next."""
-        for source in self._sources(instrument):
-            try:
-                quote = await source()
-            except Exception as exc:  # noqa: BLE001 - fall through to the next source
-                logger.info("Market source failed for %s: %s", instrument, exc)
-                continue
-            if quote is not None:
-                return quote
-        return None
+        """Fetch one instrument from Exness, or ``None``.
 
-    def _sources(self, instrument: str):
-        """Yield candidate fetchers, best freshness first."""
-        if instrument in _YAHOO_SYMBOLS:
-            yield lambda: self._yahoo(*_YAHOO_SYMBOLS[instrument], instrument)
-        if instrument in ("XAUUSD", "XAGUSD"):
-            yield lambda: self._gold_api(instrument)
-        if instrument == "DXY":
-            yield lambda: self._yahoo(*_INDEX_INSTRUMENTS["DXY"], "DXY")
-        if _PAIR_RE.match(instrument):
-            symbol = f"{instrument[:3]}{instrument[3:]}=X"
-            yield lambda symbol=symbol: self._yahoo(symbol, instrument, "live quote", instrument)
-            yield lambda: self._ecb_fix(instrument, instrument[:3], instrument[3:])  # noqa: B023
-
-    # -- sources ---------------------------------------------------------
-    async def _yahoo(self, symbol: str, name: str, note: str, instrument: str) -> Quote | None:
-        client = await self._get_client()
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        resp = await client.get(url, params={"interval": "1d", "range": "1d"})
-        resp.raise_for_status()
-        payload = resp.json()
-        result = (payload.get("chart") or {}).get("result") or []
-        if not result:
-            return None
-        meta = result[0].get("meta") or {}
-        price = meta.get("regularMarketPrice")
-        if price is None:
-            return None
-        stamp = meta.get("regularMarketTime")
-        as_of = (
-            datetime.fromtimestamp(int(stamp), tz=UTC)
-            if stamp
-            else datetime.now(UTC)
-        )
-        kind = "futures" if note.startswith(("gold", "silver")) else "live"
-        return Quote(
-            instrument=name,
-            price=float(price),
-            kind=kind,
-            source="yahoo",
-            as_of=as_of,
-            change_percent=meta.get("regularMarketChangePercent"),
-            decimals=_decimals_for(instrument),
-            note=note,
-        )
-
-    async def _gold_api(self, instrument: str) -> Quote | None:
-        client = await self._get_client()
-        symbol = "XAU" if instrument == "XAUUSD" else "XAG"
-        resp = await client.get(f"https://api.gold-api.com/price/{symbol}")
-        resp.raise_for_status()
-        payload = resp.json()
-        price = payload.get("price")
-        if price is None:
-            return None
-        as_of = datetime.now(UTC)
-        raw_stamp = payload.get("updatedAt")
-        if raw_stamp:
-            try:
-                as_of = datetime.fromisoformat(str(raw_stamp).replace("Z", "+00:00"))
-            except ValueError:
-                pass
-        return Quote(
-            instrument=instrument,
-            price=float(price),
-            kind="live",
-            source="gold-api",
-            as_of=as_of,
-            decimals=2,
-            note="spot",
-        )
-
-    async def _ecb_fix(self, instrument: str, base: str, quote_ccy: str) -> Quote | None:
-        if base not in _ECB_CURRENCIES or quote_ccy not in _ECB_CURRENCIES:
-            return None
-        client = await self._get_client()
-        resp = await client.get(
-            "https://api.frankfurter.dev/v1/latest",
-            params={"base": base, "symbols": quote_ccy},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        rate = (payload.get("rates") or {}).get(quote_ccy)
-        if rate is None:
-            return None
-        date_str = payload.get("date")
+        There is no failover chain any more. The old code fell through Yahoo ->
+        gold-api -> ECB, which meant a Forex group could be quoted a central
+        bank's daily fix while the prompt implied a live tick. One broker, one
+        number; a failure stays a failure so the answer can say so.
+        """
+        client = await self.exness()
+        # The account's own instrument list decides the symbol (and its suffix),
+        # so a mini account quoting EURUSDm still works.
+        available: set[str] = set()
         try:
-            as_of = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC)
-        except (TypeError, ValueError):
-            as_of = datetime.now(UTC)
+            available = await client.available_instruments()
+        except ExnessError as exc:
+            logger.info("Exness instrument list unavailable (%s); trying bare symbols", exc)
+
+        bars = await client.candles(
+            instrument,
+            timeframe=QUOTE_TIMEFRAME,
+            count=QUOTE_CANDLE_COUNT,
+            instruments=available or None,
+        )
+        if not bars:
+            return None
+
+        # The newest bar is the price. A bar whose OHLC are all zero is the
+        # placeholder Exness returns for an untouched period; walk back to the
+        # last real one rather than quoting 0.00000.
+        last = next((bar for bar in reversed(bars) if bar.close > 0), None)
+        if last is None:
+            return None
+
+        age_minutes = (datetime.now(UTC) - last.time).total_seconds() / 60
         return Quote(
             instrument=instrument,
-            price=float(rate),
-            kind="daily_fix",
-            source="frankfurter/ecb",
-            as_of=as_of,
+            price=last.close,
+            # Past the stale window the market is shut and this is Friday's
+            # close, not a tick. Same number, different claim.
+            kind="live" if age_minutes <= STALE_AFTER_MINUTES else "market_closed",
+            source="exness",
+            as_of=last.time,
             decimals=_decimals_for(instrument),
-            note="official ECB daily reference rate",
+            note="bid",
+            symbol=client.symbol_for(instrument, available or None),
+        )
+
+    async def _record_failure(self, exc: Exception) -> None:
+        """Remember why the last fetch failed, for ``/diag`` only.
+
+        Never surfaced in a group answer: the group is told there is no live
+        data, not that a signature was rejected.
+        """
+        self.last_error = str(exc) or type(exc).__name__
+        self.last_error_kind = (
+            "not_configured" if isinstance(exc, ExnessCredentialsMissing) else "error"
         )

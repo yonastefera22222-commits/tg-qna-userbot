@@ -173,11 +173,31 @@ class AnswerResult:
 class AIEngine:
     """Manages persistent HTTP/2 clients and fast single-shot Q&A across Groq, Gemini, OpenRouter."""
 
+    #: Settings the market feed needs to reach Exness. Read per answer, so a
+    #: key saved from the dashboard works without a restart. The private key is
+    #: the sensitive one; the rest identify the account and its host.
+    MARKET_SETTING_KEYS = (
+        "exness_api_key",
+        "exness_private_key",
+        "exness_account_id",
+        "exness_gateway_url",
+    )
+
     def __init__(self, market_feed: MarketFeed | None = None) -> None:
         self._client: httpx.AsyncClient | None = None
         # Serves live prices to Forex groups. Injectable so tests never touch
         # the network.
         self.market_feed = market_feed or MarketFeed()
+
+    def attach_market_settings(self, loader) -> None:
+        """Point the market feed at the database the owner saves keys into.
+
+        Called once at startup. ``loader`` is an awaitable returning the four
+        Exness settings, so the feed always signs with the *current* key rather
+        than one captured when the process booted.
+        """
+        self.market_feed._settings_loader = loader  # noqa: SLF001 - wiring, not poking
+        self._settings_loader = loader
 
     async def start(self) -> None:
         if self._client is None:

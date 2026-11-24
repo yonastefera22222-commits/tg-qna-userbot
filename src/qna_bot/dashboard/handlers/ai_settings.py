@@ -55,7 +55,14 @@ async def _render_ai_menu(target: CallbackQuery | Message, ctx: AppContext) -> N
         "cause of a laggy answer. Smart lets it think before replying.</i>"
         "\n\n💡 <i>Tip: Use Groq as Primary for lowest latency and Gemini as Fallback if you hit rate limits!</i>"
     )
-    kb = ai_menu_kb(has_fallback=bool(fb_p and fb_m), speed_mode=speed_mode)
+    exness_ready = all(
+        (await ctx.db.get_settings(
+            ("exness_api_key", "exness_private_key", "exness_account_id", "exness_gateway_url")
+        )).values()
+    )
+    kb = ai_menu_kb(
+        has_fallback=bool(fb_p and fb_m), speed_mode=speed_mode, exness_ready=exness_ready
+    )
     if isinstance(target, CallbackQuery):
         await safe_edit_text(target, text, reply_markup=kb)
     else:

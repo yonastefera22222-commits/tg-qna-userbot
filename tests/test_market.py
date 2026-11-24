@@ -1,8 +1,10 @@
-"""Live market feed: extraction, freshness labelling, prompting, fallbacks.
+"""Live market feed: extraction, freshness labelling, prompting, sources.
 
-The payloads below are the real shapes returned by each source when this was
-written (Yahoo chart API, gold-api.com, Frankfurter/ECB). They are frozen here
-so the parsing contract is tested without touching the network.
+Every number here comes from the Exness Trader API, so the fixtures below are
+the documented Exness response shapes (access-point discovery -> instruments ->
+candles) rather than another vendor's JSON. They are frozen so the parsing and
+signing contract is tested without touching the network - which is required,
+not merely convenient: the sandbox has no outbound TLS.
 """
 
 from __future__ import annotations
@@ -10,9 +12,18 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from exness_fixtures import (
+    ACCOUNT_ID,
+    API_KEY,
+    GATEWAY,
+    TEST_PRIVATE_KEY,
+    FakeExness,
+    candle_payload,
+)
 
 from qna_bot.ai import forex
 from qna_bot.ai.engine import AIEngine
+from qna_bot.ai.exness import ExnessCredentials
 from qna_bot.ai.market import (
     STALE_AFTER_MINUTES,
     MarketFeed,
@@ -22,69 +33,67 @@ from qna_bot.ai.market import (
     normalise_instrument,
 )
 
-# --- recorded live payloads ------------------------------------------------
-YAHOO_EURUSD = {
-    "chart": {
-        "result": [
-            {
-                "meta": {
-                    "currency": "USD",
-                    "symbol": "EURUSD=X",
-                    "regularMarketPrice": 1.0984,
-                    "regularMarketChangePercent": 0.0879,
-                    "regularMarketTime": 1795410105,
-                },
-                "timestamp": [1792710000],
-                "indicators": {"quote": [{"close": [1.0984]}]},
-            }
-        ],
-        "error": None,
+CREDS = ExnessCredentials(
+    api_key=API_KEY,
+    private_key=TEST_PRIVATE_KEY,
+    account_id=ACCOUNT_ID,
+    gateway_url=GATEWAY,
+)
+
+
+def _settings(**overrides) -> dict:
+    values = {
+        "exness_api_key": CREDS.api_key,
+        "exness_private_key": CREDS.private_key,
+        "exness_account_id": CREDS.account_id,
+        "exness_gateway_url": CREDS.gateway_url,
     }
-}
-
-GOLD_API = {
-    "currency": "USD",
-    "exchangeRate": 1.0,
-    "name": "Gold",
-    "price": 3607.800049,
-    "symbol": "XAU",
-    "updatedAt": "2026-11-23T05:00:11Z",
-}
-
-FRANKFURTER = {"amount": 1.0, "base": "EUR", "date": "2026-11-20", "rates": {"USD": 1.099}}
+    values.update(overrides)
+    return values
 
 
-class _Resp:
-    def __init__(self, payload: dict, status: int = 200) -> None:
-        self._payload = payload
-        self.status_code = status
+def _exness_feed(fake: FakeExness, **overrides) -> MarketFeed:
+    """A feed wired to a stubbed Exness account."""
 
-    def json(self) -> dict:
-        return self._payload
+    async def load() -> dict:
+        return _settings(**overrides)
 
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+    return MarketFeed(fake.client(), settings_loader=load)
 
 
-class _FakeClient:
-    """Routes a URL to a recorded payload, and records what was asked for."""
+#: Nine daily BTC bars ending today (today's is still forming). Closes rise to
+#: 61605.06 and the high of the *completed* week before today is 66055.10.
+BTC_CLOSES = [
+    81074.19, 80790.84, 80024.01, 80006.66, 80805.08, 81267.59, 77775.11, 77198.21,
+    77434.75, 78248.45, 76677.30, 77345.05, 80405.29, 75942.13, 75746.93, 75747.58,
+    74584.65, 75223.15, 73720.12, 73964.47, 71342.97, 68249.27, 64128.05, 65305.06,
+    64855.84, 64893.95, 62987.27, 61901.82, 58798.98, 60094.09, 64000.00, 61605.06,
+]
+#: Highs sit just above their closes, with one deliberate spike inside the last
+#: completed week (index 27 of 32, where 31 is today) so the expected answer is
+#: unambiguous: 66055.10 - and demonstrably not today's 61674.92.
+BTC_HIGHS = [c + 100 for c in BTC_CLOSES[:-1]] + [61674.92]
+BTC_HIGHS[27] = 66055.10
 
-    def __init__(self, routes: dict[str, _Resp | Exception]) -> None:
-        self.routes = routes
-        self.calls: list[str] = []
 
-    async def get(self, url: str, params: dict | None = None, **_: object) -> _Resp:
-        self.calls.append(url)
-        for fragment, response in self.routes.items():
-            if fragment in url:
-                if isinstance(response, Exception):
-                    raise response
-                return response
-        raise AssertionError(f"unexpected URL {url}")
-
-    async def aclose(self) -> None:
-        return None
+def btc_payload(*, days_back: int = 0) -> list[dict]:
+    now = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    base = now - timedelta(days=days_back)
+    total = len(BTC_CLOSES)
+    bars = []
+    for idx, close in enumerate(BTC_CLOSES):
+        day = base - timedelta(days=total - 1 - idx)
+        bars.append(
+            {
+                "time": day.isoformat(),
+                "open": BTC_CLOSES[idx - 1] if idx else close,
+                "high": BTC_HIGHS[idx],
+                "low": close - 800,
+                "close": close,
+                "volume": 100.0,
+            }
+        )
+    return bars
 
 
 # --- instrument extraction -------------------------------------------------
@@ -149,9 +158,12 @@ def test_live_quote_label_has_no_timestamp() -> None:
     assert "2026" not in label
 
 
-def test_stale_quote_says_market_closed_without_a_clock() -> None:
-    old = _quote(as_of=datetime.now(UTC) - timedelta(minutes=STALE_AFTER_MINUTES + 5))
-    label = old.label()
+def test_closed_market_quote_says_market_closed_without_a_clock() -> None:
+    closed = _quote(
+        kind="market_closed",
+        as_of=datetime.now(UTC) - timedelta(minutes=STALE_AFTER_MINUTES + 5),
+    )
+    label = closed.label()
     # The state still has to be honest - Friday's close is not the live price -
     # but the timestamp itself is not shown.
     assert "market closed" in label
@@ -159,12 +171,14 @@ def test_stale_quote_says_market_closed_without_a_clock() -> None:
     assert "2026" not in label
 
 
-def test_ecb_fix_is_never_called_current() -> None:
-    fix = _quote(kind="daily_fix", source="frankfurter/ecb", as_of=datetime(2026, 11, 20, tzinfo=UTC))
-    label = fix.label()
-    assert "daily fix" in label
-    assert "official" not in label
-    assert "2026-11-20" not in label
+def test_detailed_label_names_exness_and_the_symbol() -> None:
+    """The owner's diagnostics get the venue and the exact account symbol."""
+    quote = _quote(instrument="EURUSD", symbol="EURUSDm")
+    detailed = quote.label(detailed=True)
+    assert "Exness" in detailed
+    assert "EURUSDm" in detailed
+    # A group reply never mentions the venue.
+    assert "Exness" not in quote.label()
 
 
 def test_detailed_label_keeps_the_timestamp() -> None:
@@ -185,14 +199,12 @@ def test_empty_snapshot_renders_nothing() -> None:
     assert MarketSnapshot().is_empty()
 
 
-def test_prompt_block_warns_about_daily_fixes() -> None:
-    snapshot = MarketSnapshot(
-        quotes=[_quote(kind="daily_fix", as_of=datetime(2026, 11, 20, tzinfo=UTC))]
-    )
+def test_prompt_block_has_no_daily_fix_caveat_to_offer() -> None:
+    """There is no once-a-day reference source any more, so no caveat for one."""
+    snapshot = MarketSnapshot(quotes=[_quote()])
     block = snapshot.as_prompt_block()
-    assert "daily fix" in block
-    assert "never call them the current price" in block
-    assert "2026-11-20" not in block
+    assert "daily fix" not in block
+    assert "ECB" not in block
 
 
 def test_prompt_block_forbids_dates_and_provenance() -> None:
@@ -209,12 +221,14 @@ def test_prompt_block_warns_about_closed_market() -> None:
     assert "market is closed" in block
 
 
-def test_prompt_block_labels_gold_as_futures() -> None:
+def test_prompt_block_no_longer_calls_gold_a_future() -> None:
+    """Gold is now the account's own spot CFD, not a COMEX front month."""
     snapshot = MarketSnapshot(
-        quotes=[_quote(instrument="XAUUSD", price=3611.4, kind="futures", decimals=2)]
+        quotes=[_quote(instrument="XAUUSD", price=3611.4, kind="live", decimals=2)]
     )
     block = snapshot.as_prompt_block()
-    assert "not spot" in block
+    assert "not spot" not in block
+    assert "3611.40" in block
 
 
 # --- guidance swap ---------------------------------------------------------
@@ -249,97 +263,118 @@ def test_prompt_without_data_keeps_the_refusal_rule() -> None:
 
 # --- fetching --------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_fx_uses_live_yahoo_quote() -> None:
-    client = _FakeClient({"query1.finance.yahoo.com": _Resp(YAHOO_EURUSD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    snapshot = await feed.snapshot("EURUSD?")
+async def test_fx_quote_comes_from_exness() -> None:
+    fake = FakeExness(candles={"EURUSD": candle_payload(price=1.0984)})
+    feed = _exness_feed(fake)
+    try:
+        snapshot = await feed.snapshot("EURUSD?")
+    finally:
+        await feed.close()
+
     assert len(snapshot.quotes) == 1
     quote = snapshot.quotes[0]
     assert quote.price == pytest.approx(1.0984)
     assert quote.kind == "live"
-    assert quote.source == "yahoo"
+    # The single source. Anything else here would be the bug this replaced.
+    assert quote.source == "exness"
 
 
 @pytest.mark.asyncio
-async def test_falls_back_to_ecb_fix_when_live_source_fails() -> None:
-    client = _FakeClient(
-        {
-            "query1.finance.yahoo.com": RuntimeError("boom"),
-            "api.frankfurter.dev": _Resp(FRANKFURTER),
-        }
-    )
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    snapshot = await feed.snapshot("EURUSD?")
-    assert len(snapshot.quotes) == 1
-    assert snapshot.quotes[0].kind == "daily_fix"
-    assert snapshot.quotes[0].price == pytest.approx(1.099)
+async def test_failed_fetch_does_not_borrow_another_venue() -> None:
+    """The old chain fell through to an ECB daily fix. That is now forbidden."""
+    fake = FakeExness(candles_status=400, error_code=4000)
+    feed = _exness_feed(fake)
+    try:
+        snapshot = await feed.snapshot("EURUSD?")
+    finally:
+        await feed.close()
+
+    assert snapshot.is_empty()
+    assert snapshot.failed == ["EURUSD"]
+    # No daily_fix, no futures, no second host - just an honest gap.
+    assert not any(q.kind in ("daily_fix", "futures") for q in snapshot.quotes)
 
 
 @pytest.mark.asyncio
-async def test_gold_falls_back_to_gold_api() -> None:
-    client = _FakeClient(
-        {"query1.finance.yahoo.com": RuntimeError("boom"), "api.gold-api.com": _Resp(GOLD_API)}
+async def test_gold_is_quoted_from_exness_not_a_spot_api() -> None:
+    fake = FakeExness(
+        instruments=["EURUSD", "XAUUSD"],
+        candles={"XAUUSD": candle_payload(price=3607.80)},
     )
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    snapshot = await feed.snapshot("gold price")
-    assert len(snapshot.quotes) == 1
-    assert snapshot.quotes[0].source == "gold-api"
+    feed = _exness_feed(fake)
+    try:
+        snapshot = await feed.snapshot("gold price")
+    finally:
+        await feed.close()
+
+    assert snapshot.quotes[0].source == "exness"
     assert snapshot.quotes[0].price == pytest.approx(3607.80, abs=0.01)
 
 
 @pytest.mark.asyncio
 async def test_total_failure_yields_empty_snapshot_not_exception() -> None:
-    client = _FakeClient({"": RuntimeError("network down")})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    snapshot = await feed.snapshot("EURUSD?")
+    fake = FakeExness(discovery_status=503, error_code=2)
+    feed = _exness_feed(fake)
+    try:
+        snapshot = await feed.snapshot("EURUSD?")
+    finally:
+        await feed.close()
+
     assert snapshot.is_empty()
     assert snapshot.failed == ["EURUSD"]
 
 
 @pytest.mark.asyncio
-async def test_non_forex_question_makes_no_requests() -> None:
-    client = _FakeClient({})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    snapshot = await feed.snapshot("capital of Kenya?")
+async def test_unconfigured_feed_makes_no_requests_at_all() -> None:
+    fake = FakeExness()
+    feed = MarketFeed(fake.client(), settings_loader=None)
+    try:
+        snapshot = await feed.snapshot("EURUSD?")
+    finally:
+        await feed.close()
+
     assert snapshot.is_empty()
-    assert client.calls == []
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_forex_question_makes_no_requests() -> None:
+    fake = FakeExness()
+    feed = _exness_feed(fake)
+    try:
+        snapshot = await feed.snapshot("capital of Kenya?")
+    finally:
+        await feed.close()
+
+    assert snapshot.is_empty()
+    assert fake.calls == []
 
 
 @pytest.mark.asyncio
 async def test_cache_is_per_instrument_set() -> None:
-    client = _FakeClient(
-        {
-            "query1.finance.yahoo.com/v8/finance/chart/EURUSD=X": _Resp(YAHOO_EURUSD),
-            "query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB": _Resp(
-                {
-                    "chart": {
-                        "result": [
-                            {
-                                "meta": {
-                                    "regularMarketPrice": 103.773,
-                                    "regularMarketTime": 1795410105,
-                                }
-                            }
-                        ]
-                    }
-                }
-            ),
-        }
+    fake = FakeExness(
+        instruments=["EURUSD", "DXY"],
+        candles={
+            "EURUSD": candle_payload(price=1.0984),
+            "DXY": candle_payload(price=103.773),
+        },
     )
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    feed = _exness_feed(fake)
+    try:
+        first = await feed.snapshot("EURUSD?")
+        assert [q.instrument for q in first.quotes] == ["EURUSD"]
 
-    first = await feed.snapshot("EURUSD?")
-    assert [q.instrument for q in first.quotes] == ["EURUSD"]
+        # A different instrument must not be served the cached EUR digest.
+        second = await feed.snapshot("DXY?")
+        assert [q.instrument for q in second.quotes] == ["DXY"]
 
-    # A different instrument must not be served the cached EUR digest.
-    second = await feed.snapshot("DXY?")
-    assert [q.instrument for q in second.quotes] == ["DXY"]
-
-    # A repeat of the same set is served from cache.
-    calls_before = len(client.calls)
-    third = await feed.snapshot("EURUSD?")
-    assert [q.instrument for q in third.quotes] == ["EURUSD"]
-    assert len(client.calls) == calls_before
+        # A repeat of the same set is served from cache.
+        calls_before = len(fake.calls)
+        third = await feed.snapshot("EURUSD?")
+        assert [q.instrument for q in third.quotes] == ["EURUSD"]
+        assert len(fake.calls) == calls_before
+    finally:
+        await feed.close()
 
 
 # --- period questions (crypto / history) -----------------------------------
@@ -437,13 +472,16 @@ def test_parse_period_query_ignores_non_period_questions(text: str) -> None:
 @pytest.mark.asyncio
 async def test_btc_last_week_high_is_computed_exactly() -> None:
     """The user's actual question: "highest BTC price last week"."""
-    from qna_bot.ai.market import MarketFeed, parse_period_query
+    from qna_bot.ai.market import parse_period_query
 
-    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    answer = await feed.period_answer(parse_period_query(
-        "On the exness BTC chart, what was the highest price recorded last week?"
-    ))
+    fake = FakeExness(instruments=["BTCUSD"], candles={"D1:BTCUSD": btc_payload()})
+    feed = _exness_feed(fake)
+    try:
+        answer = await feed.period_answer(parse_period_query(
+            "On the exness BTC chart, what was the highest price recorded last week?"
+        ))
+    finally:
+        await feed.close()
     assert answer is not None
     assert answer.formatted() == "66055.10"
 
@@ -451,11 +489,14 @@ async def test_btc_last_week_high_is_computed_exactly() -> None:
 @pytest.mark.asyncio
 async def test_period_answers_use_price_precision_not_fx_precision() -> None:
     """66055.10000 is a tell; crypto quotes two decimals."""
-    from qna_bot.ai.market import MarketFeed, parse_period_query
+    from qna_bot.ai.market import parse_period_query
 
-    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    answer = await feed.period_answer(parse_period_query("BTC high last week"))
+    fake = FakeExness(instruments=["BTCUSD"], candles={"D1:BTCUSD": btc_payload()})
+    feed = _exness_feed(fake)
+    try:
+        answer = await feed.period_answer(parse_period_query("BTC high last week"))
+    finally:
+        await feed.close()
     assert answer is not None
     assert not answer.formatted().endswith("000")
 
@@ -463,11 +504,14 @@ async def test_period_answers_use_price_precision_not_fx_precision() -> None:
 @pytest.mark.asyncio
 async def test_last_week_excludes_todays_forming_bar() -> None:
     """An incomplete candle must not become "the high last week"."""
-    from qna_bot.ai.market import MarketFeed, parse_period_query
+    from qna_bot.ai.market import parse_period_query
 
-    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
-    answer = await feed.period_answer(parse_period_query("BTC high last week"))
+    fake = FakeExness(instruments=["BTCUSD"], candles={"D1:BTCUSD": btc_payload()})
+    feed = _exness_feed(fake)
+    try:
+        answer = await feed.period_answer(parse_period_query("BTC high last week"))
+    finally:
+        await feed.close()
     assert answer is not None
     # Today's bar high is 61674.92 and is NOT the weekly high.
     assert answer.high == pytest.approx(66055.10)
@@ -476,10 +520,9 @@ async def test_last_week_excludes_todays_forming_bar() -> None:
 @pytest.mark.asyncio
 async def test_period_answer_is_computed_without_ai() -> None:
     """The model must never be asked to eyeball a series for a max/min."""
-    from qna_bot.ai.market import MarketFeed
 
-    client = _FakeClient({"BTC-USD": _Resp(BTC_PAYLOAD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    fake = FakeExness(instruments=["BTCUSD"], candles={"D1:BTCUSD": btc_payload()})
+    feed = _exness_feed(fake)
     engine = _CapturingEngine(feed)
 
     result = await engine.answer_question(
@@ -524,24 +567,25 @@ async def _ask(engine: _CapturingEngine, *, forex_group: bool) -> str:
 
 @pytest.mark.asyncio
 async def test_engine_fetches_for_forex_groups_only() -> None:
-    client = _FakeClient({"query1.finance.yahoo.com": _Resp(YAHOO_EURUSD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    fake = FakeExness(candles={"EURUSD": candle_payload(price=1.0984)})
+    feed = _exness_feed(fake)
     engine = _CapturingEngine(feed)
 
     # A normal group must never pay for a market call.
     prompt = await _ask(engine, forex_group=False)
-    assert client.calls == []
+    assert fake.calls == []
     assert "LIVE MARKET DATA" not in prompt
 
     prompt = await _ask(engine, forex_group=True)
-    assert client.calls != []
+    assert fake.calls != []
     assert "LIVE MARKET DATA" in prompt
+    await feed.close()
 
 
 @pytest.mark.asyncio
 async def test_live_data_toggle_stops_fetching() -> None:
-    client = _FakeClient({"query1.finance.yahoo.com": _Resp(YAHOO_EURUSD)})
-    feed = MarketFeed(client=client)  # type: ignore[arg-type]
+    fake = FakeExness(candles={"EURUSD": candle_payload(price=1.0984)})
+    feed = _exness_feed(fake)
     engine = _CapturingEngine(feed)
 
     await engine.answer_question(
@@ -554,9 +598,10 @@ async def test_live_data_toggle_stops_fetching() -> None:
         provider_keys={"groq": "gsk_test"},
         local_math_enabled=False,
     )
-    assert client.calls == []
+    assert fake.calls == []
     assert "LIVE MARKET DATA" not in engine.prompts[-1]
     assert forex.NO_LIVE_DATA_GUIDANCE in engine.prompts[-1]
+    await feed.close()
 
 
 def test_live_data_defaults_on() -> None:

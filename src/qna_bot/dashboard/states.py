@@ -25,6 +25,21 @@ class GroupStates(StatesGroup):
     waiting_trigger_keywords = State()
 
 
+class ExnessStates(StatesGroup):
+    """One state per Exness credential field.
+
+    Separate states rather than one plus a "which field" slot: the answer text
+    is validated differently per field (a Gateway URL must parse, an account ID
+    must be digits), and a wrong guess at this point means the owner's next
+    price question is answered "no live data" with no clue why.
+    """
+
+    waiting_api_key = State()
+    waiting_private_key = State()
+    waiting_account_id = State()
+    waiting_gateway_url = State()
+
+
 class DashboardStates(StatesGroup):
     waiting_sim_question = State()
     waiting_ai_key_update = State()
@@ -42,5 +57,6 @@ AI_MENU_STATES = frozenset(
     {
         f"{DashboardStates.__name__}:waiting_ai_key_update",
         f"{DashboardStates.__name__}:waiting_custom_model_update",
+        *_state_names(ExnessStates),
     }
 )

@@ -26,6 +26,12 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from exness_fixtures import (
+    daily_bars_from_yahoo_shaped,
+    exness_response,
+    is_exness_request,
+    settings_loader,
+)
 
 from qna_bot.ai.engine import AIEngine
 from qna_bot.ai.forex import (
@@ -78,10 +84,14 @@ def _payload(bars: list[dict]) -> dict:
 
 
 def _transport(payload: dict, calls: list[str]) -> httpx.MockTransport:
+    """Exness answers with the OHLC series; any model call returns WRONG."""
+
+    daily = daily_bars_from_yahoo_shaped(payload)
+
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
-        if "yahoo" in str(request.url):
-            return httpx.Response(200, json=payload)
+        if is_exness_request(str(request.url)):
+            return exness_response(request, daily)
         # No model may be called for a question that can be computed.
         return httpx.Response(
             200, json={"choices": [{"message": {"content": "WRONG"}, "finish_reason": "stop"}]}
@@ -104,7 +114,10 @@ async def test_photo_market_question_is_computed_not_guessed() -> None:
         _bar(2, 91800.0, 90500.0, 92550.5, 91700.0),
     ]
     calls: list[str] = []
-    feed = MarketFeed(httpx.AsyncClient(transport=_transport(_payload(badges), calls)))
+    feed = MarketFeed(
+        httpx.AsyncClient(transport=_transport(_payload(badges), calls)),
+        settings_loader=settings_loader(),
+    )
     engine = AIEngine(market_feed=feed)
     engine._client = httpx.AsyncClient(transport=_transport(_payload(badges), calls))
 
@@ -123,7 +136,8 @@ async def test_photo_market_question_is_computed_not_guessed() -> None:
     assert result.answer == "92550.50"
     assert result.provider == "local_market"
     # Proof that the answer came from the series, not a model looking at artwork.
-    assert all("yahoo" in url for url in calls), calls
+    assert any(is_exness_request(url) for url in calls), calls
+    assert not any("groq" in url or "/chat/completions" in url for url in calls), calls
 
 
 @pytest.mark.asyncio
@@ -131,7 +145,9 @@ async def test_photo_does_not_disable_the_period_shortcut_but_text_still_works()
     """The same question with no image must keep taking the same path."""
     bars = [_bar(0, 70000.0, 69000.0, 69500.0, 69900.0)]
     calls: list[str] = []
-    feed = MarketFeed(httpx.AsyncClient(transport=_transport(_payload(bars), calls)))
+    feed = MarketFeed(
+        httpx.AsyncClient(transport=_transport(_payload(bars), calls)), settings_loader=settings_loader()
+    )
     engine = AIEngine(market_feed=feed)
     engine._client = httpx.AsyncClient(transport=_transport(_payload(bars), calls))
 
@@ -199,7 +215,9 @@ async def test_this_week_excludes_the_weekend_before_it() -> None:
         }
     }
     calls: list[str] = []
-    feed = MarketFeed(httpx.AsyncClient(transport=_transport(payload, calls)))
+    feed = MarketFeed(
+        httpx.AsyncClient(transport=_transport(payload, calls)), settings_loader=settings_loader()
+    )
     answer = await feed.period_answer(
         PeriodQuery(period="this_week", aggregation="high", instrument="BTCUSD")
     )
@@ -214,7 +232,9 @@ async def test_this_week_with_no_bars_yet_falls_back_to_latest_session() -> None
     payload = _payload([_bar(0, 100.0, 90.0, 95.0, 99.0)])
     payload["chart"]["result"][0]["timestamp"] = [int(last_week.timestamp())]
     calls: list[str] = []
-    feed = MarketFeed(httpx.AsyncClient(transport=_transport(payload, calls)))
+    feed = MarketFeed(
+        httpx.AsyncClient(transport=_transport(payload, calls)), settings_loader=settings_loader()
+    )
     answer = await feed.period_answer(
         PeriodQuery(period="this_week", aggregation="high", instrument="BTCUSD")
     )
@@ -303,13 +323,15 @@ def test_photo_is_ignored_when_photo_answers_are_off() -> None:
 
 
 def _vision_transport(question: str, payload: dict, calls: list[str]) -> httpx.MockTransport:
-    """Yahoo answers with OHLC; the model only ever transcribes."""
+    """Exness answers with OHLC; the model only ever transcribes."""
+
+    daily = daily_bars_from_yahoo_shaped(payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode("utf-8", "replace")
         calls.append(str(request.url))
-        if "yahoo" in str(request.url):
-            return httpx.Response(200, json=payload)
+        if is_exness_request(str(request.url)):
+            return exness_response(request, daily)
         if AIEngine.TRANSCRIBE_PROMPT in body:
             return httpx.Response(
                 200,
@@ -333,7 +355,7 @@ async def test_uncaptioned_poster_question_is_read_then_computed() -> None:
     payload = _payload(bars)
     calls: list[str] = []
     transport = _vision_transport(REPORTED_QUESTION, payload, calls)
-    feed = MarketFeed(httpx.AsyncClient(transport=transport))
+    feed = MarketFeed(httpx.AsyncClient(transport=transport), settings_loader=settings_loader())
     engine = AIEngine(market_feed=feed)
     engine._client = httpx.AsyncClient(transport=transport)
 
@@ -360,7 +382,7 @@ async def test_uncaptioned_decorative_image_still_gets_a_vision_answer() -> None
     """When the picture holds no question, fall through to the old behaviour."""
     calls: list[str] = []
     transport = _vision_transport("NONE", _payload([_bar(0, 100.0, 90.0, 95.0, 99.0)]), calls)
-    feed = MarketFeed(httpx.AsyncClient(transport=transport))
+    feed = MarketFeed(httpx.AsyncClient(transport=transport), settings_loader=settings_loader())
     engine = AIEngine(market_feed=feed)
     engine._client = httpx.AsyncClient(transport=transport)
 
@@ -384,7 +406,7 @@ async def test_ocr_is_not_attempted_when_a_caption_exists() -> None:
     calls: list[str] = []
     bars = [_bar(0, 70000.0, 69000.0, 69500.0, 69900.0)]
     transport = _vision_transport(REPORTED_QUESTION, _payload(bars), calls)
-    feed = MarketFeed(httpx.AsyncClient(transport=transport))
+    feed = MarketFeed(httpx.AsyncClient(transport=transport), settings_loader=settings_loader())
     engine = AIEngine(market_feed=feed)
     engine._client = httpx.AsyncClient(transport=transport)
 
@@ -405,8 +427,10 @@ async def test_ocr_is_not_attempted_when_a_caption_exists() -> None:
 @pytest.mark.asyncio
 async def test_transcription_failure_falls_back_instead_of_raising() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if "yahoo" in str(request.url):
-            return httpx.Response(200, json=_payload([_bar(0, 100.0, 90.0, 95.0, 99.0)]))
+        if is_exness_request(str(request.url)):
+            return exness_response(
+                request, daily_bars_from_yahoo_shaped(_payload([_bar(0, 100.0, 90.0, 95.0, 99.0)]))
+            )
         body = request.read().decode("utf-8", "replace")
         if AIEngine.TRANSCRIBE_PROMPT in body:
             return httpx.Response(500, json={"error": "boom"})
@@ -415,7 +439,7 @@ async def test_transcription_failure_falls_back_instead_of_raising() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    feed = MarketFeed(httpx.AsyncClient(transport=transport))
+    feed = MarketFeed(httpx.AsyncClient(transport=transport), settings_loader=settings_loader())
     engine = AIEngine(market_feed=feed)
     engine._client = httpx.AsyncClient(transport=transport)
 

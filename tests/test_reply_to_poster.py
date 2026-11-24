@@ -27,6 +27,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from exness_fixtures import (
+    daily_bars_from_yahoo_shaped,
+    exness_response,
+    is_exness_request,
+    settings_loader,
+)
 
 from qna_bot.ai.engine import AIEngine
 from qna_bot.ai.forex import is_refusal
@@ -126,10 +132,12 @@ async def test_pointer_caption_triggers_a_read_of_the_card() -> None:
     """The reported message, end to end through the engine."""
     calls: list[str] = []
 
+    daily = daily_bars_from_yahoo_shaped(PAYLOAD)
+
     def handler(request: httpx.Request) -> httpx.Response:
-        if "yahoo" in str(request.url):
-            calls.append("yahoo")
-            return httpx.Response(200, json=PAYLOAD)
+        if is_exness_request(str(request.url)):
+            calls.append("exness")
+            return exness_response(request, daily)
         body = request.read().decode("utf-8", "replace")
         if AIEngine.TRANSCRIBE_PROMPT in body:
             calls.append("transcribe")
@@ -142,7 +150,11 @@ async def test_pointer_caption_triggers_a_read_of_the_card() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
 
     result = await engine.answer_question(
@@ -207,7 +219,11 @@ async def test_refusal_with_an_image_is_retried_once() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
 
     result = await engine.answer_question(
@@ -236,7 +252,11 @@ async def test_refusal_without_an_image_is_never_retried() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
 
     result = await engine.answer_question(
@@ -261,7 +281,11 @@ async def test_a_repeated_refusal_is_kept_not_error_padded() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    engine = AIEngine(market_feed=MarketFeed(httpx.AsyncClient(transport=transport)))
+    engine = AIEngine(
+        market_feed=MarketFeed(
+            httpx.AsyncClient(transport=transport), settings_loader=settings_loader()
+        )
+    )
     engine._client = httpx.AsyncClient(transport=transport)
 
     result = await engine.answer_question(
