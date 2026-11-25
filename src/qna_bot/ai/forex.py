@@ -157,7 +157,13 @@ LIVE_DATA_PRESENT_GUIDANCE = (
     "the instrument asked about. Only refuse if the instrument is absent from "
     "the block, and then say exactly: " + NO_LIVE_DATA_ANSWER + "\n"
     "Never invent a level, forecast, target, event result or news item that is "
-    "not in that block."
+    "not in that block.\n"
+    "If the question names a window, the number you give is the one for that "
+    "window as this bot computes it: a week is Monday to Friday, the market is "
+    "closed at the weekend, and 'the last N days' means N trading sessions. Do "
+    "not re-derive the window yourself, do not widen it to a trailing seven "
+    "days, and do not mention the window's dates unless the question asked for "
+    "them."
 )
 
 

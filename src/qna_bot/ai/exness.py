@@ -69,7 +69,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
@@ -444,6 +444,7 @@ class ExnessClient:
         count: int = QUOTE_CANDLE_COUNT,
         price_type: str = "bid",
         instruments: set[str] | None = None,
+        align_daily_to_utc_midnight: bool = False,
     ) -> list[Candle]:
         """Newest ``count`` candles, oldest first, as Exness returns them.
 
@@ -451,6 +452,13 @@ class ExnessClient:
         Negative counts are valid and mean "the most recent N", which is exactly
         what a "price now" read wants - no clock synchronisation, no risk of a
         future ``to`` being rejected.
+
+        ``align_daily_to_utc_midnight`` matters only for ``D1``. Exness opens its
+        trading day at *local* midnight, which in Europe (UTC+2/+3) is 21:00 or
+        22:00 UTC the previous evening. Left raw, a bar stamped
+        ``2026-11-16T22:00Z`` would be filed as Sunday and dropped as a weekend,
+        losing Monday from "the last five trading days". When set, each bar's
+        stamp is moved to the UTC midnight of its trading date.
         """
         symbol = self._resolve_symbol(instrument, instruments)
         # Build the query once. This exact string is signed and transmitted;
@@ -476,6 +484,8 @@ class ExnessClient:
             side = item.get("bid") if isinstance(item.get("bid"), dict) else item
             parsed = _parse_candle(side)
             if parsed is not None:
+                if align_daily_to_utc_midnight:
+                    parsed.time = _trading_date_midnight(parsed.time)
                 bars.append(parsed)
         bars.sort(key=lambda c: c.time)
         return bars
@@ -508,6 +518,19 @@ def _parse_candle(item: object) -> Candle | None:
         volume = 0.0
     return Candle(
         time=stamp, open=open_, high=high, low=low, close=close, volume=volume
+    )
+
+
+def _trading_date_midnight(stamp: datetime) -> datetime:
+    """Snap a daily candle's open time to the UTC midnight of its trading date.
+
+    The trading date is a *local* calendar day, and the brokers' local day runs
+    ahead of UTC: an open at 22:00 UTC on Sunday 15th is Monday 16th's session.
+    Treating the stamp as UTC files it under Sunday, which the weekend filter
+    then removes - silently shortening every "last N trading days" window.
+    """
+    return datetime(stamp.year, stamp.month, stamp.day, tzinfo=UTC) + (
+        timedelta(days=1) if stamp.hour >= 20 else timedelta(0)
     )
 
 

@@ -38,7 +38,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 
@@ -326,8 +326,6 @@ _PERIOD_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(last|previous|past)\s+month\b", re.I), "last_month"),
     (re.compile(r"\bthis\s+month\b|\bmonth\s+to\s+date\b|\bmtd\b", re.I), "this_month"),
     (re.compile(r"\b(today|so\s+far\s+today)\b", re.I), "today"),
-    (re.compile(r"\b(last|previous|past)\s+(?:7|seven)\s+days?\b", re.I), "last_week"),
-    (re.compile(r"\b(last|previous|past)\s+(?:30|thirty)\s+days?\b", re.I), "last_month"),
     # Amharic. A transcribed poster or a typed question from an Ethiopian
     # giveaway group says "ይህ ሳምንት" where English says "this week", and none of the
     # Latin patterns above can match Ethiopic script. Ordered longest-first so
@@ -359,17 +357,88 @@ _AGGREGATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"ለውጥ|እድገት|መቶኛ|መቶኛው"), "change"),
 )
 
-#: How many days back each period starts. Crypto trades daily, so calendar days
-#: are the right unit; an FX "last week" skips the weekend automatically because
-#: Yahoo simply has no bars for it.
-_PERIOD_DAYS = {
-    "today": 1,
-    "yesterday": 2,
-    "this_week": 7,
-    "last_week": 14,
-    "this_month": 31,
-    "last_month": 62,
+#: How many calendar days of history to ask the broker for, per period. This is
+#: a *fetch* budget, not the window: the window is decided by real dates below.
+#: It is padded because the selection skips weekends and the still-forming day,
+#: which would otherwise leave the buffer short by two days.
+_PERIOD_FETCH_DAYS = {
+    "today": 8,
+    "yesterday": 8,
+    "this_week": 14,
+    "last_week": 21,
+    "this_month": 45,
+    "last_month": 75,
+     # "last 5 trading days" needs five sessions plus a weekend plus today's
+    # forming bar, so a fortnight is the smallest safe request.
+    "last_5_days": 16,
 }
+
+#: Spelled-out numbers a poster may use instead of digits.
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "fourteen": 14, "twenty": 20,
+    "thirty": 30, "sixty": 60, "ninety": 90,
+}
+
+#: "last 5 days", "past ten trading sessions". Checked BEFORE the general period
+#: patterns, because an explicit day count is a more precise statement of intent
+#: than the word "week" implied by it - and because these count *sessions*, so
+#: the weekend is excluded rather than silently included.
+_EXPLICIT_DAYS_RE = re.compile(
+    r"\b(?:last|previous|past|over\s+the\s+(?:last|past))\s+"
+    r"(\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")\s+"
+    r"(?:trading\s+|business\s+|market\s+)?(?:days?|sessions?)\b",
+    re.I,
+)
+
+
+def _is_session(bar_time: datetime, *, trades_weekends: bool) -> bool:
+    """True when this daily bar is a real trading session.
+
+    FX, metals and indices are shut at the weekend, so a Saturday/Sunday bar is
+    never a session - it is either absent, or present carrying Friday's close
+    forward (Exness does the latter for some instruments). Either way it does
+    not belong in "the last five days".
+
+    Crypto settles every calendar day, so for those the weekend is a session.
+    """
+    if trades_weekends:
+        return True
+    return bar_time.weekday() < 5
+
+
+def _date_range(period: str, now: datetime) -> tuple[date, date] | None:
+    """The calendar window a period names, inclusive, as traders mean it.
+
+    The whole point: "last week" is the previous **Monday to Friday**, not the
+    seven days before today. A window ending "7 days ago" lands on an arbitrary
+    weekday, which is how a Thursday question returned the wrong week's high.
+
+    Weeks start Monday (ISO), the convention in every trading calendar.
+    """
+    today = now.date()
+    monday = today - timedelta(days=today.weekday())
+    if period == "this_week":
+        return monday, today
+    if period == "last_week":
+        # Previous Monday to the Friday that closed it. Ending on Sunday would
+        # put two non-sessions in the window; for instruments that carry Friday
+        # forward, that silently re-counts Friday's range.
+        return monday - timedelta(days=7), monday - timedelta(days=3)
+    if period == "this_month":
+        return today.replace(day=1), today
+    if period == "last_month":
+        first_this = today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        return last_prev.replace(day=1), last_prev
+    if period == "today":
+        return today, today
+    if period == "yesterday":
+        # The previous calendar day. The selector walks back to the last session
+        # when that day had none, so a Monday question returns Friday.
+        prev = today - timedelta(days=1)
+        return prev, prev
+    return None
 
 
 @dataclass
@@ -379,31 +448,42 @@ class PeriodQuery:
     period: str
     aggregation: str
     instrument: str | None = None
+    #: Set for an explicit "last N trading days", which counts *sessions* rather
+    #: than calendar days so the weekend is not silently included.
+    session_count: int | None = None
 
     @property
     def days(self) -> int:
-        return _PERIOD_DAYS.get(self.period, 7)
-
-    def window_days(self) -> int:
-        """How many of the most recent bars belong to the window itself.
-
-        "last week" means the previous 7 days excluding today; "this week"
-        includes today, so the arithmetic lives here rather than in the caller.
-        """
-        if self.period in ("today", "yesterday"):
-            return 1
-        return 7 if "week" in self.period else 30
+        """Calendar days of history to request (fetch budget, not the window)."""
+        if self.session_count:
+            # Five sessions needs a week; forty needs two months. Two days of
+            # slack per weekend plus the forming day is what the selector eats.
+            return max(self.session_count + 4 + (self.session_count // 5) * 2, 10)
+        return _PERIOD_FETCH_DAYS.get(self.period, 21)
 
     @property
     def is_calendar_week(self) -> bool:
-        """True for "this week", which starts on Monday - not 7 days ago.
+        """True for either week period, whose boundaries are calendar dates.
 
-        A giveaway host asking "the highest price this week" on a Tuesday means
-        Monday and Tuesday, not the last seven days. Trailing-seven was close
-        enough to look right and wrong often enough to matter, which is the
-        worst combination for a competition answer.
+        Kept as a property because the distinction it names is the one that
+        matters: a week is Monday-to-Friday, not "the last seven bars". Both
+        "this week" and "last week" are date ranges now - the older code only
+        got the trailing edge right for the former.
         """
-        return self.period == "this_week"
+        return self.period in ("this_week", "last_week")
+
+    @property
+    def is_session_window(self) -> bool:
+        """True when the window is a count of sessions, not a calendar range."""
+        return self.session_count is not None
+
+
+def _find_aggregation(text: str) -> str | None:
+    """Which statistic the question asks for (high/low/open/close/change)."""
+    for pattern, name in _AGGREGATIONS:
+        if pattern.search(text):
+            return name
+    return None
 
 
 def parse_period_query(text: str) -> PeriodQuery | None:
@@ -414,6 +494,23 @@ def parse_period_query(text: str) -> PeriodQuery | None:
     """
     if not text:
         return None
+    # An explicit "last N trading days" wins over any week/month word nearby: it
+    # states the window exactly, and it must be counted in sessions.
+    explicit = _EXPLICIT_DAYS_RE.search(text)
+    if explicit is not None:
+        token = explicit.group(1).lower()
+        count = int(token) if token.isdigit() else _NUMBER_WORDS.get(token)
+        if count and 1 <= count <= 90:
+            aggregation = _find_aggregation(text)
+            if aggregation is not None:
+                instruments = instruments_in(text)
+                return PeriodQuery(
+                    period=f"last_{count}_days",
+                    aggregation=aggregation,
+                    instrument=instruments[0] if instruments else None,
+                    session_count=count,
+                )
+
     period = None
     for pattern, name in _PERIOD_PATTERNS:
         if pattern.search(text):
@@ -422,11 +519,7 @@ def parse_period_query(text: str) -> PeriodQuery | None:
     if period is None:
         return None
 
-    aggregation = None
-    for pattern, name in _AGGREGATIONS:
-        if pattern.search(text):
-            aggregation = name
-            break
+    aggregation = _find_aggregation(text)
     if aggregation is None:
         return None
 
@@ -657,44 +750,74 @@ class MarketFeed:
         if not bars:
             return None
 
-
-        # Drop today's still-forming bar from the *completed* pool: an
-        # incomplete candle makes "highest price last week" wrong the moment it
-        # is posted. Today's own bar is still what "today"/"this week" ask for.
-        # Identify today's bar by date, and fall back to the newest bar when the
-        # forming candle carried no values at all (a Sunday, say). Position alone
-        # is unreliable the moment a bar is dropped for a null field.
         now = datetime.now(UTC)
-        today_bar = next((b for b in reversed(bars) if b[0].date() == now.date()), None)
-        if today_bar is None and bars:
-            today_bar = bars[-1]
-        completed = [b for b in bars if b is not today_bar]
-        pool = completed or bars
+        today = now.date()
+        # Crypto settles 24/7, so its weekend bars are sessions; FX/metals/indices
+        # are shut, and a weekend bar there is Friday's close carried forward.
+        trades_weekends = instrument in _CRYPTO_SYMBOLS
 
-        window = query.window_days()
-        if query.period == "today":
-            selected = [today_bar] if today_bar else pool[-1:]
-        elif query.period == "yesterday":
-            selected = pool[-1:]
-        elif query.is_calendar_week:
-            # "This week" is Monday-to-now, not a trailing seven days. On a
-            # Tuesday the difference is the whole weekend before it.
-            monday = (now - timedelta(days=now.weekday())).date()
-            selected = [b for b in [*pool, *( [today_bar] if today_bar else [])]
-                        if b[0].date() >= monday]
+        # Identify today's still-forming bar by *date*, not position: a bar can
+        # be dropped for a null field, and the newest bar is not always today
+        # (a Saturday question's newest bar is Friday's).
+        today_bar = next((b for b in reversed(bars) if b[0].date() == today), None)
+        completed = [b for b in bars if b is not today_bar]
+
+        def in_range(day: date, bounds: tuple[date, date]) -> bool:
+            return bounds[0] <= day <= bounds[1]
+
+        if query.session_count is not None:
+            # "The last 5 trading days" counts *sessions*: for FX the weekend is
+            # skipped, for crypto it is not, because both are what a trader
+            # means by the phrase for that instrument.
+            pool = [
+                b for b in completed
+                if _is_session(b[0], trades_weekends=trades_weekends)
+            ]
+            if trades_weekends and today_bar is not None:
+                pool.append(today_bar)
+            selected = pool[-query.session_count :]
+        elif (bounds := _date_range(query.period, now)) is not None:
+            selected = [b for b in bars if in_range(b[0].date(), bounds)]
+            # Weekend bars inside a Monday-Friday window are not sessions for FX;
+            # they carry Friday's close and would silently widen the window.
+            if not trades_weekends:
+                selected = [
+                    b for b in selected
+                    if b is today_bar or _is_session(b[0], trades_weekends=False)
+                ]
+            # A still-forming bar may bound "today" and "this week so far", but
+            # it must never set "the high last week": it is not finished, and the
+            # number it shows now will not be the one the host sees at close.
+            if query.period not in ("today", "this_week"):
+                selected = [b for b in selected if b is not today_bar]
             if not selected:
-                # A brand-new week with no bars yet (or a market that has not
-                # opened): fall back to the most recent session rather than
-                # returning nothing and losing the question.
-                selected = pool[-1:]
-        elif query.period == "this_month":
-            # Trailing window ending now, today's partial bar included.
-            selected = pool[-window:]
-            if today_bar is not None:
-                selected = [*selected, today_bar]
-        else:
-            # "last week" / "last month": the completed window before today.
-            selected = pool[-window:]
+                # A Monday "yesterday", or a new week before any session printed.
+                # Answer with the most recent completed session rather than
+                # dropping the question - the only case outside the named window.
+                fallback = [
+                    b for b in completed
+                    if _is_session(b[0], trades_weekends=trades_weekends)
+                ]
+                selected = fallback[-1:]
+                if not selected:
+                    return None
+                # Flagged rather than returned silently: the answer is truthful
+                # but it is outside the window the question named.
+                fallback_used = True
+            else:
+                fallback_used = False
+        else:  # pragma: no cover - every period has a range or a count
+            return None
+
+        # A weekend question about "this week" would otherwise be answered from
+        # whichever single bar the range happened to contain. Trading never
+        # happened in that window, so the honest answer is no data, not a
+        # one-candle high dressed up as the week's.
+        if query.period == "this_week" and not fallback_used and not trades_weekends:
+            sessions = [b for b in selected if _is_session(b[0], trades_weekends=False)]
+            if not sessions:
+                return None
+
         if not selected:
             return None
 
@@ -741,7 +864,11 @@ class MarketFeed:
         if instrument not in HISTORY_INSTRUMENTS:
             return []
 
-        cached = self._bar_cache.get(instrument)
+        # Keyed by the requested depth as well as the instrument: a 90-session
+        # question must never be served the 16-day series fetched for a
+        # five-session one.
+        cache_key = f"{instrument}:{days}"
+        cached = self._bar_cache.get(cache_key)
         if cached is not None and (time.monotonic() - cached[0]) < CACHE_TTL_SECONDS:
             return cached[1]
 
@@ -756,6 +883,11 @@ class MarketFeed:
                 timeframe=HISTORY_TIMEFRAME,
                 count=max(days, 10) + 2,
                 instruments=available or None,
+                # Date each daily bar by its trading day, not the UTC clock: the
+                # session opens at local midnight, which is the previous evening
+                # in UTC, and would otherwise be filed a day early and dropped
+                # as a weekend.
+                align_daily_to_utc_midnight=True,
             )
         except Exception as exc:  # noqa: BLE001 - a feed must never break an answer
             logger.warning("OHLC fetch failed for %s: %s", instrument, exc)
@@ -769,7 +901,7 @@ class MarketFeed:
             # would make "the high last week" report 0 as the low.
             if bar.high > 0 and bar.low > 0
         ]
-        self._bar_cache[instrument] = (time.monotonic(), bars)
+        self._bar_cache[cache_key] = (time.monotonic(), bars)
         return bars
 
     async def _quote(self, instrument: str) -> Quote | None:
