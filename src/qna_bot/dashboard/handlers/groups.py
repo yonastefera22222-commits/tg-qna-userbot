@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 from ...storage.database import GroupConfig
 from ..context import AppContext, safe_edit_text
 from ..filters import NotACommand
-from ..keyboards import group_config_kb, groups_list_kb
+from ..keyboards import delay_picker_kb, group_config_kb, groups_list_kb
 from ..states import GroupStates
 
 router = Router(name="groups")
@@ -20,11 +20,6 @@ _SENDER_CYCLE = ["admins", "humans", "all"]
 _STYLE_CYCLE = ["giveaway", "short", "detailed"]
 _DETECT_CYCLE = ["giveaway_aggressive", "balanced", "strict"]
 _COOLDOWN_CYCLE = [0.0, 1.0, 2.0, 5.0, 10.0, 30.0]
-#: Human delay in milliseconds, cycled by tapping the button. Measured from the
-#: message arriving to the reply being posted, so it holds for every answer type
-#: - instant arithmetic, Forex formulas, OHLC history, model answers and photos.
-#: 1.5 s was the old maximum, which is barely human for a typed answer.
-_DELAY_CYCLE = [0, 300, 700, 1500, 3000, 5000]
 _CONTEXT_CYCLE = [0, 1, 2, 3]
 
 
@@ -96,6 +91,70 @@ def _group_settings_text(group: GroupConfig) -> str:
         "• <b>📈 Live Market Prices</b> fetches real quotes (gold, DXY, yields)\n"
         "   so price questions get a timestamped number, not a refusal\n"
         f"• <b>🏷 Trigger Keywords:</b> {kw}"
+    )
+
+
+def _delay_picker_text(group: GroupConfig) -> str:
+    current = int(group.human_delay_ms)
+    shown = "Off" if current <= 0 else f"{current / 1000:g}s"
+    return (
+        f"⏳ <b>Human Delay: {html.escape(group.title)}</b>\n\n"
+        f"Current: <b>{shown}</b>\n\n"
+        "How long the bot waits before posting a reply, measured from the moment "
+        "the question arrived. It applies to <b>every</b> reply type — instant "
+        "math, Forex formulas, Exness history, model answers and photo "
+        "questions — so the number means the same thing everywhere.\n\n"
+        "A slower answer already past the delay posts immediately; the delay is "
+        "a minimum, not an extra wait.\n\n"
+        "<i>First Comment Race is capped at 250 ms regardless, so it can still "
+        "win the race.</i>\n\n"
+        "Pick a delay:"
+    )
+
+
+@router.callback_query(F.data.startswith("gdelay:"))
+async def cb_delay_picker(callback: CallbackQuery, ctx: AppContext) -> None:
+    """Open the delay picker, or save the chosen value.
+
+    A picker rather than a cycle because the range now runs to 5 s: eleven stops
+    tapped one at a time is how the wrong value gets saved during a live
+    giveaway.
+    """
+    parts = (callback.data or "").split(":")
+    # gdelay:menu:<cid>:<page>:<mode>  |  gdelay:<cid>:<ms>:<page>:<mode>
+    if len(parts) > 1 and parts[1] == "menu":
+        chat_id = int(parts[2])
+        back_page = int(parts[3])
+        mode_flag = parts[4] if len(parts) > 4 else "d"
+        group = await ctx.db.get_group(chat_id)
+        if not group:
+            await callback.answer("Group not found", show_alert=True)
+            return
+        await callback.answer()
+        await safe_edit_text(
+            callback,
+            _delay_picker_text(group),
+            reply_markup=delay_picker_kb(group, back_page, mode_flag),
+        )
+        return
+
+    chat_id = int(parts[1])
+    chosen = int(parts[2])
+    back_page = int(parts[3])
+    mode_flag = parts[4] if len(parts) > 4 else "d"
+
+    group = await ctx.db.get_group(chat_id)
+    if not group:
+        await callback.answer("Group not found", show_alert=True)
+        return
+    group.human_delay_ms = chosen
+    await ctx.db.save_group(group)
+    await ctx.userbot.reload_cache()
+    await callback.answer("Off" if chosen == 0 else f"Delay: {chosen / 1000:g}s")
+    await safe_edit_text(
+        callback,
+        _group_settings_text(group),
+        reply_markup=group_config_kb(group, back_page, mode_flag),
     )
 
 
@@ -271,7 +330,15 @@ async def cb_group_cfg_update(
     elif field == "cooldown":
         group.cooldown_seconds = _next_in_cycle(_COOLDOWN_CYCLE, group.cooldown_seconds)
     elif field == "delay":
-        group.human_delay_ms = _next_in_cycle(_DELAY_CYCLE, group.human_delay_ms)
+        # Backwards compatibility: an old message's keyboard may still carry the
+        # cycling callback. Open the picker instead of silently stepping.
+        await callback.answer()
+        await safe_edit_text(
+            callback,
+            _delay_picker_text(group),
+            reply_markup=delay_picker_kb(group, back_page, mode_flag),
+        )
+        return
     elif field == "context":
         group.context_messages = _next_in_cycle(_CONTEXT_CYCLE, group.context_messages)
 
