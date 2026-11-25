@@ -33,6 +33,7 @@ from qna_bot.ai.market import (
     _is_session,
     parse_period_query,
 )
+from qna_bot.ai.market_calendar import is_session as calendar_is_session
 
 
 def _freeze(monkeypatch, moment: datetime) -> None:
@@ -113,19 +114,48 @@ def test_a_monday_yesterday_names_the_previous_calendar_day() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("weekday", "is_session"),
-    [(0, True), (1, True), (2, True), (3, True), (4, True), (5, False), (6, False)],
-)
-def test_fx_has_no_weekend_sessions(weekday: int, is_session: bool) -> None:
+@pytest.mark.parametrize("weekday", range(7))
+def test_fx_has_no_weekend_sessions(weekday: int) -> None:
+    from qna_bot.ai.market_calendar import FOREX
+
     day = datetime(2026, 11, 9, tzinfo=UTC) + timedelta(days=weekday)
-    assert _is_session(day, trades_weekends=False) is is_session
+    assert _is_session(day, market=FOREX) is (weekday < 5)
 
 
 @pytest.mark.parametrize("weekday", range(7))
 def test_crypto_trades_every_day(weekday: int) -> None:
+    from qna_bot.ai.market_calendar import CRYPTO
+
     day = datetime(2026, 11, 9, tzinfo=UTC) + timedelta(days=weekday)
-    assert _is_session(day, trades_weekends=True) is True
+    assert _is_session(day, market=CRYPTO) is True
+
+
+@pytest.mark.parametrize("weekday", [5, 6])
+@pytest.mark.parametrize(
+    ("instrument", "weekend_is_a_session"),
+    [
+        # The week's actual closure table, per family.
+        ("BTCUSD", True),
+        ("ETHUSD", True),
+        ("XAUUSD", False),
+        ("XAGUSD", False),
+        ("EURUSD", False),
+        ("USDJPY", False),
+        ("DXY", False),
+        ("US10Y", False),
+    ],
+)
+def test_the_calendar_classifies_each_family_correctly(
+    instrument: str, weekend_is_a_session: bool, weekday: int
+) -> None:
+    """Crypto is the only family whose weekend bars are real sessions."""
+    from qna_bot.ai.market_calendar import market_class_for
+
+    market = market_class_for(instrument)
+    # 16 Nov 2026 is a Monday, so +5 is Saturday and +6 is Sunday.
+    day = datetime(2026, 11, 16, tzinfo=UTC) + timedelta(days=weekday)
+    assert day.weekday() >= 5
+    assert calendar_is_session(day, market) is weekend_is_a_session
 
 
 # ---------------------------------------------------------------------------
