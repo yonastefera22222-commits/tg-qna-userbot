@@ -126,6 +126,8 @@ specific reason (`Exness not connected`, or the error code: `1000` bad key, `100
 ## ☁️ Deploying to Render Free Tier (Step-by-Step)
 
 > **Setting up a second account?** See **[SETUP-GUIDE.md](SETUP-GUIDE.md)** for the full walkthrough — separate bot token, separate `OWNER_ID`, what must not be shared between deployments, and a troubleshooting table.
+>
+> **Out of free instances, or no credit card?** See **[DEPLOY-ALTERNATIVES.md](DEPLOY-ALTERNATIVES.md)** — which hosts can actually run a long-lived userbot (most free-hosting lists cannot: anything request-driven like Vercel, Lambda or Cloudflare Workers is silent when no HTTP traffic arrives), the one managed host that is card-free *and* doesn't sleep, running it on a spare phone or Pi for free forever, and how to move without re-pairing your Telegram login.
 
 ### Step 1 — Push this repo to your GitHub (`tg-qna-bot`)
 
