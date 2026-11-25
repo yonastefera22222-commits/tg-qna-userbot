@@ -11,6 +11,14 @@ from ..storage.database import GroupConfig
 GROUPS_PER_PAGE = 7
 
 
+#: The human delay values offered in the picker, in milliseconds.
+#:
+#: A picker rather than a cycle: nine stops is far too many to tap through one
+#: at a time, and "tap five times and hope" is how the wrong delay gets saved
+#: during a live giveaway. 500 ms steps up to 5 s.
+HUMAN_DELAY_CHOICES = (0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000)
+
+
 def _delay_label(human_delay_ms: int) -> str:
     """Describe the delay by what it does, not just by its number.
 
@@ -303,7 +311,7 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
     )
     b.button(
         text=_delay_label(group.human_delay_ms),
-        callback_data=f"gcfg:{cid}:delay:{back_page}:{mode_flag}",
+        callback_data=f"gdelay:menu:{cid}:{back_page}:{mode_flag}",
     )
     kw_label = group.trigger_keywords[:18] + "…" if len(group.trigger_keywords) > 18 else (group.trigger_keywords or "Auto")
     b.button(
@@ -323,6 +331,32 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
         callback_data=f"grp:list:{back_page}:{mode_flag}",
     )
     b.adjust(1, 1, 1, 1, 2, 2, 2, 1, 1)
+    return b.as_markup()
+
+
+def delay_picker_kb(
+    group: GroupConfig, back_page: int, mode_flag: str
+) -> InlineKeyboardMarkup:
+    """Every delay value on its own button, current one marked.
+
+    Two columns keeps all eleven options on one screen, which a single-column
+    list of this length would not: a settings screen that needs scrolling hides
+    the option the owner is looking for.
+    """
+    cid = group.chat_id
+    b = InlineKeyboardBuilder()
+    for choice in HUMAN_DELAY_CHOICES:
+        mark = "✅ " if int(group.human_delay_ms) == choice else ""
+        label = "Off" if choice == 0 else f"{choice / 1000:g}s"
+        b.button(
+            text=f"{mark}{label}",
+            callback_data=f"gdelay:{cid}:{choice}:{back_page}:{mode_flag}",
+        )
+    b.button(
+        text="⬅️ Back",
+        callback_data=f"grp:cfg:{cid}:{back_page}:{mode_flag}",
+    )
+    b.adjust(2, 2, 2, 2, 2, 1, 1)
     return b.as_markup()
 
 
