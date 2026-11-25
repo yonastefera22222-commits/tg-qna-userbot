@@ -20,7 +20,11 @@ _SENDER_CYCLE = ["admins", "humans", "all"]
 _STYLE_CYCLE = ["giveaway", "short", "detailed"]
 _DETECT_CYCLE = ["giveaway_aggressive", "balanced", "strict"]
 _COOLDOWN_CYCLE = [0.0, 1.0, 2.0, 5.0, 10.0, 30.0]
-_DELAY_CYCLE = [0, 300, 700, 1500]
+#: Human delay in milliseconds, cycled by tapping the button. Measured from the
+#: message arriving to the reply being posted, so it holds for every answer type
+#: - instant arithmetic, Forex formulas, OHLC history, model answers and photos.
+#: 1.5 s was the old maximum, which is barely human for a typed answer.
+_DELAY_CYCLE = [0, 300, 700, 1500, 3000, 5000]
 _CONTEXT_CYCLE = [0, 1, 2, 3]
 
 
