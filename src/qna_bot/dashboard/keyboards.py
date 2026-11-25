@@ -11,6 +11,20 @@ from ..storage.database import GroupConfig
 GROUPS_PER_PAGE = 7
 
 
+def _delay_label(human_delay_ms: int) -> str:
+    """Describe the delay by what it does, not just by its number.
+
+    The setting is measured from the message arriving to the reply being posted,
+    for every answer type. Saying so on the button is cheaper than the support
+    question "does this apply to the instant answers too?".
+    """
+    if human_delay_ms <= 0:
+        return "⏳ Delay: Off"
+    seconds = human_delay_ms / 1000.0
+    pretty = f"{seconds:g}s"
+    return f"⏳ Delay: {pretty} (all replies)"
+
+
 def main_dashboard_kb(global_enabled: bool, notify_on: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(
@@ -288,7 +302,7 @@ def group_config_kb(group: GroupConfig, back_page: int, mode_flag: str) -> Inlin
         callback_data=f"gcfg:{cid}:cooldown:{back_page}:{mode_flag}",
     )
     b.button(
-        text=f"⏳ Delay: {group.human_delay_ms}ms",
+        text=_delay_label(group.human_delay_ms),
         callback_data=f"gcfg:{cid}:delay:{back_page}:{mode_flag}",
     )
     kw_label = group.trigger_keywords[:18] + "…" if len(group.trigger_keywords) > 18 else (group.trigger_keywords or "Auto")

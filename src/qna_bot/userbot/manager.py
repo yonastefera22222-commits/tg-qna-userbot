@@ -31,6 +31,7 @@ from ..ai.text_cleanup import prepare_incoming, wants_inherited_image
 from ..storage.database import Database, GroupConfig
 from .filters import describe_reason, should_evaluate_message
 from .first_comment import FIRST_COMMENT_ANSWER, is_first_comment
+from .human_delay import wait_for_send
 from .login import (
     CodeDelivery,
     LoginResult,
@@ -820,16 +821,26 @@ class UserbotManager:
         chat_id: int,
         text: str,
         dedup_key: tuple[int, int],
+        *,
+        received_at: float | None = None,
     ) -> None:
         """Post the fixed "I win" line. No model, no prompt, no API key.
 
         Kept separate from the AI path so the hot path is a dict lookup, a regex
         and one Telethon send - the same shape as the local math solver.
+
+        The owner's human delay applies here too, but capped: this is a race
+        against every other bot in the group, so the delay is bounded to a few
+        hundred milliseconds rather than honoured in full. Waiting the full
+        1500 ms would reliably lose the comment it exists to win.
         """
         if group.reply_to_message:
             send = event.reply
         else:
             send = event.respond
+        await wait_for_send(
+            received_at, group.human_delay_ms, first_comment=True
+        )
         self._recent_msg_ids.append(dedup_key)
         self._last_reply_ts[int(chat_id)] = time.monotonic()
         try:
@@ -866,6 +877,11 @@ class UserbotManager:
         )
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
+        # Taken before any work at all: the human delay is measured from the
+        # moment the message reached us, so a slow path cannot spend the delay
+        # twice. This is why a fast path and a 4-second image path now post on
+        # the same clock instead of 1.5 s and 5.5 s respectively.
+        received_at = time.monotonic()
         if not self._global_enabled:
             self._record(event.chat_id, event.sender_id, event.raw_text, "skip:global_paused")
             return
@@ -964,7 +980,9 @@ class UserbotManager:
         # deliberately ignores the per-group cooldown: this is a one-shot burst,
         # and a cooldown would silently skip the message that wins it.
         if group.first_comment_enabled and not has_image and is_first_comment(clean_text):
-            await self._answer_first_comment(event, group, chat_id, text, dedup_key)
+            await self._answer_first_comment(
+                event, group, chat_id, text, dedup_key, received_at=received_at
+            )
             return
 
         # Local pre-filter (runs in <0.1ms before any AI call)
@@ -1082,9 +1100,12 @@ class UserbotManager:
             )
             return
 
-        # Optional human-like delay (0ms by default for maximum giveaway speed)
-        if group.human_delay_ms > 0:
-            await asyncio.sleep(group.human_delay_ms / 1000.0)
+        # Optional human-like delay. Measured from arrival, not added to the
+        # work: the local math path, the Forex formulas and the OHLC answers all
+        # reach this same line, and so do slow model and image answers. An
+        # unconditional sleep here posted them at 1.5 s and 5.5 s respectively;
+        # waiting out the remainder posts them all at the delay.
+        await wait_for_send(received_at, group.human_delay_ms)
 
         # Mark dedup & cooldown immediately before sending to prevent race conditions
         self._recent_msg_ids.append(dedup_key)
