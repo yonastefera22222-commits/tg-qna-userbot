@@ -176,10 +176,13 @@ def test_this_week_is_a_calendar_week() -> None:
     assert query.is_calendar_week is True
 
 
-def test_last_week_is_not_a_calendar_week() -> None:
+def test_last_week_is_also_a_calendar_week() -> None:
+    """"Last week" used to be a trailing seven days ending on an arbitrary
+    weekday - the bug that returned the wrong week's high. It is now the
+    previous Monday-to-Friday, exactly like "this week" is the current one."""
     query = parse_period_query("btc high last week")
     assert query is not None
-    assert query.is_calendar_week is False
+    assert query.is_calendar_week is True
 
 
 @pytest.mark.asyncio

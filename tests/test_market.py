@@ -69,30 +69,52 @@ BTC_CLOSES = [
     74584.65, 75223.15, 73720.12, 73964.47, 71342.97, 68249.27, 64128.05, 65305.06,
     64855.84, 64893.95, 62987.27, 61901.82, 58798.98, 60094.09, 64000.00, 61605.06,
 ]
-#: Highs sit just above their closes, with one deliberate spike inside the last
-#: completed week (index 27 of 32, where 31 is today) so the expected answer is
-#: unambiguous: 66055.10 - and demonstrably not today's 61674.92.
+def _all_weekdays() -> list[datetime]:
+    """The last 32 *trading* days, newest last, ending today.
+
+    Built from weekdays rather than the last 32 calendar days: "last week" is
+    now a calendar Monday-Friday, so a fixture that spans whole weeks is the
+    only one whose expected answer does not change with the day CI runs.
+    """
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    days: list[datetime] = [today]
+    probe = today
+    while len(days) < 32:
+        probe -= timedelta(days=1)
+        if probe.weekday() < 5 or len(days) >= 28:
+            days.append(probe)
+    return list(reversed(days))
+
+
+#: Highs sit just above their closes, with one deliberate spike inside the
+#: previous calendar week so the expected answer is unambiguous: 66055.10 - and
+#: demonstrably neither today's 61674.92 nor anything from this week.
 BTC_HIGHS = [c + 100 for c in BTC_CLOSES[:-1]] + [61674.92]
-BTC_HIGHS[27] = 66055.10
 
 
 def btc_payload(*, days_back: int = 0) -> list[dict]:
-    now = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    base = now - timedelta(days=days_back)
-    total = len(BTC_CLOSES)
-    bars = []
-    for idx, close in enumerate(BTC_CLOSES):
-        day = base - timedelta(days=total - 1 - idx)
-        bars.append(
-            {
-                "time": day.isoformat(),
-                "open": BTC_CLOSES[idx - 1] if idx else close,
-                "high": BTC_HIGHS[idx],
-                "low": close - 800,
-                "close": close,
-                "volume": 100.0,
-            }
-        )
+    """Daily BTC candles on trading days, today's still-forming bar last.
+
+    The 66055.10 high is pinned to the newest bar of the *previous calendar
+    week*, so "the high last week" has one correct answer whichever weekday the
+    suite runs on.
+    """
+    days = _all_weekdays()
+    this_monday = days[-1].date() - timedelta(days=days[-1].weekday())
+    bars = [
+        {
+            "time": days[idx].isoformat(),
+            "open": BTC_CLOSES[idx - 1] if idx else close,
+            "high": BTC_HIGHS[idx],
+            "low": close - 800,
+            "close": close,
+            "volume": 100.0,
+        }
+        for idx, close in enumerate(BTC_CLOSES)
+    ]
+    previous_week = [b for b in bars[:-1] if b["time"][:10] < this_monday.isoformat()]
+    if previous_week:
+        previous_week[-1]["high"] = 66055.10
     return bars
 
 

@@ -482,12 +482,43 @@ async def test_rotating_the_key_rebuilds_the_client_and_host_cache(creds) -> Non
 
 @pytest.mark.asyncio
 async def test_period_high_comes_from_exness_daily_candles(creds) -> None:
-    # Nine daily bars ending today. Highs are close+10, so the whole series
-    # tops out at 190 - but that bar is today's and still forming.
-    closes = [100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0]
+    """The high of the previous Monday-Friday, from the account's own bars.
+
+    Fixture: three weeks of weekday bars where this week trades highest and the
+    previous week is second. "Last week" must return the previous week's high -
+    not this week's, and not a trailing seven days' worth of both.
+    """
+    from datetime import timedelta
+
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    this_monday = today - timedelta(days=today.weekday())
+    bars = []
+    # Three calendar weeks of sessions, oldest first, ending with this week's
+    # sessions up to today.
+    base = this_monday - timedelta(days=21)
+    day = base
+    step = 0
+    while day <= today:
+        if day.weekday() < 5:
+            # Weeks get progressively higher highs: older is lower.
+            week_index = (day - base).days // 7
+            level = 100.0 + week_index * 100.0
+            bars.append(
+                {
+                    "time": day.isoformat(),
+                    "open": level,
+                    "high": level + 10.0,
+                    "low": level - 10.0,
+                    "close": level,
+                    "volume": 1.0,
+                }
+            )
+        day += timedelta(days=1)
+        step += 1
+
     fake = FakeExness(
         instruments=["XAUUSD", "EURUSD"],
-        candles={"D1:XAUUSD": daily_payload(closes, days_back=0)},
+        candles={"D1:XAUUSD": bars},
     )
     feed = _feed(fake, creds)
     try:
@@ -498,11 +529,15 @@ async def test_period_high_comes_from_exness_daily_candles(creds) -> None:
         await feed.close()
 
     assert answer is not None
-    # Highest high over the *completed* window, computed locally: 180 from the
-    # 170 bar. Today's 180 close (high 190) is excluded on purpose - a forming
-    # candle would make "the high last week" wrong the moment it is posted.
-    assert answer.high == pytest.approx(180.0)
     assert answer.aggregation == "high"
+    # Three weeks back is index 0, so the previous week is index 2: its
+    # Monday-Friday bars all carry a 310 high, and this week's 410s must not
+    # appear even though this week has already printed by mid-week.
+    assert answer.high == pytest.approx(310.0)
+    # And the window really is Mon-Fri of that week, not a trailing seven days.
+    assert answer.start.date().weekday() == 0
+    assert answer.end.date().weekday() <= 4
+    assert answer.end.date() < this_monday.date()
 
 
 @pytest.mark.asyncio
