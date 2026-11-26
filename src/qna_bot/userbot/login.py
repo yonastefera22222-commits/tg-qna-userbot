@@ -635,20 +635,6 @@ def translate_signin_error(exc: Exception) -> LoginResult:
 # ---------------------------------------------------------------------------
 
 
-#: A coherent device identity for the login connection.
-#:
-#: This is not cosmetic. Telegram decides whether to *actually deliver* a login
-#: code partly on how the requesting client identifies itself. With Telethon's
-#: defaults the client announces itself as ``Telethon 1.x`` on ``Python``, which
-#: is exactly the fingerprint Telegram's anti-spam heuristics suppress: the
-#: request comes back ``SentCodeTypeApp`` with a valid hash, and nothing is ever
-#: delivered, with no error and no FloodWait. It is the single most reported
-#: cause of "the code never arrives" on third-party clients
-#: (Telethon issue #4730), and multiple reporters there confirmed that sending a
-#: realistic mobile profile made delivery reliable again.
-#:
-#: The values are deliberately a plain, widely-installed Android build rather
-#: than anything unusual, and they are used only for the *login* connection.
 def code_settings() -> CodeSettings | None:
     """The delivery channels to permit when asking Telegram for a login code.
 
@@ -710,12 +696,6 @@ async def _request_login_code(client: TelegramClient, phone: str):
     return sent
 
 
-DEVICE_MODEL = "Pixel 6"
-SYSTEM_VERSION = "SDK 33"
-APP_VERSION = "10.2.0 (4300)"
-LANG_CODE = "en"
-SYSTEM_LANG_CODE = "en-US"
-
 
 def make_login_client(api_id: int, api_hash: str, session: StringSession | None = None) -> TelegramClient:
     """Create a temporary Telethon client configured for interactive login.
@@ -726,8 +706,11 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
     ``request_retries`` is raised a little so flaky mobile-server connections do
     not abort a login the owner is halfway through.
 
-    The device parameters exist because a default Telethon client is the exact
-    fingerprint Telegram silently drops login codes for (see ``DEVICE_MODEL``).
+    The client announces itself exactly as Telethon does by default. It used to
+    impersonate an Android phone ("Pixel 6", "SDK 33", app build "10.2.0 (4300)");
+    that was removed because it is a fingerprint no real device produces - an old
+    SDK running an impossible app build, from a datacenter IP - and logins that had
+    been delivering codes stopped doing so once it was in place.
     """
     return TelegramClient(
         session or StringSession(),
@@ -737,11 +720,6 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
         request_retries=5,
         connection_retries=5,
         retry_delay=1,
-        device_model=DEVICE_MODEL,
-        system_version=SYSTEM_VERSION,
-        app_version=APP_VERSION,
-        lang_code=LANG_CODE,
-        system_lang_code=SYSTEM_LANG_CODE,
     )
 
 

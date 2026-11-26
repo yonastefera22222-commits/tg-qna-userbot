@@ -356,28 +356,25 @@ def test_delivery_carries_next_channel_for_every_type() -> None:
         assert delivery.next_channel is DeliveryChannel.CALL
 
 
-def test_login_client_does_not_identify_as_raw_telethon() -> None:
-    """A default Telethon fingerprint is what Telegram suppresses codes for.
+def test_login_client_sends_no_impersonated_device_identity() -> None:
+    """The login client must NOT impersonate a phone.
 
-    See Telethon #4730: reporters confirmed delivery became reliable again once
-    the client presented a real mobile device profile.
+    It briefly did (``device_model="Pixel 6"``, ``system_version="SDK 33"``,
+    ``app_version="10.2.0 (4300)"``) on the theory that a mobile profile helps
+    delivery. It does the opposite here: it is a combination no real device
+    produces - a three-year-old SDK announcing an app build that never existed,
+    from a datacenter IP - and logins that had been delivering codes stopped once
+    it was in place. The identity is Telethon's own again.
     """
-    from qna_bot.userbot.login import (
-        APP_VERSION,
-        DEVICE_MODEL,
-        SYSTEM_VERSION,
-        make_login_client,
-    )
+    from qna_bot.userbot.login import make_login_client
 
     client = make_login_client(12345, "abc")
     # Never connected, so there is nothing to tear down; the identity Telegram
     # actually sees is baked into the init-connection request.
     init = client._init_request
-    assert init.device_model == DEVICE_MODEL
-    assert init.system_version == SYSTEM_VERSION
-    assert init.app_version == APP_VERSION
-    assert "telethon" not in init.device_model.lower()
-    assert "python" not in init.system_version.lower()
+    assert "pixel" not in str(init.device_model).lower()
+    assert "sdk 33" not in str(init.system_version).lower()
+    assert init.app_version != "10.2.0 (4300)"
 
 
 def test_email_login_is_the_primary_login_offer() -> None:
