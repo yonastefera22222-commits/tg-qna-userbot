@@ -752,9 +752,21 @@ async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContex
     # The button says "QR Code", so it must *send a QR code*. It used to only
     # start the browser flow and show a text screen with a link, which is why
     # nothing scannable ever appeared: the image lived behind a second button
-    # ("📷 Make a QR Code") that was easy to miss. A link is not a QR code, and a
-    # browser page is not one either - that page has no image on it at all.
-    page_url = await _start_browser_login(ctx, int(api_id), str(api_hash))
+    # ("📷 Make a QR Code") that was easy to miss.
+    #
+    # Exactly ONE login is started here. Previously this handler started a browser
+    # login *and then* a QR login, i.e. two live Telegram connections for the same
+    # login attempt. Telegram does not allow that: the second ``auth.exportLoginToken``
+    # is cancelled with ENTITY_BOUNDS_INVALID / LOGIN_TOKEN_INVALID, so
+    # ``start_qr_login`` returned ``url=None`` and the screen said "Telegram did not
+    # issue a QR token" - no QR code ever appeared, on a fresh deploy where the
+    # browser flow was being started for the very first time. ``_qr_kb`` still
+    # offers the browser page when an attempt already exists, and
+    # "🌐 Send Me the Login Link" starts one on demand.
+    page_url = None
+    manager = ctx.browser_login
+    if manager is not None and ctx.env.public_url:
+        page_url = manager.page_url(ctx.env.public_url)
     await _show_qr_image(callback, ctx, state, int(api_id), str(api_hash), page_url=page_url)
 
 
