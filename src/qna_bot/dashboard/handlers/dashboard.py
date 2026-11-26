@@ -7,7 +7,13 @@ import html
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from ...ai.language import is_amharic
 from ...ai.providers import PROVIDERS
@@ -299,6 +305,65 @@ async def cb_export_share(callback: CallbackQuery, ctx: AppContext) -> None:
         SHARE_STEPS + NO_CREDENTIALS_NOTE + f"\n\n<code>{html.escape(state_b64)}</code>",
         reply_markup=kb,
     )
+
+
+@router.callback_query(F.data == "acc:session_string")
+async def cb_session_string(callback: CallbackQuery, ctx: AppContext) -> None:
+    """Hand the owner the one value that makes a free host survivable.
+
+    On Render Free the disk is wiped on every redeploy, restart and 15-minute idle
+    spin-down (https://render.com/docs/free), and `data/bot.db` - where the login
+    lives - is on that disk. `TG_STRING_SESSION` is read at boot, so pasting this
+    into the host's Environment tab means the bot starts already logged in and
+    nothing is lost. Getting it from here avoids the terminal entirely, which is
+    the only way this is usable from a phone.
+    """
+    await callback.answer("Preparing...")
+    payload = await ctx.userbot.session_file_bytes()
+    if payload is None:
+        await callback.message.answer(
+            "❌ There is no saved session yet. Finish the Telegram login first, "
+            "then come back here."
+        )
+        return
+
+    filename, blob = payload
+    session_str = blob.decode("utf-8").strip()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Delete Secret Message", callback_data="msg:delete_me")]
+        ]
+    )
+    await callback.message.answer_document(
+        BufferedInputFile(blob, filename=filename),
+        caption=(
+            "🔑 <b>Your Telegram session string</b>\n\n"
+            "⚠️ <b>This is your account.</b> Anyone who has this file can read and "
+            "send messages as you. Keep it in your own host's settings and nowhere "
+            "else.\n\n"
+            "Why you want it: on a free host the disk is wiped on every redeploy, "
+            "restart and idle spin-down, which erases the login you just made. This "
+            "value lives in an environment variable instead, so it survives.\n\n"
+            "<b>Copy it verbatim from the file</b> (do not retype — phone copy can "
+            "silently insert spaces).\n\n"
+            "Then: host dashboard → <b>Environment</b> → add\n"
+            "• <code>TG_STRING_SESSION</code> = the string\n"
+            "• <code>TG_API_ID</code> / <code>TG_API_HASH</code> = your API credentials\n"
+            "• <code>ENCRYPTION_KEY</code> = your fixed key\n\n"
+            "Save Changes. After the redeploy the bot starts already connected — no "
+            "code, and nothing left to lose.\n\n"
+            "To revoke later: Telegram → Settings → Devices → terminate this session.",
+        ),
+        reply_markup=kb,
+    )
+    # The string is also short enough to read inline, which helps when file
+    # copying is awkward on the device at hand.
+    if len(session_str) <= 3400:
+        await callback.message.answer(
+            "For convenience, here it is inline as well:\n\n"
+            f"<code>{html.escape(session_str)}</code>",
+            reply_markup=kb,
+        )
 
 
 @router.callback_query(F.data == "acc:export_render")

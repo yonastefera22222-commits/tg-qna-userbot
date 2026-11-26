@@ -460,6 +460,38 @@ class UserbotManager:
         logger.info("Telegram account connected via phone login: %s", self.account_display)
         return LoginResult(LoginStatus.OK, f"Successfully connected as {self.account_display}!")
 
+    async def current_session_string(self) -> str | None:
+        """The live login as a StringSession, or None when not connected.
+
+        This is what the owner pastes into the host's Environment tab as
+        ``TG_STRING_SESSION``. On a host with an ephemeral disk that variable is
+        the only copy of the login that survives a restart, so being able to get
+        the string *from the working bot* - rather than by running a script in a
+        terminal - is what makes the whole thing usable from a phone.
+        """
+        client = self._client
+        if client is not None and self.is_connected:
+            try:
+                return client.session.save()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Could not export the live session: %s", exc)
+        # Fall back to the stored copy so this still works from a cold process
+        # that has not (re)connected yet.
+        return await self._db.get_setting("tg_session")
+
+    async def session_file_bytes(self) -> tuple[str, bytes] | None:
+        """The session string plus a filename, for sending as a file.
+
+        A StringSession is ~350 characters, which fits a Telegram message, but a
+        plain text message is easy to mis-copy on a phone (line wrapping inserts
+        spaces). Sending it as a file gives the owner something to copy verbatim.
+        """
+        value = await self.current_session_string()
+        if not value:
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        return f"telegram-session-{stamp}.txt", (value + "\n").encode("utf-8")
+
     async def _attach_client(self, client: TelegramClient) -> None:
         # Disconnect any previously active client cleanly
         if self._client is not None and self._client is not client:

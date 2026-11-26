@@ -66,6 +66,38 @@ Your repo: `github.com/yonastefera22222-commits/tg-qna-userbot` → click **Fork
 > bot now logs a clear `ENCRYPTION_KEY is not a valid Fernet key` warning and keeps
 > running, but every secret stored under the old key becomes unreadable.
 
+> **On a free host, the database itself is temporary.** Render's docs are explicit
+> ([Deploy for Free](https://render.com/docs/free)): free web services have an
+> *ephemeral filesystem*, and "any changes to your web service's filesystem
+> (uploaded images, local SQLite databases, etc.) are **lost** every time the
+> service redeploys, restarts, or spins down". A free service spins down after 15
+> minutes without traffic. The bot keeps its Telegram login in `data/bot.db`, so a
+> plain free deploy **cannot** keep a login for long — the wizard will be undone.
+>
+> **Two settings make it durable, and only these:**
+>
+> | Variable | What it preserves |
+> |---|---|
+> | `TG_API_ID`, `TG_API_HASH` | Stop re-entering your API credentials every restart |
+> | `TG_STRING_SESSION` | The login itself — no OTP screen, ever again |
+> | `ENCRYPTION_KEY` | Keeps stored secrets readable across restarts |
+> | `BOT_STATE_B64` | Groups, AI keys and settings (export from the dashboard) |
+>
+> **You do not need a computer to get `TG_STRING_SESSION`.** Once the bot is
+> connected (even briefly), open its dashboard → **Account** →
+> **🔑 Get Session String**. It sends you a `.txt` file plus the string inline.
+> Copy the file's value verbatim into the host's **Environment** tab as
+> `TG_STRING_SESSION`. From then on the bot starts already logged in and there is
+> no code to lose. (A terminal alternative is `python tools/make_session.py`.)
+
+> **The bot now keeps itself awake.** Free services sleep after 15 minutes without
+> *inbound* HTTP, and Telegram polling is outbound — so the bot used to be spun
+> down while doing its job. It now pings its own public `/health` every 10 minutes
+> (`KEEPALIVE_PING_SECONDS`, default 600; set `0` to disable). Set `PUBLIC_URL` if
+> the host does not provide `RENDER_EXTERNAL_URL`. Note that keeping a free
+> instance awake consumes its 750 monthly instance hours, which covers ~31 days of
+> one service — enough for a single always-on bot.
+
 > **The blueprint does not ask for your Telegram API ID and Hash.** Those are
 > **not** environment variables in `render.yaml`, so a blueprint deploy leaves them
 > unset and the bot will ask for them in the wizard (Step 1). Enter them from
