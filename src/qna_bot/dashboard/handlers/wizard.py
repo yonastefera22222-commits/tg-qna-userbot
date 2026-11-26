@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -12,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ...ai.providers import PROVIDERS, fetch_live_models
-from ...userbot.login import CodeDelivery, LoginStatus
+from ...userbot.login import CodeDelivery, LoginStatus, PhoneIssue, parse_phone
 from ..context import AppContext, safe_delete_message, safe_edit_text
 from ..filters import NotACommand
 from ..keyboards import (
@@ -316,8 +317,18 @@ async def msg_api_hash(message: Message, ctx: AppContext, state: FSMContext) -> 
 
 @router.callback_query(F.data == "wiz:login_method")
 async def cb_login_method(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
+    """Show the login options WITHOUT silently killing a live attempt.
+
+    This used to cancel the pending login and clear the state unconditionally.
+    Because "Login Options" is the back button on several screens - and every
+    failure screen offers it - merely looking at the options destroyed whatever
+    the owner had already done, so the next message arrived with nothing waiting
+    for it and got "I am not waiting for any input right now".
+
+    Choosing a method is a deliberate act: that button releases any previous
+    attempt before starting its own.
+    """
     await callback.answer()
-    await ctx.userbot.cancel_pending_login()
     await state.set_state(None)
     await safe_edit_text(
         callback,
@@ -330,8 +341,11 @@ async def cb_login_method(callback: CallbackQuery, ctx: AppContext, state: FSMCo
 
 
 @router.callback_query(F.data == "wiz:login_phone")
-async def cb_login_phone(callback: CallbackQuery, state: FSMContext) -> None:
+async def cb_login_phone(callback: CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
     await callback.answer()
+    # Starting the phone flow over: drop any previous attempt so its temporary
+    # client does not linger and hold an old phone_code_hash.
+    await ctx.userbot.cancel_pending_login()
     await state.set_state(WizardStates.waiting_phone)
     await safe_edit_text(
         callback,
@@ -1475,6 +1489,23 @@ async def msg_any_fallback(message: Message, ctx: AppContext, state: FSMContext)
     text = (message.text or "").strip()
 
     if current is None:
+        # A phone number typed into an empty conversation is not "input while not
+        # waiting" - it is someone in the middle of the login whose step got lost.
+        # This happened every time the owner reached the phone prompt through
+        # "Login Options" / "Try Again": those handlers set the state to None, so
+        # the number arrived with nothing waiting for it and was answered with a
+        # shrug. Recover instead of lecturing: recognise the number, restore the
+        # step, and continue exactly as if the button had just been pressed.
+        parsed = parse_phone(text)
+        if parsed.issue in (
+            PhoneIssue.OK,
+            PhoneIssue.TOO_SHORT,
+            PhoneIssue.TOO_LONG,
+        ) or re.fullmatch(r"\+?\d{7,15}", re.sub(r"[^\d+]", "", text) or ""):
+            await state.set_state(WizardStates.waiting_phone)
+            await msg_phone(message, ctx, state)
+            return
+
         hint = (
             "Send /start to open the dashboard."
             if has_session
