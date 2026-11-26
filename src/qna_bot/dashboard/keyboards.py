@@ -99,12 +99,14 @@ def otp_keypad_kb(current_digits: str) -> InlineKeyboardMarkup:
     )
     b.button(text="🔄 Resend Code", callback_data="otp:resend")
     b.button(text="❓ No code received?", callback_data="otp:help")
+    # The route that cannot fail to deliver, next to the ones that can.
+    b.button(text="📷 Use QR Login Instead", callback_data="wiz:login_qr")
     # The dead end this fixes: when no code ever arrives, the keypad used to
     # offer only "resend" and "cancel". One tap now switches the *channel* to
     # email, which Telegram still delivers to third-party apps.
     b.button(text="📧 No code coming? Get it by email", callback_data="wiz:emailcode")
     b.button(text="❌ Cancel", callback_data="wiz:login_method")
-    b.adjust(3, 3, 3, 3, 1, 2, 1, 1)
+    b.adjust(3, 3, 3, 3, 1, 2, 1, 1, 1)
     return b.as_markup()
 
 
