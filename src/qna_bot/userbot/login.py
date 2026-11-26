@@ -71,7 +71,7 @@ from telethon.tl.functions.account import (
     SendVerifyEmailCodeRequest,
     VerifyEmailRequest,
 )
-from telethon.tl.functions.auth import ResendCodeRequest, SendCodeRequest
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.types import CodeSettings
 from telethon.tl.types import auth as auth_types
 
@@ -667,36 +667,6 @@ def code_settings() -> CodeSettings | None:
         return None
 
 
-async def _request_login_code(client: TelegramClient, phone: str):
-    """``send_code_request`` with the delivery flags set explicitly.
-
-    Falls back to Telethon's own helper (all flags unset) only when the explicit
-    request cannot be built, so behaviour is never worse than before.
-    """
-    settings = code_settings()
-    api_id = getattr(client, "api_id", None)
-    api_hash = getattr(client, "api_hash", None)
-    # Only a real client is asked directly. Anything else (a stand-in, or a wrapper
-    # without api credentials) keeps using Telethon's own helper.
-    if settings is None or api_id is None or api_hash is None or not isinstance(client, TelegramClient):
-        return await client.send_code_request(phone)
-    sent = await client(
-        SendCodeRequest(
-            phone_number=phone,
-            api_id=api_id,
-            api_hash=api_hash,
-            settings=settings,
-        )
-    )
-    if isinstance(sent, auth_types.SentCodeSuccess):  # pragma: no cover - API contract
-        raise RuntimeError("Telegram logged in without asking for a code")
-    # Keep Telethon's own bookkeeping in step: later calls read this cache.
-    if sent.phone_code_hash:
-        client._phone_code_hash[phone] = sent.phone_code_hash
-    return sent
-
-
-
 def make_login_client(api_id: int, api_hash: str, session: StringSession | None = None) -> TelegramClient:
     """Create a temporary Telethon client configured for interactive login.
 
@@ -726,19 +696,6 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
 # ---------------------------------------------------------------------------
 # The login session itself
 # ---------------------------------------------------------------------------
-
-
-#: Sent to the owner when Telegram insists on the in-app channel, which is the
-#: one that commonly delivers nothing to a third-party client.
-_APP_CHANNEL_NOTICE = (
-    "📨 <b>Where your login code is</b>\n\n"
-    "Telegram chose to deliver it <b>inside the Telegram app</b> — as a message in "
-    "the <b>“Telegram” service chat</b> (blue shield ✓) of the account that already "
-    "has this number, and it may show a <b>“Confirm login”</b> button instead of "
-    "digits.\n\n"
-    "It is <b>not</b> an SMS. If that chat stays empty, tap <b>🔄 Resend Code</b> "
-    "or use the QR login."
-)
 
 
 class PhoneLoginSession:
@@ -873,72 +830,6 @@ class PhoneLoginSession:
         if not client.is_connected():
             await client.connect()
 
-    async def escalate_after_app_channel(self, delivery: CodeDelivery) -> None:
-        """Move the code off Telegram's in-app channel automatically.
-
-        ``SentCodeTypeApp`` means Telegram chose to put the login code in the
-        *service chat of another logged-in session*, and offers no SMS or call in
-        that answer. That is the channel with the known silent-withholding problem
-        (Telethon #4730): the request succeeds, the hash is valid, and nothing ever
-        arrives. Asking the owner to tap Resend is the wrong remedy - Telegram
-        nominates that other channel itself in ``auth.sentCode.next_type``, and a
-        single ``auth.resendCode`` is exactly how you accept the offer.
-
-        So: resend once, immediately. The new code goes to the channel Telegram
-        nominated (usually SMS, sometimes a call) instead of the one that silently
-        drops it. The attempt is *not* restarted, so the hash stays valid and the
-        first code remains usable. Deliberately one shot and silent - a second
-        request would be rate-limited and would invalidate the first code.
-        """
-        pending = self._pending
-        if pending is None:
-            return
-        if delivery.channel is not DeliveryChannel.TELEGRAM_APP:
-            return
-        if pending.channel_escalated:
-            return
-        if delivery.next_channel is None:
-            # Telegram named no other channel in ``next_type``, so a resend would
-            # not move the code anywhere - it would only burn a rate limit. Say
-            # where the code went instead.
-            pending.channel_escalated = True
-            await self._tell_owner(_APP_CHANNEL_NOTICE)
-            return
-        pending.channel_escalated = True
-
-        previous = delivery.channel
-        try:
-            pending.touch()
-            sent = await pending.client(
-                ResendCodeRequest(pending.phone, pending.phone_code_hash)
-            )
-        except Exception as exc:
-            # Keep the original attempt intact; the owner still has the first code
-            # if Telegram did deliver it, and can resend by hand later.
-            logger.info("Automatic channel switch off the app channel failed: %s", exc)
-            await self._tell_owner(
-                "⚠️ <b>Telegram put the login code inside the Telegram app</b> "
-                "(the channel that commonly delivers nothing). I tried to move it to "
-                "SMS automatically, but Telegram refused.\n\n"
-                "Tap <b>🔄 Resend Code</b> to try the next channel, or use the QR "
-                "login — it needs no code at all."
-            )
-            return
-
-        new_delivery = describe_delivery(sent)
-        pending.phone_code_hash = getattr(sent, "phone_code_hash", "") or pending.phone_code_hash
-        pending.delivery = new_delivery
-        pending.code_length = new_delivery.length or pending.code_length
-        pending.resend_count += 1
-        await self._save()
-        logger.info(
-            "Code channel switched %s -> %s after Telegram chose the in-app channel",
-            previous,
-            new_delivery.channel,
-        )
-        if new_delivery.channel is DeliveryChannel.TELEGRAM_APP:
-            await self._tell_owner(_APP_CHANNEL_NOTICE)
-
     # -- step 1: phone -> code -----------------------------------------
     async def request_code(self, api_id: int, api_hash: str, raw_phone: str) -> LoginResult:
         """Validate the number, request a code and record where it was delivered."""
@@ -950,7 +841,7 @@ class PhoneLoginSession:
         client = make_login_client(api_id, api_hash)
         try:
             await client.connect()
-            sent = await _request_login_code(client, parsed.e164)
+            sent = await client.send_code_request(parsed.e164)
         except Exception as exc:
             try:
                 await client.disconnect()
@@ -974,11 +865,6 @@ class PhoneLoginSession:
             )
         )
         await self._start_keepalive(client)
-        # If Telegram picked the in-app channel, take the offer it made in
-        # ``next_type`` and resend onto that channel now - before the owner is told
-        # to go looking in a place the code never reaches.
-        await self.escalate_after_app_channel(delivery)
-        delivery = self._pending.delivery if self._pending else delivery
         await self._save()
         logger.info(
             "Login code requested for %s via %s (length=%s, email_setup_required=%s)",
@@ -1318,7 +1204,7 @@ class PhoneLoginSession:
 
         # 2) Fallback: brand new request from the same (still connected) client.
         try:
-            sent = await _request_login_code(pending.client, pending.phone)
+            sent = await pending.client.send_code_request(pending.phone)
         except Exception as exc:
             logger.warning("Fresh send_code_request failed for %s: %s", pending.phone, exc)
             return translate_send_error(exc, pending.phone)
@@ -1399,7 +1285,7 @@ class PhoneLoginSession:
             return translate_signin_error(PhoneCodeExpiredError(request=None))
 
         try:
-            sent = await _request_login_code(pending.client, pending.phone)
+            sent = await pending.client.send_code_request(pending.phone)
         except Exception as exc:
             return translate_send_error(exc, pending.phone)
 
