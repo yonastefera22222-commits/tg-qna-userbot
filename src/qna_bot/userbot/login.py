@@ -296,18 +296,6 @@ def describe_next_channel(next_type: object) -> DeliveryChannel | None:
     return None
 
 
-def _resumed_title(channel: DeliveryChannel) -> str:
-    """Fallback title when a snapshot only remembers the channel."""
-    return {
-        DeliveryChannel.TELEGRAM_APP: "Code sent inside Telegram",
-        DeliveryChannel.SMS: "Code sent by SMS",
-        DeliveryChannel.CALL: "Code delivered by phone call",
-        DeliveryChannel.FLASH_CALL: "Code delivered by flash call",
-        DeliveryChannel.MISSED_CALL: "Code delivered by missed call",
-        DeliveryChannel.EMAIL: "Code sent by email",
-    }.get(channel, "Code requested from Telegram")
-
-
 def describe_delivery(sent: object) -> CodeDelivery:
     """Turn a Telethon ``auth.SentCode`` into precise, actionable UI text.
 
@@ -476,13 +464,6 @@ class PendingLogin:
     #: Telegram said 2FA is needed; ``sign_in(password=...)`` will complete the login.
     code_verified: bool = False
     resend_count: int = 0
-    #: Retries of the *same* code against a refreshed hash. Separate from
-    #: ``resend_count`` so a stale hash cannot exhaust the resend budget (or be
-    #: exhausted by it) - that conflation permanently failed correct codes.
-    hash_retries: int = 0
-    #: How many times the owner has typed a code Telegram rejected. Used only to
-    #: stop an endless guessing loop, not to give up early.
-    code_attempts: int = 0
     code_length: int | None = None
     #: Telegram refused to send any code until a "login email" is set up
     #: (``SentCodeTypeSetUpEmailRequired``). Until this is cleared, *no* code will
@@ -493,31 +474,11 @@ class PendingLogin:
     #: The owner explicitly asked for the code by email, and Telegram agreed.
     #: From then on the delivery channel is the inbox, not the app.
     email_login_requested: bool = False
-    #: The channel Telegram said it would use *next* (``auth.sentCode.next_type``).
-    #: Kept so a resend can escalate deliberately rather than hoping the channel
-    #: the owner is already waiting on suddenly starts working.
-    next_channel: DeliveryChannel | None = None
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
-
-    @property
-    def should_escalate(self) -> bool:
-        """True when the channel that told us nothing should be abandoned.
-
-        Two consecutive silent failures is the signal: one miss is a slow SMS, two
-        means this channel is not going to deliver. Continuing to press Resend on
-        the same channel is what makes an OTP look permanently broken - which is
-        exactly the report this exists to answer.
-        """
-        return self.resend_count >= ESCALATE_AFTER_SILENT_RESENDS
-
-    @property
-    def exhausted(self) -> bool:
-        """True when every automatic route has been tried and failed."""
-        return self.resend_count >= GIVE_UP_AFTER_SILENT_RESENDS
 
 
 # ---------------------------------------------------------------------------
@@ -684,20 +645,6 @@ def translate_signin_error(exc: Exception) -> LoginResult:
 #:
 #: The values are deliberately a plain, widely-installed Android build rather
 #: than anything unusual, and they are used only for the *login* connection.
-#: How many resends to tolerate on a channel that produces no code before moving
-#: to the next one. One miss is a slow SMS; two means the channel is dead for this
-#: account, and Telegram's own fallback (``next_type``) is the right answer.
-#: Telegram login codes are short-lived (and ``auth.sentCode.timeout`` is the
-#: resend cooldown, not a lifetime). Reviving an attempt older than this would
-#: hand the owner a code prompt whose code has already expired, so the resume is
-#: refused and the wizard honestly asks for the number again.
-RESUMABLE_LOGIN_SECONDS = 15 * 60
-
-ESCALATE_AFTER_SILENT_RESENDS = 2
-#: After this many, resending automatically is pointless: the honest options are a
-#: different channel (email), QR login, or waiting out the flood window.
-GIVE_UP_AFTER_SILENT_RESENDS = 5
-
 DEVICE_MODEL = "Pixel 6"
 SYSTEM_VERSION = "SDK 33"
 APP_VERSION = "10.2.0 (4300)"
@@ -738,23 +685,6 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
 # ---------------------------------------------------------------------------
 
 
-def _sync_client_hash(client: TelegramClient, phone: str, phone_code_hash: str) -> None:
-    """Teach Telethon's client the hash we are about to use.
-
-    ``client.sign_in(phone, code, phone_code_hash=...)`` does use the value we
-    pass - but everything else in the client reads its own
-    ``_phone_code_hash[phone]`` cache, and Telethon *keeps* an old hash there
-    rather than replacing it (see ``send_code_request``: it only stores the hash
-    if one is not already present). After a resume, a resend, or a reconnect, the
-    two can disagree, and the mismatch surfaces as "code expired" for a code that
-    is perfectly valid.
-    """
-    try:
-        client._phone_code_hash[phone] = phone_code_hash
-    except Exception:  # pragma: no cover - private attribute, but stable since 1.x
-        logger.debug("Could not align the client's phone_code_hash cache.")
-
-
 class PhoneLoginSession:
     """Owns the temporary Telethon client for the whole phone → code → 2FA flow.
 
@@ -764,14 +694,6 @@ class PhoneLoginSession:
 
     #: How many times we transparently request a *fresh* code before giving up.
     MAX_AUTO_RESENDS = 2
-    #: How many times a single code is retried against a freshly fetched hash. The
-    #: previous behaviour returned "login code expired" immediately once two
-    #: resends had been used, even when the digits were correct and the only stale
-    #: part was the hash.
-    MAX_HASH_RETRIES = 2
-    #: Telegram allows a handful of wrong guesses before it kills the attempt, so
-    #: stop before the owner burns through it.
-    MAX_CODE_ATTEMPTS = 3
 
     def __init__(self, *, keepalive_interval: float = 20.0) -> None:
         self._pending: PendingLogin | None = None
@@ -794,37 +716,16 @@ class PhoneLoginSession:
         pending = self._pending
         if pending is None:
             return None
-        # The session string is the point of this snapshot, and it used to be
-        # missing: the saved attempt held a ``phone_code_hash`` that Telegram
-        # accepts only from the auth key that requested it, while the key lived in
-        # a Telethon client in RAM. On Render Free — which sleeps after 15 minutes
-        # and redeploys on every push — the process is routinely replaced between
-        # "send my number" and "here is the code", so the code the owner received
-        # was guaranteed to be rejected by "No login session is active". That made
-        # the login look permanently broken after a deployment move, and the boot
-        # routine then deleted the attempt as "stale".
-        #
-        # Telethon writes the auth key into ``session`` as soon as the client
-        # connects, so exporting the string on every save keeps the attempt
-        # resumable. api_hash is still excluded: it is already stored encrypted
-        # under ``tg_api_hash``.
-        try:
-            session_str = pending.client.session.save()
-        except Exception:  # pragma: no cover - never let a snapshot break a login
-            session_str = ""
+        # Deliberately excludes api_hash: it is already stored (encrypted) under
+        # ``tg_api_hash``, and a restarted process can never resume this attempt
+        # anyway because Telegram binds the hash to the old auth key.
         return {
             "phone": pending.phone,
             "phone_code_hash": pending.phone_code_hash,
             "code_verified": pending.code_verified,
             "code_length": pending.code_length,
             "resend_count": pending.resend_count,
-            "hash_retries": pending.hash_retries,
-            "code_attempts": pending.code_attempts,
             "delivery_channel": pending.delivery.channel.value if pending.delivery else None,
-            "delivery_title": pending.delivery.title if pending.delivery else None,
-            "delivery_detail": pending.delivery.detail if pending.delivery else None,
-            "next_channel": pending.next_channel.value if pending.next_channel else None,
-            "session": session_str,
             "saved_at": time.time(),
         }
 
@@ -867,74 +768,6 @@ class PhoneLoginSession:
                 await pending.client.disconnect()
             except Exception:  # pragma: no cover - best effort cleanup
                 pass
-
-    async def restore(
-        self,
-        snapshot: dict[str, object] | None,
-        api_id: int = 0,
-        api_hash: str = "",
-    ) -> bool:
-        """Rebuild the pending attempt saved by a previous process.
-
-        Returns False when the snapshot cannot produce a usable client, which is
-        the honest answer rather than raising during boot. Called instead of
-        discarding the attempt, because with the session string the auth key is
-        intact: Telegram will accept the ``phone_code_hash`` that key requested,
-        so the code already in the owner's Telegram app still works.
-        """
-        if not snapshot:
-            return False
-        phone = str(snapshot.get("phone") or "")
-        code_hash = str(snapshot.get("phone_code_hash") or "")
-        session_str = str(snapshot.get("session") or "")
-        if not (phone and code_hash and session_str):
-            # An older snapshot predates the session field; nothing to resume.
-            return False
-        saved_at = snapshot.get("saved_at")
-        if isinstance(saved_at, (int, float)):
-            age = time.time() - float(saved_at)
-            if age > RESUMABLE_LOGIN_SECONDS:
-                logger.info(
-                    "Saved login attempt is %ds old (limit %ds); not resuming it.",
-                    int(age),
-                    RESUMABLE_LOGIN_SECONDS,
-                )
-                return False
-        try:
-            client = make_login_client(api_id, api_hash, session=StringSession(session_str))
-        except Exception as exc:
-            logger.warning("Could not rebuild the saved login attempt: %s", exc)
-            return False
-        channel = None
-        raw_channel = snapshot.get("delivery_channel")
-        if raw_channel:
-            try:
-                channel = DeliveryChannel(str(raw_channel))
-            except ValueError:
-                channel = None
-        self._set_pending(
-            PendingLogin(
-                client=client,
-                api_id=int(api_id),
-                api_hash=api_hash,
-                phone=phone,
-                phone_code_hash=code_hash,
-                delivery=None,
-                code_length=snapshot.get("code_length") if isinstance(snapshot.get("code_length"), int) else None,
-                code_verified=bool(snapshot.get("code_verified")),
-                resend_count=int(snapshot.get("resend_count") or 0),
-                hash_retries=int(snapshot.get("hash_retries") or 0),
-                code_attempts=int(snapshot.get("code_attempts") or 0),
-            )
-        )
-        if channel is not None:
-            self._pending.delivery = CodeDelivery(
-                channel,
-                str(snapshot.get("delivery_title") or _resumed_title(channel)),
-                str(snapshot.get("delivery_detail") or ""),
-                self._pending.code_length,
-            )
-        return True
 
     async def _start_keepalive(self, client: TelegramClient) -> None:
         """Keep the temporary login connection alive while the owner types the code.
@@ -1000,13 +833,10 @@ class PhoneLoginSession:
                 phone_code_hash=sent.phone_code_hash,
                 delivery=delivery,
                 code_length=delivery.length,
-                next_channel=delivery.next_channel,
                 email_setup_required=blocked,
             )
         )
         await self._start_keepalive(client)
-        # Saving here is what makes the attempt survive a restart: the auth key is
-        # in the session string from the moment the client connected.
         await self._save()
         logger.info(
             "Login code requested for %s via %s (length=%s, email_setup_required=%s)",
@@ -1318,53 +1148,21 @@ class PhoneLoginSession:
         if pending is None:
             return LoginResult(LoginStatus.ERROR, "No login in progress. Send your phone number again.")
 
-        # Checked before any network work: an attempt that has exhausted every
-        # channel must not touch Telegram again, because each extra request extends
-        # the flood window that is the actual problem. This is the loop that makes
-        # an OTP look permanently broken.
-        if pending.exhausted:
-            return LoginResult(
-                LoginStatus.ERROR,
-                "⛔ Telegram has stopped delivering codes to this account on every "
-                "channel tried. Resending again will not help. Use <b>📷 QR Login</b> "
-                "(no code needed) or <b>📧 Get the code by email</b>, or wait out the "
-                "rate limit - repeated requests extend it.",
-            )
-
         pending.touch()
         await self._ensure_connected(pending.client)
 
         # 1) Preferred: Telegram's own "resend the same attempt" endpoint.
         try:
-            previous = pending.delivery
             sent = await pending.client(ResendCodeRequest(pending.phone, pending.phone_code_hash))
             pending.resend_count += 1
             delivery = describe_delivery(sent)
             pending.phone_code_hash = getattr(sent, "phone_code_hash", "") or pending.phone_code_hash
-            _sync_client_hash(pending.client, pending.phone, pending.phone_code_hash)
-            previous_channel = previous.channel if previous else None
             pending.delivery = delivery
             pending.code_length = delivery.length or pending.code_length
-            pending.next_channel = delivery.next_channel
             await self._save()
-            note = ""
-            if pending.should_escalate and delivery.channel is previous_channel:
-                # Same channel again after two misses. Tell the owner rather than
-                # letting them wait on it a third time.
-                alt = delivery.next_channel
-                note = (
-                    "\n\n⚠️ That is the same channel again and the previous codes did "
-                    "not arrive. "
-                    + (
-                        f"Tap 🔄 Resend once more and Telegram should switch to "
-                        f"<b>{alt.value.replace('_', ' ')}</b>."
-                        if alt
-                        else "Try <b>📷 QR Login</b> or <b>📧 Get the code by email</b>."
-                    )
-                )
             return LoginResult(
                 LoginStatus.CODE_SENT,
-                f"New code requested — {delivery.title}.{note}",
+                f"New code requested — {delivery.title}.",
                 delivery=delivery,
             )
         except (PhoneCodeExpiredError, PhoneCodeHashEmptyError, SendCodeUnavailableError) as exc:
@@ -1385,10 +1183,8 @@ class PhoneLoginSession:
 
         delivery = describe_delivery(sent)
         pending.phone_code_hash = sent.phone_code_hash
-        _sync_client_hash(pending.client, pending.phone, sent.phone_code_hash)
         pending.delivery = delivery
         pending.code_length = delivery.length or pending.code_length
-        pending.next_channel = delivery.next_channel
         pending.resend_count += 1
         await self._save()
         return LoginResult(
@@ -1422,7 +1218,6 @@ class PhoneLoginSession:
 
         pending.touch()
         await self._ensure_connected(pending.client)
-        _sync_client_hash(pending.client, pending.phone, pending.phone_code_hash)
 
         try:
             await pending.client.sign_in(
@@ -1442,26 +1237,7 @@ class PhoneLoginSession:
             return await self._recover_stale_hash(digits)
         except (PhoneCodeInvalidError, CodeInvalidError) as exc:
             logger.info("Invalid code entered for %s: %s", pending.phone, exc)
-            # Keep the attempt: the hash did not fail, the digits did. The wizard
-            # renders a keypad for exactly this, so the owner can clear and retype
-            # without restarting the whole login.
-            pending.code_attempts += 1
-            if pending.code_attempts >= self.MAX_CODE_ATTEMPTS:
-                return LoginResult(
-                    LoginStatus.ERROR,
-                    "❌ That code has been rejected "
-                    f"<b>{pending.code_attempts}</b> times. Tap 🔄 Resend Code and "
-                    "enter the newest code — Telegram invalidates older ones as soon "
-                    "as it sends a new one.",
-                    delivery=pending.delivery,
-                )
-            return LoginResult(
-                LoginStatus.ERROR,
-                "❌ That code was not accepted. Check the digits (leading zeros count) "
-                "and tap ✅ Submit again — the login is still open, you do not need a "
-                "new code yet.",
-                delivery=pending.delivery,
-            )
+            return translate_signin_error(exc)
         except Exception as exc:
             logger.warning("sign_in failed for %s: %s", pending.phone, exc)
             return translate_signin_error(exc)
@@ -1477,39 +1253,17 @@ class PhoneLoginSession:
         """
         pending = self._pending
         assert pending is not None
-        # Retry budget is separate from the resend budget: a stale hash is not the
-        # same problem as "Telegram never delivered anything", and using one
-        # counter for both made a correct code fail for good after two resends.
-        if pending.hash_retries >= self.MAX_HASH_RETRIES:
-            return LoginResult(
-                LoginStatus.ERROR,
-                "⌛ That code can no longer be used — this login attempt got out of "
-                "step with Telegram. Tap 🔄 Resend Code, then enter the <b>new</b> "
-                "code as soon as it arrives.",
-            )
+        if pending.resend_count >= self.MAX_AUTO_RESENDS:
+            return translate_signin_error(PhoneCodeExpiredError(request=None))
 
         try:
             sent = await pending.client.send_code_request(pending.phone)
         except Exception as exc:
             return translate_send_error(exc, pending.phone)
 
-        pending.hash_retries += 1
         pending.phone_code_hash = sent.phone_code_hash
-        _sync_client_hash(pending.client, pending.phone, sent.phone_code_hash)
-        previous_channel = pending.delivery.channel if pending.delivery else None
         pending.delivery = describe_delivery(sent)
-        pending.next_channel = pending.delivery.next_channel
-        if previous_channel is not None and pending.delivery.channel is not previous_channel:
-            # Telegram switched channel, so the digits the owner is holding came
-            # from a different message and will not match this attempt. Asking
-            # them to re-enter the same code would just fail again.
-            return LoginResult(
-                LoginStatus.CODE_SENT,
-                f"📨 Telegram sent a <b>new</b> code — {pending.delivery.title}.\n\n"
-                "Enter <b>that</b> code (the earlier one belonged to the previous "
-                "attempt).",
-                delivery=pending.delivery,
-            )
+        pending.resend_count += 1
 
         try:
             await pending.client.sign_in(

@@ -48,10 +48,6 @@ class SQLiteStorage(BaseStorage):
         self._db_path = db_path
         self._ttl_seconds = ttl_seconds
         self._conn: aiosqlite.Connection | None = None
-        #: When the last TTL sweep ran. ``0.0`` means "never", so the first write
-        #: performs one immediately and a table left over from an old deployment
-        #: is cleaned as soon as the bot starts using it.
-        self._last_gc = 0.0
 
     async def _connection(self) -> aiosqlite.Connection:
         if self._conn is None:
@@ -157,19 +153,8 @@ class SQLiteStorage(BaseStorage):
         return await cursor.fetchone()
 
     async def _maybe_gc(self, conn: aiosqlite.Connection, now: float) -> None:
-        """Drop wizard state older than the TTL, at most once a minute.
-
-        The throttle used to be ``int(now) % 60 != 0``, which only runs GC when the
-        clock happens to land exactly on a whole minute - roughly a 1-in-60 chance
-        per write, and never on the write that follows a quiet period. So the table
-        grew unbounded, and a *stale* state could survive far longer than the TTL,
-        resuming a wizard step the owner had abandoned days earlier.
-
-        A monotonic timestamp of the last sweep is both correct and cheap.
-        """
-        if now - self._last_gc < 60:
+        if int(now) % 60 != 0:  # cheap throttle: run at most once a minute
             return
-        self._last_gc = now
-        cutoff = now - self._ttl_seconds
+        cutoff = time.time() - self._ttl_seconds
         await conn.execute("DELETE FROM fsm_states WHERE updated_at < ?", (cutoff,))
         await conn.commit()
