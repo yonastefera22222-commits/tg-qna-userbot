@@ -42,8 +42,6 @@ from datetime import UTC, date, datetime, timedelta
 
 import httpx
 
-from . import market_calendar as calendar
-from . import sessions as trading_sessions
 from .exness import (
     HISTORY_TIMEFRAME,
     QUOTE_CANDLE_COUNT,
@@ -394,17 +392,19 @@ _EXPLICIT_DAYS_RE = re.compile(
 )
 
 
-def _is_session(bar_time: datetime, *, market: calendar.MarketClass) -> bool:
-    """True when this daily bar is a real trading session for ``market``.
+def _is_session(bar_time: datetime, *, trades_weekends: bool) -> bool:
+    """True when this daily bar is a real trading session.
 
-    The weekend rule is not a property of the bar, it is a property of the
-    instrument: crypto settles every calendar day, while forex, metals and
-    indices are shut. Exness frequently still serves a Saturday/Sunday bar for a
-    shut market carrying Friday's close forward, and that bar must not be
-    counted - it would silently widen a five-session window to seven days and
-    make a weekend "high" equal Friday's close.
+    FX, metals and indices are shut at the weekend, so a Saturday/Sunday bar is
+    never a session - it is either absent, or present carrying Friday's close
+    forward (Exness does the latter for some instruments). Either way it does
+    not belong in "the last five days".
+
+    Crypto settles every calendar day, so for those the weekend is a session.
     """
-    return calendar.is_session(bar_time.date(), market)
+    if trades_weekends:
+        return True
+    return bar_time.weekday() < 5
 
 
 def _date_range(period: str, now: datetime) -> tuple[date, date] | None:
@@ -752,11 +752,9 @@ class MarketFeed:
 
         now = datetime.now(UTC)
         today = now.date()
-        # Which market this is decides whether weekend bars are sessions. This is
-        # a per-family fact (crypto settles 24/7; forex, metals and indices are
-        # shut), not a per-instrument guess, so it is asked once here.
-        market = calendar.market_class_for(instrument)
-        trades_weekends = market.trades_weekends
+        # Crypto settles 24/7, so its weekend bars are sessions; FX/metals/indices
+        # are shut, and a weekend bar there is Friday's close carried forward.
+        trades_weekends = instrument in _CRYPTO_SYMBOLS
 
         # Identify today's still-forming bar by *date*, not position: a bar can
         # be dropped for a null field, and the newest bar is not always today
@@ -773,7 +771,7 @@ class MarketFeed:
             # means by the phrase for that instrument.
             pool = [
                 b for b in completed
-                if _is_session(b[0], market=market)
+                if _is_session(b[0], trades_weekends=trades_weekends)
             ]
             if trades_weekends and today_bar is not None:
                 pool.append(today_bar)
@@ -785,7 +783,7 @@ class MarketFeed:
             if not trades_weekends:
                 selected = [
                     b for b in selected
-                    if b is today_bar or _is_session(b[0], market=market)
+                    if b is today_bar or _is_session(b[0], trades_weekends=False)
                 ]
             # A still-forming bar may bound "today" and "this week so far", but
             # it must never set "the high last week": it is not finished, and the
@@ -798,7 +796,7 @@ class MarketFeed:
                 # dropping the question - the only case outside the named window.
                 fallback = [
                     b for b in completed
-                    if _is_session(b[0], market=market)
+                    if _is_session(b[0], trades_weekends=trades_weekends)
                 ]
                 selected = fallback[-1:]
                 if not selected:
@@ -816,7 +814,7 @@ class MarketFeed:
         # happened in that window, so the honest answer is no data, not a
         # one-candle high dressed up as the week's.
         if query.period == "this_week" and not fallback_used and not trades_weekends:
-            sessions = [b for b in selected if _is_session(b[0], market=market)]
+            sessions = [b for b in selected if _is_session(b[0], trades_weekends=False)]
             if not sessions:
                 return None
 
@@ -939,23 +937,13 @@ class MarketFeed:
         if last is None:
             return None
 
-        now = datetime.now(UTC)
-        age_minutes = (now - last.time).total_seconds() / 60
-        # Whether the market is *open* is a calendar question, not an age
-        # question. Asking only about age marked Friday's close as live for the
-        # first few hours of Saturday, because the last tick was still recent
-        # enough - a shut market quoted as current, on the weekend, which is when
-        # these questions get asked. Age then decides only whether the number is
-        # still fresh enough to repeat while the market *is* open.
-        market = calendar.market_class_for(instrument)
-        shut_for_weekend = trading_sessions.is_closed_for_weekend(market, now)
-        fresh = age_minutes <= STALE_AFTER_MINUTES
+        age_minutes = (datetime.now(UTC) - last.time).total_seconds() / 60
         return Quote(
             instrument=instrument,
             price=last.close,
-            # Same number, different claim: a shut market's close is never the
-            # current price.
-            kind="live" if (fresh and not shut_for_weekend) else "market_closed",
+            # Past the stale window the market is shut and this is Friday's
+            # close, not a tick. Same number, different claim.
+            kind="live" if age_minutes <= STALE_AFTER_MINUTES else "market_closed",
             source="exness",
             as_of=last.time,
             decimals=_decimals_for(instrument),
