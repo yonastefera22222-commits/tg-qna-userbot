@@ -23,7 +23,7 @@ from qna_bot.userbot.login import make_login_client
 
 LOGIN_MODULE = pathlib.Path(__file__).resolve().parents[1] / "src/qna_bot/userbot/login.py"
 
-#: The client construction of the version that worked, as an AST signature.
+#: Transport kwargs the working client has always used.
 _WORKING_KEYWORDS = [
     "flood_sleep_threshold",
     "request_retries",
@@ -32,18 +32,24 @@ _WORKING_KEYWORDS = [
 ]
 
 
-def test_the_client_sends_no_impersonated_identity() -> None:
-    """Telegram must see Telethon's own identity, not a fake phone."""
+def test_the_client_uses_the_identity_telegram_has_accepted() -> None:
+    """Pin the device identity to the one visible as a working session.
+
+    The owner's Telegram "Other Devices" list shows "Pixel 6 / userbot 10.2.0"
+    (Ashburn = Render) - a session that only exists because a login *succeeded*
+    with it. Removing these parameters makes the client look like raw Telethon
+    from a datacenter IP instead, which is a different client to Telegram.
+    """
     client = make_login_client(12345, "a" * 32)
     init = client._init_request
 
-    lowered = f"{init.device_model} {init.system_version} {init.app_version}".lower()
-    for giveaway in ("pixel", "sdk 33", "10.2.0", "samsung", "sm-g"):
-        assert giveaway not in lowered, f"client is impersonating a device: {giveaway}"
+    assert init.device_model == "Pixel 6"
+    assert init.system_version == "SDK 33"
+    assert init.app_version == "10.2.0 (4300)"
 
 
-def test_the_client_is_constructed_exactly_as_it_was_when_it_worked() -> None:
-    """No extra client kwargs - they ride in every connection handshake."""
+def test_the_client_keeps_the_documented_transport_options() -> None:
+    """The transport kwargs must not be dropped while editing the identity."""
     source = LOGIN_MODULE.read_text()
     tree = ast.parse(source)
     factory = next(
@@ -56,7 +62,9 @@ def test_the_client_is_constructed_exactly_as_it_was_when_it_worked() -> None:
         for node in ast.walk(factory)
         if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "TelegramClient"
     )
-    assert [kw.arg for kw in call.keywords] == _WORKING_KEYWORDS
+    kwargs = [kw.arg for kw in call.keywords]
+    for required in _WORKING_KEYWORDS:
+        assert required in kwargs
 
 
 def test_the_first_code_request_uses_telethons_own_helper() -> None:

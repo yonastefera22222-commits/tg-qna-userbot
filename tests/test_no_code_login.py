@@ -356,25 +356,18 @@ def test_delivery_carries_next_channel_for_every_type() -> None:
         assert delivery.next_channel is DeliveryChannel.CALL
 
 
-def test_login_client_sends_no_impersonated_device_identity() -> None:
-    """The login client must NOT impersonate a phone.
+def test_login_client_uses_the_session_identity_telegram_accepts() -> None:
+    """The device identity is proven: it is in the owner's device list.
 
-    It briefly did (``device_model="Pixel 6"``, ``system_version="SDK 33"``,
-    ``app_version="10.2.0 (4300)"``) on the theory that a mobile profile helps
-    delivery. It does the opposite here: it is a combination no real device
-    produces - a three-year-old SDK announcing an app build that never existed,
-    from a datacenter IP - and logins that had been delivering codes stopped once
-    it was in place. The identity is Telethon's own again.
+    "Pixel 6 / userbot 10.2.0" from Ashburn is a session that exists only because
+    a login succeeded with this identity. It must stay.
     """
     from qna_bot.userbot.login import make_login_client
 
     client = make_login_client(12345, "abc")
-    # Never connected, so there is nothing to tear down; the identity Telegram
-    # actually sees is baked into the init-connection request.
     init = client._init_request
-    assert "pixel" not in str(init.device_model).lower()
-    assert "sdk 33" not in str(init.system_version).lower()
-    assert init.app_version != "10.2.0 (4300)"
+    assert init.device_model == "Pixel 6"
+    assert init.app_version == "10.2.0 (4300)"
 
 
 def test_email_login_is_the_primary_login_offer() -> None:

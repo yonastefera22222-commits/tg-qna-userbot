@@ -667,6 +667,16 @@ def code_settings() -> CodeSettings | None:
         return None
 
 
+#: The identity this userbot signs in with. Every one of these values is visible in
+#: the owner's own Telegram "Other Devices" list as a working session
+#: ("Pixel 6", "userbot 10.2.0"), so they are load-bearing, not decoration.
+DEVICE_MODEL = "Pixel 6"
+SYSTEM_VERSION = "SDK 33"
+APP_VERSION = "10.2.0 (4300)"
+LANG_CODE = "en"
+SYSTEM_LANG_CODE = "en-US"
+
+
 def make_login_client(api_id: int, api_hash: str, session: StringSession | None = None) -> TelegramClient:
     """Create a temporary Telethon client configured for interactive login.
 
@@ -676,11 +686,16 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
     ``request_retries`` is raised a little so flaky mobile-server connections do
     not abort a login the owner is halfway through.
 
-    The client announces itself exactly as Telethon does by default. It used to
-    impersonate an Android phone ("Pixel 6", "SDK 33", app build "10.2.0 (4300)");
-    that was removed because it is a fingerprint no real device produces - an old
-    SDK running an impossible app build, from a datacenter IP - and logins that had
-    been delivering codes stopped doing so once it was in place.
+    The device parameters are not cosmetic and must not be removed. They are the
+    identity this userbot has always signed in with, and the owner's own Telegram
+    "Other Devices" list shows the session it produced: Pixel 6 / userbot 10.2.0,
+    from Ashburn - Render's datacenter, i.e. this exact deployment. A session only
+    appears in that list after a *successful* login, so this identity, from that IP,
+    is demonstrably one Telegram accepts for this account.
+
+    Removing them makes the client announce itself as Telethon/Python from a
+    datacenter IP instead, which is a different - and apparently less welcome -
+    client for this account.
     """
     return TelegramClient(
         session or StringSession(),
@@ -690,6 +705,11 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
         request_retries=5,
         connection_retries=5,
         retry_delay=1,
+        device_model=DEVICE_MODEL,
+        system_version=SYSTEM_VERSION,
+        app_version=APP_VERSION,
+        lang_code=LANG_CODE,
+        system_lang_code=SYSTEM_LANG_CODE,
     )
 
 
