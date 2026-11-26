@@ -296,6 +296,18 @@ def describe_next_channel(next_type: object) -> DeliveryChannel | None:
     return None
 
 
+def _resumed_title(channel: DeliveryChannel) -> str:
+    """Fallback title when a snapshot only remembers the channel."""
+    return {
+        DeliveryChannel.TELEGRAM_APP: "Code sent inside Telegram",
+        DeliveryChannel.SMS: "Code sent by SMS",
+        DeliveryChannel.CALL: "Code delivered by phone call",
+        DeliveryChannel.FLASH_CALL: "Code delivered by flash call",
+        DeliveryChannel.MISSED_CALL: "Code delivered by missed call",
+        DeliveryChannel.EMAIL: "Code sent by email",
+    }.get(channel, "Code requested from Telegram")
+
+
 def describe_delivery(sent: object) -> CodeDelivery:
     """Turn a Telethon ``auth.SentCode`` into precise, actionable UI text.
 
@@ -668,6 +680,12 @@ def translate_signin_error(exc: Exception) -> LoginResult:
 #: How many resends to tolerate on a channel that produces no code before moving
 #: to the next one. One miss is a slow SMS; two means the channel is dead for this
 #: account, and Telegram's own fallback (``next_type``) is the right answer.
+#: Telegram login codes are short-lived (and ``auth.sentCode.timeout`` is the
+#: resend cooldown, not a lifetime). Reviving an attempt older than this would
+#: hand the owner a code prompt whose code has already expired, so the resume is
+#: refused and the wizard honestly asks for the number again.
+RESUMABLE_LOGIN_SECONDS = 15 * 60
+
 ESCALATE_AFTER_SILENT_RESENDS = 2
 #: After this many, resending automatically is pointless: the honest options are a
 #: different channel (email), QR login, or waiting out the flood window.
@@ -744,9 +762,24 @@ class PhoneLoginSession:
         pending = self._pending
         if pending is None:
             return None
-        # Deliberately excludes api_hash: it is already stored (encrypted) under
-        # ``tg_api_hash``, and a restarted process can never resume this attempt
-        # anyway because Telegram binds the hash to the old auth key.
+        # The session string is the point of this snapshot, and it used to be
+        # missing: the saved attempt held a ``phone_code_hash`` that Telegram
+        # accepts only from the auth key that requested it, while the key lived in
+        # a Telethon client in RAM. On Render Free — which sleeps after 15 minutes
+        # and redeploys on every push — the process is routinely replaced between
+        # "send my number" and "here is the code", so the code the owner received
+        # was guaranteed to be rejected by "No login session is active". That made
+        # the login look permanently broken after a deployment move, and the boot
+        # routine then deleted the attempt as "stale".
+        #
+        # Telethon writes the auth key into ``session`` as soon as the client
+        # connects, so exporting the string on every save keeps the attempt
+        # resumable. api_hash is still excluded: it is already stored encrypted
+        # under ``tg_api_hash``.
+        try:
+            session_str = pending.client.session.save()
+        except Exception:  # pragma: no cover - never let a snapshot break a login
+            session_str = ""
         return {
             "phone": pending.phone,
             "phone_code_hash": pending.phone_code_hash,
@@ -754,6 +787,10 @@ class PhoneLoginSession:
             "code_length": pending.code_length,
             "resend_count": pending.resend_count,
             "delivery_channel": pending.delivery.channel.value if pending.delivery else None,
+            "delivery_title": pending.delivery.title if pending.delivery else None,
+            "delivery_detail": pending.delivery.detail if pending.delivery else None,
+            "next_channel": pending.next_channel.value if pending.next_channel else None,
+            "session": session_str,
             "saved_at": time.time(),
         }
 
@@ -796,6 +833,72 @@ class PhoneLoginSession:
                 await pending.client.disconnect()
             except Exception:  # pragma: no cover - best effort cleanup
                 pass
+
+    async def restore(
+        self,
+        snapshot: dict[str, object] | None,
+        api_id: int = 0,
+        api_hash: str = "",
+    ) -> bool:
+        """Rebuild the pending attempt saved by a previous process.
+
+        Returns False when the snapshot cannot produce a usable client, which is
+        the honest answer rather than raising during boot. Called instead of
+        discarding the attempt, because with the session string the auth key is
+        intact: Telegram will accept the ``phone_code_hash`` that key requested,
+        so the code already in the owner's Telegram app still works.
+        """
+        if not snapshot:
+            return False
+        phone = str(snapshot.get("phone") or "")
+        code_hash = str(snapshot.get("phone_code_hash") or "")
+        session_str = str(snapshot.get("session") or "")
+        if not (phone and code_hash and session_str):
+            # An older snapshot predates the session field; nothing to resume.
+            return False
+        saved_at = snapshot.get("saved_at")
+        if isinstance(saved_at, (int, float)):
+            age = time.time() - float(saved_at)
+            if age > RESUMABLE_LOGIN_SECONDS:
+                logger.info(
+                    "Saved login attempt is %ds old (limit %ds); not resuming it.",
+                    int(age),
+                    RESUMABLE_LOGIN_SECONDS,
+                )
+                return False
+        try:
+            client = make_login_client(api_id, api_hash, session=StringSession(session_str))
+        except Exception as exc:
+            logger.warning("Could not rebuild the saved login attempt: %s", exc)
+            return False
+        channel = None
+        raw_channel = snapshot.get("delivery_channel")
+        if raw_channel:
+            try:
+                channel = DeliveryChannel(str(raw_channel))
+            except ValueError:
+                channel = None
+        self._set_pending(
+            PendingLogin(
+                client=client,
+                api_id=int(api_id),
+                api_hash=api_hash,
+                phone=phone,
+                phone_code_hash=code_hash,
+                delivery=None,
+                code_length=snapshot.get("code_length") if isinstance(snapshot.get("code_length"), int) else None,
+                code_verified=bool(snapshot.get("code_verified")),
+                resend_count=int(snapshot.get("resend_count") or 0),
+            )
+        )
+        if channel is not None:
+            self._pending.delivery = CodeDelivery(
+                channel,
+                str(snapshot.get("delivery_title") or _resumed_title(channel)),
+                str(snapshot.get("delivery_detail") or ""),
+                self._pending.code_length,
+            )
+        return True
 
     async def _start_keepalive(self, client: TelegramClient) -> None:
         """Keep the temporary login connection alive while the owner types the code.
@@ -866,6 +969,8 @@ class PhoneLoginSession:
             )
         )
         await self._start_keepalive(client)
+        # Saving here is what makes the attempt survive a restart: the auth key is
+        # in the session string from the moment the client connected.
         await self._save()
         logger.info(
             "Login code requested for %s via %s (length=%s, email_setup_required=%s)",
