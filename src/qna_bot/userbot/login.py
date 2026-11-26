@@ -79,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 PersistCallback = Callable[[dict[str, object] | None], Awaitable[None]]
 ClearCallback = Callable[[], Awaitable[None]]
+NotifyCallback = Callable[[str], Awaitable[None]]
 
 # ---------------------------------------------------------------------------
 # Phone number normalisation / validation
@@ -475,6 +476,8 @@ class PendingLogin:
     #: The owner explicitly asked for the code by email, and Telegram agreed.
     #: From then on the delivery channel is the inbox, not the app.
     email_login_requested: bool = False
+    #: We already moved this attempt off the in-app channel once (one shot only).
+    channel_escalated: bool = False
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
 
@@ -747,6 +750,19 @@ def make_login_client(api_id: int, api_hash: str, session: StringSession | None 
 # ---------------------------------------------------------------------------
 
 
+#: Sent to the owner when Telegram insists on the in-app channel, which is the
+#: one that commonly delivers nothing to a third-party client.
+_APP_CHANNEL_NOTICE = (
+    "📨 <b>Where your login code is</b>\n\n"
+    "Telegram chose to deliver it <b>inside the Telegram app</b> — as a message in "
+    "the <b>“Telegram” service chat</b> (blue shield ✓) of the account that already "
+    "has this number, and it may show a <b>“Confirm login”</b> button instead of "
+    "digits.\n\n"
+    "It is <b>not</b> an SMS. If that chat stays empty, tap <b>🔄 Resend Code</b> "
+    "or use the QR login."
+)
+
+
 class PhoneLoginSession:
     """Owns the temporary Telethon client for the whole phone → code → 2FA flow.
 
@@ -761,10 +777,25 @@ class PhoneLoginSession:
         self._pending: PendingLogin | None = None
         self._keepalive_task: asyncio.Task | None = None
         self._keepalive_interval = keepalive_interval
+        #: Optional one-shot "act on this yourself" message for the owner.
+        self._notify: NotifyCallback | None = None
         # Optional persistence (SQLite) so a host restart during login does not
         # silently throw away a login attempt the owner already started.
         self._persist: PersistCallback | None = None
         self._clear_persisted: ClearCallback | None = None
+
+    def set_notify(self, notify: NotifyCallback | None) -> None:
+        """Register a callback used to message the owner *outside* the chat flow."""
+        self._notify = notify
+
+    async def _tell_owner(self, text: str) -> None:
+        notify, self._notify = self._notify, None
+        if notify is None:
+            return
+        try:
+            await notify(text)
+        except Exception as exc:  # pragma: no cover - notification is best effort
+            logger.debug("Could not notify the owner: %s", exc)
 
     def set_persistence(
         self,
@@ -864,6 +895,72 @@ class PhoneLoginSession:
         if not client.is_connected():
             await client.connect()
 
+    async def escalate_after_app_channel(self, delivery: CodeDelivery) -> None:
+        """Move the code off Telegram's in-app channel automatically.
+
+        ``SentCodeTypeApp`` means Telegram chose to put the login code in the
+        *service chat of another logged-in session*, and offers no SMS or call in
+        that answer. That is the channel with the known silent-withholding problem
+        (Telethon #4730): the request succeeds, the hash is valid, and nothing ever
+        arrives. Asking the owner to tap Resend is the wrong remedy - Telegram
+        nominates that other channel itself in ``auth.sentCode.next_type``, and a
+        single ``auth.resendCode`` is exactly how you accept the offer.
+
+        So: resend once, immediately. The new code goes to the channel Telegram
+        nominated (usually SMS, sometimes a call) instead of the one that silently
+        drops it. The attempt is *not* restarted, so the hash stays valid and the
+        first code remains usable. Deliberately one shot and silent - a second
+        request would be rate-limited and would invalidate the first code.
+        """
+        pending = self._pending
+        if pending is None:
+            return
+        if delivery.channel is not DeliveryChannel.TELEGRAM_APP:
+            return
+        if pending.channel_escalated:
+            return
+        if delivery.next_channel is None:
+            # Telegram named no other channel in ``next_type``, so a resend would
+            # not move the code anywhere - it would only burn a rate limit. Say
+            # where the code went instead.
+            pending.channel_escalated = True
+            await self._tell_owner(_APP_CHANNEL_NOTICE)
+            return
+        pending.channel_escalated = True
+
+        previous = delivery.channel
+        try:
+            pending.touch()
+            sent = await pending.client(
+                ResendCodeRequest(pending.phone, pending.phone_code_hash)
+            )
+        except Exception as exc:
+            # Keep the original attempt intact; the owner still has the first code
+            # if Telegram did deliver it, and can resend by hand later.
+            logger.info("Automatic channel switch off the app channel failed: %s", exc)
+            await self._tell_owner(
+                "⚠️ <b>Telegram put the login code inside the Telegram app</b> "
+                "(the channel that commonly delivers nothing). I tried to move it to "
+                "SMS automatically, but Telegram refused.\n\n"
+                "Tap <b>🔄 Resend Code</b> to try the next channel, or use the QR "
+                "login — it needs no code at all."
+            )
+            return
+
+        new_delivery = describe_delivery(sent)
+        pending.phone_code_hash = getattr(sent, "phone_code_hash", "") or pending.phone_code_hash
+        pending.delivery = new_delivery
+        pending.code_length = new_delivery.length or pending.code_length
+        pending.resend_count += 1
+        await self._save()
+        logger.info(
+            "Code channel switched %s -> %s after Telegram chose the in-app channel",
+            previous,
+            new_delivery.channel,
+        )
+        if new_delivery.channel is DeliveryChannel.TELEGRAM_APP:
+            await self._tell_owner(_APP_CHANNEL_NOTICE)
+
     # -- step 1: phone -> code -----------------------------------------
     async def request_code(self, api_id: int, api_hash: str, raw_phone: str) -> LoginResult:
         """Validate the number, request a code and record where it was delivered."""
@@ -899,6 +996,11 @@ class PhoneLoginSession:
             )
         )
         await self._start_keepalive(client)
+        # If Telegram picked the in-app channel, take the offer it made in
+        # ``next_type`` and resend onto that channel now - before the owner is told
+        # to go looking in a place the code never reaches.
+        await self.escalate_after_app_channel(delivery)
+        delivery = self._pending.delivery if self._pending else delivery
         await self._save()
         logger.info(
             "Login code requested for %s via %s (length=%s, email_setup_required=%s)",

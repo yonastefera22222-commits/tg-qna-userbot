@@ -98,6 +98,10 @@ class UserbotManager:
 
     def set_notify_callback(self, callback: NotifyCallback) -> None:
         self._notify_owner = callback
+        # The login session reports delivery problems on its own schedule (it is
+        # the only place that knows which channel Telegram really used), so hand
+        # it the same channel to the owner.
+        self._login.set_notify(callback)
 
     @property
     def is_connected(self) -> bool:
