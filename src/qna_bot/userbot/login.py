@@ -47,7 +47,6 @@ from telethon.errors import (
     EmailUnconfirmedError,
     EmailVerifyExpiredError,
     FloodError,
-    FloodPremiumWaitError,
     FloodWaitError,
     PasswordEmptyError,
     PasswordHashInvalidError,
@@ -631,15 +630,70 @@ class PendingLogin:
 # ---------------------------------------------------------------------------
 
 
+def _flood_seconds(exc: Exception) -> int:
+    """How long Telegram is making us wait, in seconds.
+
+    ``.seconds`` is the documented place, but it is not always populated: Telethon
+    builds the exception from the RPC error text, and some paths leave it at 0 while
+    the number sits in the message ("A wait of 67746 seconds is required",
+    "FLOOD_WAIT_67746"). Losing it turns an 18-hour block into a useless "please
+    wait and try again", so both are read.
+    """
+    seconds = 0
+    for attr in ("seconds", "capture", "value"):
+        try:
+            seconds = int(getattr(exc, attr, 0) or 0)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds:
+            return seconds
+    text = str(exc)
+    for pattern in (r"(\d+)\s*seconds", r"FLOOD_WAIT_(\d+)", r"FLOOD_PREMIUM_WAIT_(\d+)"):
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
+def humanise_seconds(seconds: int) -> str:
+    """'18 hours 49 minutes' - a number a person can plan around."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} seconds"
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes and not days:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if not parts:  # pragma: no cover - impossible with the branches above
+        parts.append(f"{sec} seconds")
+    return " ".join(parts)
+
+
 def _flood_result(exc: Exception, action: str) -> LoginResult:
-    seconds = int(getattr(exc, "seconds", 0) or 0)
-    if isinstance(exc, FloodPremiumWaitError):
-        seconds = int(getattr(exc, "seconds", 0) or 0)
-    wait_txt = f" Wait <b>{seconds}s</b> and try again." if seconds else " Please wait and try again."
+    """Turn a FloodWait into an instruction the owner can act on.
+
+    Telegram's rate limit here is not a hint. Every further code request inside the
+    window makes the next one longer - which is how a few minutes of retrying turns
+    into most of a day. So the result states the real wait in words, and
+    ``PhoneLoginSession`` refuses further requests until it has passed.
+    """
+    seconds = _flood_seconds(exc)
+    if seconds:
+        wait_txt = f" Wait <b>{humanise_seconds(seconds)}</b> and try again."
+    else:
+        # No number available: say so honestly rather than implying it is seconds.
+        wait_txt = " Telegram did not say how long; wait at least an hour."
+        seconds = 3600
     return LoginResult(
         LoginStatus.ERROR,
         f"⏳ Telegram rate-limited this {action} (FloodWait).{wait_txt}",
-        retry_after=seconds or None,
+        retry_after=seconds,
     )
 
 
@@ -884,6 +938,8 @@ class PhoneLoginSession:
         self._last_snapshot: dict[str, object] | None = None
         self._save_session: Callable[[str | None], Awaitable[None]] | None = None
         self._session_tasks: set[asyncio.Task] = set()
+        #: Wall-clock time before which Telegram will refuse another code request.
+        self._blocked_until: float = 0.0
         self._clear_persisted: ClearCallback | None = None
 
     def set_notify(self, notify: NotifyCallback | None) -> None:
@@ -1103,8 +1159,41 @@ class PhoneLoginSession:
         )
         return True
 
+    #: Set whenever Telegram sends a FloodWait. No code request of any kind is sent
+    #: until it expires: Telegram lengthens the block for every request made inside
+    #: the window, which is how a few minutes of retrying becomes most of a day.
+    @property
+    def cooling_down(self) -> float:
+        """Seconds left before Telegram will answer a code request again (0 = ready)."""
+        return max(0.0, self._blocked_until - time.time())
+
+    def _record_flood(self, result: LoginResult) -> LoginResult:
+        seconds = int(result.retry_after or 0)
+        if seconds > 0:
+            self._blocked_until = max(self._blocked_until, time.time() + seconds)
+            logger.warning(
+                "Telegram rate-limited code delivery; no further requests for %s.",
+                humanise_seconds(seconds),
+            )
+        return result
+
+    def _cooldown_result(self) -> LoginResult:
+        remaining = int(self.cooling_down)
+        return LoginResult(
+            LoginStatus.ERROR,
+            "⏳ <b>Telegram is still rate-limiting this number.</b>\n\n"
+            f"Time left: <b>{humanise_seconds(remaining)}</b>.\n\n"
+            "Sending the number again before then makes the wait <b>longer</b>, so I "
+            "am not going to ask Telegram again until it has passed.\n\n"
+            "Use <b>📷 QR Login</b> meanwhile — a QR code needs no code delivery, so "
+            "Telegram does not rate-limit it the same way.",
+            retry_after=remaining or None,
+        )
+
     async def request_code(self, api_id: int, api_hash: str, raw_phone: str) -> LoginResult:
         """Validate the number, request a code and record where it was delivered."""
+        if self.cooling_down > 0:
+            return self._cooldown_result()
         parsed = parse_phone(raw_phone)
         if not parsed.ok:
             return LoginResult(LoginStatus.ERROR, f"❌ {parsed.hint}")
@@ -1120,7 +1209,7 @@ class PhoneLoginSession:
             except Exception:
                 pass
             logger.warning("send_code_request failed for %s: %s", parsed.e164, exc)
-            return translate_send_error(exc, parsed.e164)
+            return self._record_flood(translate_send_error(exc, parsed.e164))
 
         delivery = describe_delivery(sent)
         blocked = delivery.channel is DeliveryChannel.SETUP_REQUIRED
@@ -1199,7 +1288,7 @@ class PhoneLoginSession:
             )
         except Exception as exc:
             logger.warning("SendVerifyEmailCode failed for %s: %s", address, exc)
-            return translate_send_error(exc, pending.phone)
+            return self._record_flood(translate_send_error(exc, pending.phone))
 
         pattern = getattr(sent, "email_pattern", address)
         length = getattr(sent, "length", None)
@@ -1243,7 +1332,7 @@ class PhoneLoginSession:
             )
         except Exception as exc:
             logger.warning("VerifyEmail failed: %s", exc)
-            return translate_send_error(exc, pending.phone)
+            return self._record_flood(translate_send_error(exc, pending.phone))
 
         # Email verified: the block is lifted, so request the real login code.
         pending.email_setup_required = False
@@ -1439,6 +1528,9 @@ class PhoneLoginSession:
     async def resend_code(self) -> LoginResult:
         """Ask Telegram for another code, recovering from stale hashes automatically.
 
+        Refused outright while a FloodWait is running: asking again inside the window
+        is what turns a short limit into most of a day.
+
         The naive implementation called ``send_code_request`` again, which (a)
         starts a brand new authorization attempt with a *new* hash, invalidating
         any code the owner already has, and (b) hits ``PHONE_NUMBER_FLOOD`` fast.
@@ -1449,6 +1541,8 @@ class PhoneLoginSession:
         pending = self._pending
         if pending is None:
             return LoginResult(LoginStatus.ERROR, "No login in progress. Send your phone number again.")
+        if self.cooling_down > 0:
+            return self._cooldown_result()
 
         pending.touch()
         await self._ensure_connected(pending.client)
@@ -1481,7 +1575,7 @@ class PhoneLoginSession:
             sent = await pending.client.send_code_request(pending.phone)
         except Exception as exc:
             logger.warning("Fresh send_code_request failed for %s: %s", pending.phone, exc)
-            return translate_send_error(exc, pending.phone)
+            return self._record_flood(translate_send_error(exc, pending.phone))
 
         delivery = describe_delivery(sent)
         pending.phone_code_hash = sent.phone_code_hash
@@ -1555,13 +1649,16 @@ class PhoneLoginSession:
         """
         pending = self._pending
         assert pending is not None
+        if self.cooling_down > 0:
+            # Do not burn another request: Telegram is already refusing them.
+            return self._cooldown_result()
         if pending.resend_count >= self.MAX_AUTO_RESENDS:
             return translate_signin_error(PhoneCodeExpiredError(request=None))
 
         try:
             sent = await pending.client.send_code_request(pending.phone)
         except Exception as exc:
-            return translate_send_error(exc, pending.phone)
+            return self._record_flood(translate_send_error(exc, pending.phone))
 
         pending.phone_code_hash = sent.phone_code_hash
         pending.delivery = describe_delivery(sent)
