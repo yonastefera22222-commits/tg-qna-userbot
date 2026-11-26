@@ -506,8 +506,17 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
     display_phone = ctx.userbot.pending_phone or phone
     await state.update_data(phone=display_phone, otp_digits="")
     await state.set_state(WizardStates.waiting_otp)
+    prompt = _otp_prompt_text(display_phone, "", delivery=delivery)
+    # Be explicit that the request succeeding is not proof of delivery, and point
+    # at the route that needs no delivery at all. "The code never arrives" has
+    # been the recurring complaint; this is the screen where that happens.
+    prompt += (
+        "\n\n📷 <b>If nothing arrives, the QR code is guaranteed to work</b> — it "
+        "asks Telegram for no message at all. Tap <b>📷 Use QR Login Instead</b> below "
+        "and scan it from the Telegram app on a second device."
+    )
     await status_msg.edit_text(
-        _otp_prompt_text(display_phone, "", delivery=delivery),
+        prompt,
         reply_markup=otp_keypad_kb(""),
     )
 
@@ -739,26 +748,14 @@ async def cb_login_qr(callback: CallbackQuery, ctx: AppContext, state: FSMContex
         return
 
     await safe_edit_text(callback, "🔑 Starting a login that needs no code...")
-    page_url = await _start_browser_login(ctx, int(api_id), str(api_hash))
-    if page_url is None:
-        # No public URL (local run, or PORT unset): fall back to the QR image.
-        await _show_qr_image(callback, ctx, state, int(api_id), str(api_hash))
-        return
 
-    await state.set_state(WizardStates.waiting_qr_2fa)
-    await state.update_data(qr_generation=1)
-    await safe_edit_text(
-        callback,
-        "📷 <b>QR Login</b>\n\n"
-        "This route needs a <b>second device</b> with a camera, because Telegram "
-        "refuses to approve a login from a link opened inside its own app.\n\n"
-        "🌐 <b>No second device?</b> The button below opens the same token as a web "
-        "page, which is the one place Telegram will accept it from — but if your phone "
-        "still answers with <i>“go to Settings → Devices → Scan QR”</i>, use "
-        "<b>📧 Login With Email Code</b> instead. That one needs no camera at all.\n\n"
-        "Then tap <b>🔄 I Approved — Continue</b> here.",
-        reply_markup=_qr_kb(None, page_url),
-    )
+    # The button says "QR Code", so it must *send a QR code*. It used to only
+    # start the browser flow and show a text screen with a link, which is why
+    # nothing scannable ever appeared: the image lived behind a second button
+    # ("📷 Make a QR Code") that was easy to miss. A link is not a QR code, and a
+    # browser page is not one either - that page has no image on it at all.
+    page_url = await _start_browser_login(ctx, int(api_id), str(api_hash))
+    await _show_qr_image(callback, ctx, state, int(api_id), str(api_hash), page_url=page_url)
 
 
 @router.callback_query(F.data == "wiz:qr_image")
@@ -778,23 +775,36 @@ async def _show_qr_image(
     state: FSMContext,
     api_id: int,
     api_hash: str,
+    *,
+    page_url: str | None = None,
 ) -> None:
-    """Start a QR login session and post the code as an image."""
+    """Post the live ``tg://login`` token as a scannable QR image.
+
+    ``page_url`` is the same token served as a web page, offered as a button for
+    one-phone logins. It is *additional*: the image is the primary thing.
+    """
     if callback.message is None:
         return
     await safe_edit_text(callback, "📷 Generating a QR login code...")
     res, url = await ctx.userbot.start_qr_login(api_id, api_hash)
     if url is None:
-        await safe_edit_text(callback, f"{res.message}", reply_markup=_qr_kb())
+        # Say why instead of showing an empty screen.
+        await safe_edit_text(
+            callback,
+            f"{res.message}\n\n<i>Telegram did not issue a QR token. This is usually "
+            "a wrong API ID/Hash or a rate limit.</i>",
+            reply_markup=_qr_kb(),
+        )
         return
 
     await state.set_state(WizardStates.waiting_qr_2fa)
     await state.update_data(qr_generation=1)
 
-    manager = ctx.browser_login
-    page_url = (
-        manager.page_url(ctx.env.public_url) if manager and ctx.env.public_url else None
-    )
+    if page_url is None:
+        manager = ctx.browser_login
+        page_url = (
+            manager.page_url(ctx.env.public_url) if manager and ctx.env.public_url else None
+        )
     caption = _qr_caption(url, page_url=page_url)
     png = ctx.userbot.qr_code()
     if png is not None:
