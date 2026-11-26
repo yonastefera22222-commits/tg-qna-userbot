@@ -474,11 +474,31 @@ class PendingLogin:
     #: The owner explicitly asked for the code by email, and Telegram agreed.
     #: From then on the delivery channel is the inbox, not the app.
     email_login_requested: bool = False
+    #: The channel Telegram said it would use *next* (``auth.sentCode.next_type``).
+    #: Kept so a resend can escalate deliberately rather than hoping the channel
+    #: the owner is already waiting on suddenly starts working.
+    next_channel: DeliveryChannel | None = None
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
+
+    @property
+    def should_escalate(self) -> bool:
+        """True when the channel that told us nothing should be abandoned.
+
+        Two consecutive silent failures is the signal: one miss is a slow SMS, two
+        means this channel is not going to deliver. Continuing to press Resend on
+        the same channel is what makes an OTP look permanently broken - which is
+        exactly the report this exists to answer.
+        """
+        return self.resend_count >= ESCALATE_AFTER_SILENT_RESENDS
+
+    @property
+    def exhausted(self) -> bool:
+        """True when every automatic route has been tried and failed."""
+        return self.resend_count >= GIVE_UP_AFTER_SILENT_RESENDS
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +665,14 @@ def translate_signin_error(exc: Exception) -> LoginResult:
 #:
 #: The values are deliberately a plain, widely-installed Android build rather
 #: than anything unusual, and they are used only for the *login* connection.
+#: How many resends to tolerate on a channel that produces no code before moving
+#: to the next one. One miss is a slow SMS; two means the channel is dead for this
+#: account, and Telegram's own fallback (``next_type``) is the right answer.
+ESCALATE_AFTER_SILENT_RESENDS = 2
+#: After this many, resending automatically is pointless: the honest options are a
+#: different channel (email), QR login, or waiting out the flood window.
+GIVE_UP_AFTER_SILENT_RESENDS = 5
+
 DEVICE_MODEL = "Pixel 6"
 SYSTEM_VERSION = "SDK 33"
 APP_VERSION = "10.2.0 (4300)"
@@ -833,6 +861,7 @@ class PhoneLoginSession:
                 phone_code_hash=sent.phone_code_hash,
                 delivery=delivery,
                 code_length=delivery.length,
+                next_channel=delivery.next_channel,
                 email_setup_required=blocked,
             )
         )
@@ -1148,21 +1177,52 @@ class PhoneLoginSession:
         if pending is None:
             return LoginResult(LoginStatus.ERROR, "No login in progress. Send your phone number again.")
 
+        # Checked before any network work: an attempt that has exhausted every
+        # channel must not touch Telegram again, because each extra request extends
+        # the flood window that is the actual problem. This is the loop that makes
+        # an OTP look permanently broken.
+        if pending.exhausted:
+            return LoginResult(
+                LoginStatus.ERROR,
+                "⛔ Telegram has stopped delivering codes to this account on every "
+                "channel tried. Resending again will not help. Use <b>📷 QR Login</b> "
+                "(no code needed) or <b>📧 Get the code by email</b>, or wait out the "
+                "rate limit - repeated requests extend it.",
+            )
+
         pending.touch()
         await self._ensure_connected(pending.client)
 
         # 1) Preferred: Telegram's own "resend the same attempt" endpoint.
         try:
+            previous = pending.delivery
             sent = await pending.client(ResendCodeRequest(pending.phone, pending.phone_code_hash))
             pending.resend_count += 1
             delivery = describe_delivery(sent)
             pending.phone_code_hash = getattr(sent, "phone_code_hash", "") or pending.phone_code_hash
+            previous_channel = previous.channel if previous else None
             pending.delivery = delivery
             pending.code_length = delivery.length or pending.code_length
+            pending.next_channel = delivery.next_channel
             await self._save()
+            note = ""
+            if pending.should_escalate and delivery.channel is previous_channel:
+                # Same channel again after two misses. Tell the owner rather than
+                # letting them wait on it a third time.
+                alt = delivery.next_channel
+                note = (
+                    "\n\n⚠️ That is the same channel again and the previous codes did "
+                    "not arrive. "
+                    + (
+                        f"Tap 🔄 Resend once more and Telegram should switch to "
+                        f"<b>{alt.value.replace('_', ' ')}</b>."
+                        if alt
+                        else "Try <b>📷 QR Login</b> or <b>📧 Get the code by email</b>."
+                    )
+                )
             return LoginResult(
                 LoginStatus.CODE_SENT,
-                f"New code requested — {delivery.title}.",
+                f"New code requested — {delivery.title}.{note}",
                 delivery=delivery,
             )
         except (PhoneCodeExpiredError, PhoneCodeHashEmptyError, SendCodeUnavailableError) as exc:
@@ -1185,6 +1245,7 @@ class PhoneLoginSession:
         pending.phone_code_hash = sent.phone_code_hash
         pending.delivery = delivery
         pending.code_length = delivery.length or pending.code_length
+        pending.next_channel = delivery.next_channel
         pending.resend_count += 1
         await self._save()
         return LoginResult(

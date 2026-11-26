@@ -123,6 +123,39 @@ specific reason (`Exness not connected`, or the error code: `1000` bad key, `100
 > timestamp and the exact Exness symbol stay out of group replies on purpose — they are shown on
 > your own `/diag` screen, where they help, and nowhere the group can see.
 
+## 🔑 "The login code never arrives" (especially after moving hosts)
+
+A code that used to work and stopped working right after a redeploy usually means
+the deployment moved, not that the account changed:
+
+- **A new host is a new database.** Without a restored `BOT_STATE_B64` the bot has
+  no saved session and must log in from scratch — which is the first login on that
+  host, not a regression.
+- **A new host is a new IP.** Telegram treats a first login from an unfamiliar
+  address as suspicious and can accept `auth.sendCode` while delivering nothing.
+- **Every extra Resend digs the hole deeper.** Repeated requests push the account
+  into `PHONE_NUMBER_FLOOD`, which extends the silence.
+
+The bot now handles that instead of looping:
+
+| Resends with no code | What happens |
+|---|---|
+| 1 | Treated as a slow SMS. Nothing changes. |
+| 2 | Warns that the channel is not delivering and names the channel Telegram said it would use next. |
+| 5 | Refuses to resend again — it will not make the flood window worse — and points at the two routes that cannot be blocked. |
+
+**The two routes that always work:**
+
+1. **📷 QR Login** — no code is ever delivered, so nothing can fail to arrive. The
+   bot serves the `tg://login` token from its own public URL so Telegram's own
+   "Log in?" prompt appears.
+2. **📧 Get the code by email** — Telegram then delivers the login code to an inbox
+   instead of to the app or SMS.
+
+Before either, check that the **API ID / API Hash came from the same account being
+connected** ([my.telegram.org](https://my.telegram.org) while logged in as that
+account). A mismatch is the one cause that looks identical to a silent drop.
+
 ## ☁️ Deploying to Render Free Tier (Step-by-Step)
 
 > **Setting up a second account?** See **[SETUP-GUIDE.md](SETUP-GUIDE.md)** for the full walkthrough — separate bot token, separate `OWNER_ID`, what must not be shared between deployments, and a troubleshooting table.
