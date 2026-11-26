@@ -255,13 +255,33 @@ async def msg_api_id(message: Message, state: FSMContext) -> None:
 
 
 @router.message(NotACommand(), WizardStates.waiting_api_hash)
-async def msg_api_hash(message: Message, state: FSMContext) -> None:
+async def msg_api_hash(message: Message, ctx: AppContext, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     await safe_delete_message(message)
     if len(raw) < 16:
         await message.answer("❌ That API Hash looks too short. Please send the full API Hash:")
         return
     await state.update_data(api_hash=raw)
+    # Persist them. They used to live only in this conversation's state, so any
+    # restart (Render Free sleeps after 15 minutes and redeploys on every push)
+    # silently lost them, and the next login failed with "Missing API
+    # credentials" - or, worse, on a blueprint deploy that only sets BOT_TOKEN and
+    # OWNER_ID, with an API ID from nowhere in particular.
+    api_id = (await state.get_data()).get("api_id")
+    if api_id:
+        try:
+            await ctx.db.set_setting("tg_api_id", int(api_id))
+            await ctx.db.set_setting("tg_api_hash", raw.strip())
+        except Exception as exc:  # noqa: BLE001 - explain, never crash the step
+            logger.warning("Could not save API credentials: %s", exc)
+            await message.answer(
+                "⚠️ I could not save these credentials.\n\n"
+                "That normally means <b>ENCRYPTION_KEY</b> changed (or was never "
+                "set) on the host, so previously saved secrets cannot be read or "
+                "written. Set a fixed ENCRYPTION_KEY in the host's environment, "
+                "then send the API Hash again."
+            )
+            return
     await state.set_state(None)
     await message.answer(
         "✅ API credentials saved!\n\n"
@@ -320,6 +340,24 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
     api_hash = data.get("api_hash") or ctx.env.tg_api_hash or await ctx.db.get_setting("tg_api_hash")
 
     if not (api_id and api_hash):
+        # Distinguish "never entered" from "was entered, but cannot be decrypted".
+        # The second one used to surface as a bare "Missing API credentials", which
+        # sends the owner round the same loop forever.
+        lost = bool(getattr(ctx.db, "undecryptable", set()) & {"tg_api_id", "tg_api_hash"})
+        if lost:
+            await message.answer(
+                "🔐 <b>Your saved API credentials can no longer be read.</b>\n\n"
+                "They are stored encrypted, and the encryption key on this host "
+                "changed — usually because <code>ENCRYPTION_KEY</code> was left blank "
+                "in the blueprint deploy, so the bot generated a new one on each "
+                "restart.\n\n"
+                "<b>Best fix:</b> add a fixed <code>ENCRYPTION_KEY</code> in the host's "
+                "Environment tab (I can give you the exact value), then send "
+                "<code>/setup</code> and enter the API ID and Hash again.\n\n"
+                "Until then every login attempt will fail here, so this has to come "
+                "first."
+            )
+            return
         await message.answer("❌ Missing API credentials. Send /setup to start Step 1 again.")
         return
 
@@ -1493,10 +1531,23 @@ async def cmd_login_diagnose(message: Message, ctx: AppContext, state: FSMContex
     lines = ["🩺 <b>Telegram Login Diagnostics</b>", ""]
     lines.append(f"• API ID: <code>{api_id or 'MISSING'}</code>")
     lines.append(f"• API Hash: <code>{'set' if api_hash else 'MISSING'}</code>")
+    lost = sorted(getattr(ctx.db, "undecryptable", set()))
+    lines.append(
+        "• ENCRYPTION_KEY: "
+        + (
+            "❌ changed — these stored secrets are unreadable: "
+            + ", ".join(f"<code>{html.escape(k)}</code>" for k in lost)
+            if lost
+            else ("env" if ctx.env.encryption_key else "⚠️ not set (generated file)")
+        )
+    )
     lines.append(f"• Wizard state: <code>{await state.get_state() or 'none'}</code>")
     lines.append(f"• Phone: <code>{ctx.userbot.pending_phone or '—'}</code>")
     session = await ctx.db.get_setting("tg_session")
     lines.append(f"• Saved session: {'yes' if session else 'no'}")
+    lines.append(
+        f"• Database: <code>{html.escape(str(ctx.env.db_path))}</code>"
+    )
     lines.append(f"• Userbot connected: {ctx.userbot.is_connected}")
     lines.append(
         f"• No-code login page: "

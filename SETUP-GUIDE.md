@@ -66,6 +66,15 @@ Your repo: `github.com/yonastefera22222-commits/tg-qna-userbot` → click **Fork
 > bot now logs a clear `ENCRYPTION_KEY is not a valid Fernet key` warning and keeps
 > running, but every secret stored under the old key becomes unreadable.
 
+> **The blueprint does not ask for your Telegram API ID and Hash.** Those are
+> **not** environment variables in `render.yaml`, so a blueprint deploy leaves them
+> unset and the bot will ask for them in the wizard (Step 1). Enter them from
+> [my.telegram.org](https://my.telegram.org) — and note they are stored
+> **encrypted in the database**, which means they survive restarts only while
+> `ENCRYPTION_KEY` stays the same. If you ever change that key, every stored
+> secret (API Hash, session, AI keys) becomes unreadable and has to be re-entered;
+> the bot now says so in the logs instead of dying.
+
 > **Nothing is enabled yet, so silence is expected.** A fresh deployment has no
 > groups in it. While the logs show `No saved Telethon session yet`, the bot is
 > waiting for `/setup`, not broken. After setup, open
