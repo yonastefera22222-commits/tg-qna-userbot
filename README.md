@@ -144,6 +144,26 @@ The bot now handles that instead of looping:
 | 2 | Warns that the channel is not delivering and names the channel Telegram said it would use next. |
 | 5 | Refuses to resend again — it will not make the flood window worse — and points at the two routes that cannot be blocked. |
 
+### A restart mid-login used to destroy the attempt
+
+The saved attempt held the `phone_code_hash` but **not** the auth key it belongs to,
+and the boot routine deleted the whole attempt as "stale". That reasoning was wrong
+twice over:
+
+- Telethon writes the auth key into the session the moment the client connects
+  (`self.session.auth_key = self._sender.auth_key`, then `session.save()`), so the
+  key **is** recoverable.
+- The hash is only valid for the key that requested it — which is exactly why
+  discarding the key broke the code, not why the attempt had to be discarded.
+
+On Render Free that combination is fatal: the service sleeps after 15 minutes and
+gets a brand-new process on every deploy, so a restart between "send my number" and
+"here is the code" is routine. The owner then received a code that was **guaranteed**
+to be rejected with *"No login session is active"* — indistinguishable from "the OTP
+login broke". The attempt is now saved with its session string and resumed at boot
+(or revived on demand from the OTP screen). It is only refused when it is older than
+15 minutes, because by then the code itself has expired.
+
 **The two routes that always work:**
 
 1. **📷 QR Login** — no code is ever delivered, so nothing can fail to arrive. The
