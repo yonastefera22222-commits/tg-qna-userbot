@@ -169,7 +169,13 @@ async def async_main() -> None:
     )
     await ai_engine.start()
 
-    userbot = UserbotManager(db=db, ai_engine=ai_engine)
+    userbot = UserbotManager(
+        db=db,
+        ai_engine=ai_engine,
+        env_api_id=env.tg_api_id,
+        env_api_hash=env.tg_api_hash,
+        env_session=env.tg_string_session,
+    )
     browser_login = BrowserLoginManager()
     ctx = AppContext(
         env=env, db=db, ai=ai_engine, userbot=userbot, browser_login=browser_login
