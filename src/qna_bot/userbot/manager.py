@@ -61,9 +61,23 @@ class UserbotManager:
     ADMIN_CACHE_TTL = 600.0  # 10 minutes
     ADMIN_REFRESH_INTERVAL = 240.0  # refresh in the background every 4 minutes
 
-    def __init__(self, db: Database, ai_engine: AIEngine) -> None:
+    def __init__(
+        self,
+        db: Database,
+        ai_engine: AIEngine,
+        *,
+        env_api_id: int | None = None,
+        env_api_hash: str | None = None,
+        env_session: str | None = None,
+    ) -> None:
         self._db = db
         self._ai = ai_engine
+        #: Credentials from the host's environment. On an ephemeral disk these are
+        #: the only copy of the login that outlives a restart, so they are used
+        #: whenever the database has nothing (see ``start_from_storage``).
+        self._env_api_id = env_api_id
+        self._env_api_hash = env_api_hash
+        self._env_session = env_session
         self._client: TelegramClient | None = None
         self._login = PhoneLoginSession()
         self._login.set_persistence(self._persist_pending_login, self._clear_pending_login)
@@ -138,9 +152,18 @@ class UserbotManager:
         # gone), so clear it instead of letting the wizard show a dead attempt.
         if await self.drop_stale_pending_login():
             logger.info("Discarded a login attempt left over from the previous run.")
-        api_id = await self._db.get_setting("tg_api_id")
-        api_hash = await self._db.get_setting("tg_api_hash")
-        session_str = await self._db.get_setting("tg_session")
+        # Credentials and the session: the database first, then the environment.
+        #
+        # The environment fallback is not a nicety. On a host with an ephemeral
+        # disk (Render Free wipes it on every restart, and sleeps after 15 minutes
+        # idle) the database is gone after a deploy, so a login stored only there
+        # disappears and the bot comes back asking for a phone number again. The
+        # documented escape is to paste the session string into the host's
+        # Environment tab - but that value was parsed from the environment and then
+        # never read here, so pasting it did nothing at all.
+        api_id = await self._db.get_setting("tg_api_id") or self._env_api_id
+        api_hash = await self._db.get_setting("tg_api_hash") or self._env_api_hash
+        session_str = await self._db.get_setting("tg_session") or self._env_session
 
         if not (api_id and api_hash and session_str):
             logger.info("No saved Telethon session yet; waiting for in-bot setup wizard.")
@@ -164,6 +187,11 @@ class UserbotManager:
                 await client.disconnect()
                 return False
             await self._attach_client(client)
+            if self._env_session and not await self._db.get_setting("tg_session"):
+                # Adopted from the environment: copy it in so the rest of the app
+                # (and every later restart that still has a disk) sees it too.
+                await self._db.set_setting("tg_session", self._env_session)
+                logger.info("Adopted the Telegram session from TG_STRING_SESSION.")
             return True
         except Exception as exc:
             logger.exception("Failed to start userbot from stored session: %s", exc)
