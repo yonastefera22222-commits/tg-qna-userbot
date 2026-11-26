@@ -76,6 +76,58 @@ def _otp_prompt_text(
     )
 
 
+#: Channels where Telegram never falls back to SMS or a call on its own, so waiting
+#: for one is waiting for something that will not be sent.
+_NO_SMS_CHANNELS = {"telegram_app", "setup_required", "fragment", "unknown"}
+
+
+def _no_sms_will_come(delivery: CodeDelivery | None) -> bool:
+    """True when this attempt cannot produce an SMS or a phone call.
+
+    ``auth.sentCode.next_type`` is Telegram's own statement about what a resend
+    would use. When it is absent *and* the channel chosen is the in-app one, there
+    is no delivery route left that this bot can trigger - the code either appears
+    inside Telegram or it does not.
+    """
+    if delivery is None:
+        return False
+    if delivery.channel.value not in _NO_SMS_CHANNELS:
+        return False
+    return delivery.next_channel is None or delivery.next_channel.value == "telegram_app"
+
+
+def _no_code_this_attempt_text(phone: str, delivery: CodeDelivery | None) -> str:
+    where = delivery.title if delivery is not None else "inside Telegram"
+    return (
+        "<b>Step 2 / 4 — Where your code is</b>\n\n"
+        f"📞 Number: <code>{html.escape(phone)}</code>\n"
+        f"📨 Telegram chose: <b>{html.escape(where)}</b>\n\n"
+        "⚠️ <b>For this attempt Telegram will not send an SMS or make a call.</b> "
+        "It has put the code inside the Telegram app on the phone that already has "
+        "this number — usually as a message in the <b>“Telegram” service chat</b> "
+        "(blue shield ✓), sometimes as a <b>“Confirm login”</b> prompt. Nothing will "
+        "arrive by SMS, however long you wait.\n\n"
+        "<b>Do this:</b>\n"
+        "1️⃣ Open Telegram on that phone → the <b>“Telegram”</b> chat at the top of "
+        "the list → look for the 5-digit code, or a “Yes, it's me” button.\n"
+        "2️⃣ Then tap <b>📷 Use QR Login</b> below if you would rather skip codes "
+        "entirely — it needs no delivery at all.\n\n"
+        "<i>Typing the code here still works if you find it.</i>"
+    )
+
+
+def _no_code_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📷 Use QR Login (no code needed)", callback_data="wiz:login_qr")],
+            [InlineKeyboardButton(text="📧 Get the code by email", callback_data="wiz:emailcode")],
+            [InlineKeyboardButton(text="🔄 Resend Code", callback_data="otp:resend")],
+            [InlineKeyboardButton(text="⌨️ I have the code — type it", callback_data="otp:help")],
+            [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
+        ]
+    )
+
+
 async def _safe_edit_message(target: Message, text: str, reply_markup=None) -> None:
     """Edit a status message without ever raising into the handler.
 
@@ -529,6 +581,19 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
     display_phone = ctx.userbot.pending_phone or phone
     await state.update_data(phone=display_phone, otp_digits="")
     await state.set_state(WizardStates.waiting_otp)
+
+    if _no_sms_will_come(delivery):
+        # Telegram named the in-app channel and offered no alternative. No SMS and
+        # no call will ever be sent for this attempt, so a code keypad is a screen
+        # that can only ever time out. Say it plainly and lead with the routes that
+        # do not need any delivery at all.
+        await _safe_edit_message(
+            status_msg,
+            _no_code_this_attempt_text(display_phone, delivery),
+            reply_markup=_no_code_kb(),
+        )
+        return
+
     prompt = _otp_prompt_text(display_phone, "", delivery=delivery)
     # Be explicit that the request succeeding is not proof of delivery, and point
     # at the route that needs no delivery at all. "The code never arrives" has
