@@ -132,14 +132,8 @@ class UserbotManager:
         await self.reload_cache()
         # A phone-login attempt cannot survive a process restart (its auth key is
         # gone), so clear it instead of letting the wizard show a dead attempt.
-        pending_state = await self.resume_or_drop_pending_login()
-        if pending_state == "resumed":
-            logger.info(
-                "Resumed the saved login attempt from the previous run; the code "
-                "already delivered will still be accepted."
-            )
-        elif pending_state == "dropped":
-            logger.info("Discarded a login attempt that could not be resumed.")
+        if await self.drop_stale_pending_login():
+            logger.info("Discarded a login attempt left over from the previous run.")
         api_id = await self._db.get_setting("tg_api_id")
         api_hash = await self._db.get_setting("tg_api_hash")
         session_str = await self._db.get_setting("tg_session")
@@ -228,38 +222,18 @@ class UserbotManager:
     async def _clear_pending_login(self) -> None:
         await self._db.delete_setting("tg_pending_login")
 
-    async def resume_pending_login(self) -> bool:
-        """Revive the saved attempt on demand (e.g. the OTP screen after a restart)."""
-        state = await self.resume_or_drop_pending_login()
-        return state == "resumed"
+    async def drop_stale_pending_login(self) -> bool:
+        """Clear a login attempt left over from a previous process run.
 
-    async def resume_or_drop_pending_login(self) -> str:
-        """Carry a saved login attempt across a restart, or drop it if unusable.
-
-        This used to always delete the attempt, on the reasoning that Telegram
-        binds ``phone_code_hash`` to the auth key of the client that requested it.
-        That is true — but it is not a reason to discard the attempt, because the
-        auth key lives in the Telethon session and can be saved with it. Throwing
-        it away meant that on Render Free (which sleeps after 15 minutes and
-        redeploys on every push) a restart between "send my number" and "here is
-        the code" was guaranteed to reject the code the owner had just received,
-        with "No login session is active". That is the failure that reads as
-        "the OTP login broke when we moved the deployment".
-
-        Returns one of ``"none"``, ``"resumed"`` or ``"dropped"``.
+        Telegram's ``phone_code_hash`` is tied to the temporary client's auth
+        key, so after a restart the saved attempt can never be completed. The
+        old code left the owner staring at "Requesting login code..." with no
+        way forward; now the bot asks for the number again on /start.
         """
-        snapshot = await self._db.get_setting("tg_pending_login")
-        if not snapshot:
-            return "none"
-        api_id = await self._db.get_setting("tg_api_id")
-        api_hash = await self._db.get_setting("tg_api_hash")
-        can_resume = isinstance(snapshot, dict) and bool(api_id) and bool(api_hash)
-        if can_resume and await self._login.restore(snapshot, int(api_id), str(api_hash)):
-            # A restored snapshot from before the session field could not be
-            # rebuilt, and restore() already returned False for that case.
-            return "resumed"
+        if not await self._db.get_setting("tg_pending_login"):
+            return False
         await self._clear_pending_login()
-        return "dropped"
+        return True
 
     @property
     def pending_code_length(self) -> int | None:

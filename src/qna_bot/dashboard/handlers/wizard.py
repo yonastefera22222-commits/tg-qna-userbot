@@ -1146,36 +1146,6 @@ async def msg_otp_fallback(message: Message, ctx: AppContext, state: FSMContext)
     raw = (message.text or "").strip()
     await safe_delete_message(message)
     digits = "".join(ch for ch in raw if ch.isdigit())
-
-    # A restart between "send my number" and "here is the code" used to make this
-    # step silently dead: the FSM was restored to waiting_otp by the persistent
-    # storage, but the in-memory login attempt behind it was gone, so any code the
-    # owner sent was answered with "No login session is active" and nothing else.
-    # Say what actually happened and offer the two ways forward.
-    if not ctx.userbot.has_pending_login:
-        # Try to revive the saved attempt first: if its session string survived,
-        # the auth key that requested the code is still there and the code the
-        # owner just received will be accepted. Only give up when that fails.
-        resumed = await ctx.userbot.resume_pending_login()
-        if not resumed:
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="📱 Send Phone Number Again", callback_data="wiz:login_phone")],
-                    [InlineKeyboardButton(text="📷 QR Login (no code)", callback_data="wiz:login_qr")],
-                    [InlineKeyboardButton(text="⬅️ Login Options", callback_data="wiz:login_method")],
-                ]
-            )
-            await message.answer(
-                "♻️ <b>The bot restarted while you were entering the code.</b>\n\n"
-                "That is normal on a free host — it sleeps when idle and starts a new "
-                "process on every deploy. The login attempt it was holding could not be "
-                "revived, so it has to be started again.\n\n"
-                "Tap <b>📱 Send Phone Number Again</b>. The code you already received for "
-                "the previous request will not work; a fresh one will be sent.",
-                reply_markup=kb,
-            )
-            return
-
     if not digits:
         await message.answer(
             "⚠️ Please tap the keypad buttons on the message above, or type the digits "
