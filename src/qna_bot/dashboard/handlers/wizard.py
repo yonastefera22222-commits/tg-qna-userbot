@@ -76,6 +76,26 @@ def _otp_prompt_text(
     )
 
 
+async def _safe_edit_message(target: Message, text: str, reply_markup=None) -> None:
+    """Edit a status message without ever raising into the handler.
+
+    The login screens edit a "working..." bubble after the network call. If that
+    edit fails - message too old (Telegram refuses edits after 48h), already
+    deleted, or a transient API error - the exception used to kill the handler
+    *after* the code had been requested, so the screen silently stayed on
+    "📡 Requesting login code from Telegram..." forever. From the owner's side that
+    is indistinguishable from the bot ignoring the number.
+    """
+    try:
+        await target.edit_text(text, reply_markup=reply_markup)
+    except Exception as exc:
+        logger.warning("Could not update the login screen: %s", exc)
+        try:
+            await target.answer(text, reply_markup=reply_markup)
+        except Exception as second:  # pragma: no cover - network dependent
+            logger.warning("Could not send the login screen at all: %s", second)
+
+
 async def _show_wizard_welcome(target: Message | CallbackQuery, ctx: AppContext, state: FSMContext) -> None:
     await state.clear()
     has_env_creds = bool(ctx.env.tg_api_id and ctx.env.tg_api_hash)
@@ -456,7 +476,10 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
         return
 
     status_msg = await message.answer("📡 Requesting login code from Telegram...")
+    logger.info("Requesting a login code for %s", phone)
     res = await ctx.userbot.start_phone_login(int(api_id), str(api_hash), phone)
+    logger.info("Login code request for %s returned %s via %s", phone, res.status,
+                res.delivery.channel if res.delivery else "unknown")
 
     if ctx.userbot.email_setup_required:
         # Telegram point-blank refused to send anything until a login email exists.
@@ -515,10 +538,7 @@ async def msg_phone(message: Message, ctx: AppContext, state: FSMContext) -> Non
         "asks Telegram for no message at all. Tap <b>📷 Use QR Login Instead</b> below "
         "and scan it from the Telegram app on a second device."
     )
-    await status_msg.edit_text(
-        prompt,
-        reply_markup=otp_keypad_kb(""),
-    )
+    await _safe_edit_message(status_msg, prompt, reply_markup=otp_keypad_kb(""))
 
 
 # ----------------------------------------------------------------------

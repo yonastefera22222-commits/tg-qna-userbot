@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import secrets
 from dataclasses import dataclass, field
 
@@ -14,6 +15,8 @@ from ..browser_login import BrowserLoginManager
 from ..config import EnvConfig
 from ..storage.database import Database
 from ..userbot.manager import UserbotManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -99,7 +102,16 @@ async def safe_edit_text(
     text: str,
     reply_markup=None,
 ) -> None:
-    """Edit callback message safely, ignoring 'message is not modified' errors."""
+    """Edit callback message safely, ignoring 'message is not modified' errors.
+
+    When editing is impossible (the message is too old to edit, was already
+    deleted, or the caption/photo branch will not take text) the text is sent as a
+    new message instead. That fallback is best effort: it must never raise, and it
+    must never loop. It used to be an unguarded ``await`` inside the ``except``
+    block, which turned any transient send failure into an unbounded
+    answer/fail/answer cycle - the whole wizard handler hung and the screen simply
+    never changed, which looks exactly like "nothing happened" to the owner.
+    """
     if callback.message is None:
         return
     try:
@@ -108,10 +120,18 @@ async def safe_edit_text(
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
+        return
     except Exception as exc:
-        if "message is not modified" not in str(exc).lower():
-            await callback.message.answer(
-                text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
+        if "message is not modified" in str(exc).lower():
+            return
+        logger.debug("Could not edit the message, posting a new one instead: %s", exc)
+    try:
+        await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:  # pragma: no cover - network dependent
+        # Nothing more to do: the handler has done its work, and retrying here can
+        # only loop. Log it so the reason is visible in the host's logs.
+        logger.warning("Could not deliver the update text to the owner: %s", exc)
