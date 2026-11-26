@@ -30,7 +30,12 @@ from ..ai.providers import DEFAULT_SPEED_MODE, PROVIDERS
 from ..ai.text_cleanup import prepare_incoming, wants_inherited_image
 from ..storage.database import Database, GroupConfig
 from .filters import describe_reason, should_evaluate_message
-from .first_comment import FIRST_COMMENT_ANSWER, is_first_comment
+from .first_comment import (
+    FIRST_COMMENT_ANSWER,  # noqa: F401 - re-exported for older callers
+    is_first_comment,
+    looks_amharic,
+    next_first_comment_answer,
+)
 from .human_delay import wait_for_send
 from .login import (
     CodeDelivery,
@@ -838,13 +843,16 @@ class UserbotManager:
             send = event.reply
         else:
             send = event.respond
+        # A different line each time: the same two words from the same account in
+        # every group, every day, is the most obvious sign that a bot won.
+        answer = next_first_comment_answer(amharic=looks_amharic(text))
         await wait_for_send(
             received_at, group.human_delay_ms, first_comment=True
         )
         self._recent_msg_ids.append(dedup_key)
         self._last_reply_ts[int(chat_id)] = time.monotonic()
         try:
-            await send(FIRST_COMMENT_ANSWER)
+            await send(answer)
         except FloodWaitError as exc:
             logger.warning("FloodWaitError (%ss) on first-comment reply in %s", exc.seconds, group.title)
             return
@@ -870,7 +878,7 @@ class UserbotManager:
             chat_id=int(chat_id),
             chat_title=group.title,
             question_text=text,
-            answer_text=FIRST_COMMENT_ANSWER,
+            answer_text=answer,
             provider="local",
             model="first-comment",
             latency_ms=0,

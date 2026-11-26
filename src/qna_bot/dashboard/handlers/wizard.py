@@ -966,7 +966,20 @@ async def _show_no_code_help(
         "<b>5. Wait out the rate limit</b>\n"
         "Repeated requests trigger Telegram's flood limit, after which <b>no</b> code is "
         "sent for a while. If you see a wait time, stop retrying for that long.\n\n"
-        "<b>6. Check the server can reach Telegram</b>\n"
+        "<b>6. Match the API ID to the account</b>\n"
+        "A code is sent to whichever number you typed, but Telegram ties the request to "
+        "the <b>API ID / API Hash</b> from Step 1. If those came from a different "
+        "<a href='https://my.telegram.org'>my.telegram.org</a> app than the one this "
+        "number has used before, the code can be silently dropped. Log in to "
+        "my.telegram.org <b>as the account being connected</b>, open API development "
+        "tools, and re-enter both values.\n\n"
+        "<b>7. A fresh server never gets the code</b>\n"
+        "Telegram limits first logins from new IPs, and a brand-new host is exactly "
+        "that. Two things make an enormous difference: log in to Telegram <b>on your "
+        "phone first</b> and tap “Confirm login” / “Yes, it's me” when the prompt "
+        "appears, and prefer <b>QR login</b> (⬅️ Login Options → Use QR Login), which "
+        "needs no code at all and is the one route a new server cannot break.\n\n"
+        "<b>8. Check the server can still reach Telegram</b>\n"
         "On Render Free Tier the service sleeps after 15 minutes idle. If the request "
         "timed out, the code may never have been sent — use an uptime monitor on "
         "<code>/health</code>, then try again."
@@ -975,6 +988,7 @@ async def _show_no_code_help(
         inline_keyboard=[
             # The no-code route first: it is the answer to "no code received".
             [InlineKeyboardButton(text="📧 Get the code by email", callback_data="wiz:emailcode")],
+            [InlineKeyboardButton(text="📷 Use QR Login (no code needed)", callback_data="wiz:login_qr")],
             [InlineKeyboardButton(text="🔄 Resend Code", callback_data="otp:resend")],
             [
                 InlineKeyboardButton(

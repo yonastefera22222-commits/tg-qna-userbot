@@ -150,9 +150,37 @@ _SYSTEM_PROMPTS: dict[str, str] = {
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 #: Amharic answer labels: "መልስ፦" / "መልሱ፦" / "መልስ -" (answer:) at the start.
-_AMHARIC_ANSWER_PREFIX_RE = re.compile(r"^(?:መልሱ|መልስ|መልስህ)\s*[:፦\-–]\s*")
+#:
+#: The leading ``\\**`` matters: an Amharic answer formatted as ``**መልሱ፦ 85**``
+#: used to keep its label, because the plain pattern could not match past the
+#: bold markers, and the group was posted "መልሱ፦ 85" instead of "85".
+_AMHARIC_ANSWER_PREFIX_RE = re.compile(
+    r"^[*_`~\s]*(?:መልሱ|መልስ|መልስህ)\s*[:፦\-–]?\s*[*_`~\s]*"
+)
+#: "Answer: 85", "The answer is 85", and the decorated forms models produce -
+#: "**Answer:** 85", "**Answer**: 85", "Answer — 85". Vision models are the worst
+#: offenders because they mirror the bold they see in the picture, and the
+#: cleanup used to hand the group a literal "Answer:** 85".
 _ANSWER_PREFIX_RE = re.compile(
-    r"^(?:answer\s*[:\-]\s*|the\s+answer\s+is\s*[:\-]?\s*)",
+    r"^[*_`~\s]*"
+    # "answer" / "the answer" / "answers", optionally followed by "is". The
+    # negative lookahead refuses a sentence that merely *starts* with the word:
+    # "Answer is not possible" and "An answer cannot be determined" are answers,
+    # not labels, and stripping them would post an empty message.
+    r"(?:(?:the\s+)?answers?\b(?:\s+is\b)?"
+    r"(?![^:*_~`\-–—]*\b(?:is|was|will|would|cannot|can't|not)\b))"
+    r"[*_`~\s]*"
+    # The separator may be wrapped in the model's own bold: "**Answer**: 85".
+    r"(?:[:\-–—][*_`~\s]*)?",
+    re.IGNORECASE,
+)
+
+
+#: A line that is only an answer label, with nothing after it: "**Answer:**",
+#: "መልሱ፦". Vision models split the label and the figure across lines often enough
+#: that treating the label as the answer is a real failure, not a theoretical one.
+_ANSWER_LABEL_ONLY_RE = re.compile(
+    r"^[*_`~\s]*(?:(?:the\s+)?answers?|መልሱ|መልስ|መልስህ)\s*[:፦\-–—]?[*_`~\s]*$",
     re.IGNORECASE,
 )
 
@@ -699,6 +727,17 @@ class AIEngine:
             # Take first non-empty line, strip common fluff
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             text = lines[0] if lines else text
+            # A vision model very often writes the label on one line and the
+            # figure on the next:
+            #
+            #     **Answer:**
+            #     **85**
+            #
+            # Keeping only the first line posted the word "Answer:" as the
+            # answer. When the first line is nothing but a label, take the next
+            # one instead.
+            if _ANSWER_LABEL_ONLY_RE.fullmatch(text) and len(lines) > 1:
+                text = lines[1]
             text = _ANSWER_PREFIX_RE.sub("", text).strip()
             # Amharic answers sometimes lead with their own label.
             text = _AMHARIC_ANSWER_PREFIX_RE.sub("", text).strip()

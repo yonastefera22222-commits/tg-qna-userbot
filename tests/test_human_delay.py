@@ -329,7 +329,9 @@ async def test_first_comment_waits_but_only_briefly(tmp_path, record_sleeps) -> 
         event, sent = _event("First Comment 🔥")
         await mgr._on_new_message(event)
 
-        assert sent == ["I win"]
+        # The reply rotates through a pool, so any of the pool is correct here;
+        # what this test is about is the delay.
+        assert len(sent) == 1
         assert record_sleeps, "the first comment must not ignore the delay"
         assert record_sleeps[0] == pytest.approx(
             FIRST_COMMENT_MAX_DELAY_MS / 1000.0, abs=0.1
@@ -345,7 +347,7 @@ async def test_delay_off_posts_immediately_on_both_paths(tmp_path, record_sleeps
     try:
         event, sent = _event("First Comment")
         await mgr._on_new_message(event)
-        assert sent == ["I win"]
+        assert len(sent) == 1
         assert record_sleeps == []
         await ai.close()
     finally:

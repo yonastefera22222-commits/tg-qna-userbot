@@ -15,7 +15,11 @@ from qna_bot.ai.engine import AIEngine
 from qna_bot.storage.crypto import SecretCipher
 from qna_bot.storage.database import Database
 from qna_bot.userbot import first_comment
-from qna_bot.userbot.first_comment import FIRST_COMMENT_ANSWER, is_first_comment
+from qna_bot.userbot.first_comment import (
+    FIRST_COMMENT_ANSWER,
+    FIRST_COMMENT_ANSWERS,
+    is_first_comment,
+)
 from qna_bot.userbot.manager import UserbotManager
 
 CHAT_ID = -1001234567890
@@ -160,7 +164,9 @@ async def test_first_comment_is_answered_without_calling_ai(tmp_path) -> None:
         event, sent = _event("First Comment 🔥")
         await mgr._on_new_message(event)
 
-        assert sent == ["I win"]
+        # The reply now rotates through a pool of short human lines, so assert it
+        # is one of them rather than that it is the old constant.
+        assert len(sent) == 1 and sent[0] in FIRST_COMMENT_ANSWERS
         assert mgr.counters["answers_sent"] == 1
         assert any(
             d["outcome"] == "answered" and "first_comment" in str(d.get("detail"))
@@ -178,7 +184,7 @@ async def test_abbreviation_wins_the_race(tmp_path) -> None:
         ai.answer_question = AsyncMock(side_effect=AssertionError("no AI"))  # type: ignore[assignment]
         event, sent = _event("FC")
         await mgr._on_new_message(event)
-        assert sent == ["I win"]
+        assert len(sent) == 1 and sent[0] in FIRST_COMMENT_ANSWERS
         await ai.close()
     finally:
         await db.close()
@@ -192,7 +198,7 @@ async def test_deduplication_stops_double_posting(tmp_path) -> None:
         event, sent = _event("first comment")
         await mgr._on_new_message(event)
         await mgr._on_new_message(event)  # same message id delivered twice
-        assert sent == ["I win"], "a duplicate update must not post twice"
+        assert len(sent) == 1, "a duplicate update must not post twice"
         await ai.close()
     finally:
         await db.close()
@@ -212,7 +218,7 @@ async def test_cooldown_does_not_block_the_race(tmp_path) -> None:
         ai.answer_question = AsyncMock(side_effect=AssertionError("no AI"))  # type: ignore[assignment]
         event, sent = _event("1st comment wins")
         await mgr._on_new_message(event)
-        assert sent == ["I win"]
+        assert len(sent) == 1 and sent[0] in FIRST_COMMENT_ANSWERS
         await ai.close()
     finally:
         await db.close()
