@@ -34,7 +34,16 @@ SECRET_SETTING_KEYS = frozenset(
 #: Settings that must never be copied into the portable BOT_STATE_B64 snapshot.
 #: ``tg_pending_login`` records an in-progress phone login so a restart mid-login
 #: can be detected; it is worthless after the process dies and stays out of exports.
-EPHEMERAL_SETTING_KEYS = frozenset({"tg_pending_login"})
+EPHEMERAL_SETTING_KEYS = frozenset(
+    {
+        # Holds the live Telethon StringSession of a *temporary* login client. It is
+        # not a secret worth keeping beyond the attempt: once the login completes the
+        # real session is written to ``tg_session``, and if the attempt is abandoned
+        # the temporary client is worthless.
+        "tg_pending_login",
+        "tg_pending_login_session",
+    }
+)
 
 #: Settings that identify the deployment's owner and must NEVER travel to
 #: someone else. A Telethon session string is a complete account login: whoever

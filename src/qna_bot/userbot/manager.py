@@ -81,6 +81,9 @@ class UserbotManager:
         self._client: TelegramClient | None = None
         self._login = PhoneLoginSession()
         self._login.set_persistence(self._persist_pending_login, self._clear_pending_login)
+        self._login.set_session_store(
+            self._load_pending_session, self._save_pending_session
+        )
         self._qr = QrLoginSession()
         self._me_id: int | None = None
         self._me_name: str | None = None
@@ -150,8 +153,12 @@ class UserbotManager:
         await self.reload_cache()
         # A phone-login attempt cannot survive a process restart (its auth key is
         # gone), so clear it instead of letting the wizard show a dead attempt.
-        if await self.drop_stale_pending_login():
-            logger.info("Discarded a login attempt left over from the previous run.")
+        # A login attempt interrupted by a restart can be *continued*: the temporary
+        # client's session was kept, so the code the owner already has is still
+        # valid. Only discard the attempt when it cannot be rebuilt.
+        if not await self.resume_pending_login():
+            if await self.drop_stale_pending_login():
+                logger.info("Discarded a login attempt that could not be resumed.")
         # Credentials and the session: the database first, then the environment.
         #
         # The environment fallback is not a nicety. On a host with an ephemeral
@@ -253,6 +260,45 @@ class UserbotManager:
 
     async def _clear_pending_login(self) -> None:
         await self._db.delete_setting("tg_pending_login")
+
+    async def _save_pending_session(self, session: str | None) -> None:
+        """Keep (or drop) the temporary login client's session string."""
+        if session:
+            await self._db.set_setting("tg_pending_login_session", session)
+        else:
+            await self._db.delete_setting("tg_pending_login_session")
+
+    async def _load_pending_session(self) -> str | None:
+        value = await self._db.get_setting("tg_pending_login_session")
+        return str(value) if value else None
+
+    async def resume_pending_login(self) -> bool:
+        """Continue a login attempt that a restart interrupted, if one exists.
+
+        Called at startup. Returns True when an attempt was picked up and the code
+        the owner is holding can still be accepted.
+        """
+        try:
+            pending = await self._db.get_setting("tg_pending_login")
+        except Exception:  # pragma: no cover - storage is best effort
+            return False
+        if not pending:
+            return False
+        # Seed the snapshot the session needs, including the credentials from the
+        # database (they are never written into the snapshot itself).
+        if isinstance(pending, dict):
+            api_id = await self._db.get_setting("tg_api_id")
+            api_hash = await self._db.get_setting("tg_api_hash")
+            pending = {
+                **pending,
+                "api_id": api_id or self._env_api_id,
+                "api_hash": api_hash or self._env_api_hash,
+            }
+            self._login.seed_snapshot(pending)
+        resumed = await self._login.restore()
+        if resumed:
+            logger.info("Resumed the login attempt that a restart interrupted.")
+        return resumed
 
     async def drop_stale_pending_login(self) -> bool:
         """Clear a login attempt left over from a previous process run.

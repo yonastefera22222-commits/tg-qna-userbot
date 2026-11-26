@@ -176,6 +176,15 @@ def parse_phone(raw: str) -> ParsedPhone:
 
     digits = cleaned
 
+    # A trunk prefix after the country code. "+251 091 234 5678" is how a great many
+    # people write their own number: the international form with the national 0 kept.
+    # Sent as-is, Telegram receives "+2510912345678", which is a *different* number
+    # (and almost certainly nobody's), so it accepts the request and delivers the
+    # code nowhere. Only stripped for the country codes where a leading 0 is known to
+    # be a trunk prefix -- genuinely international numbers such as +1 0123... or
+    # +44 0123... are left untouched because a real number really can start that way.
+    digits = _drop_trunk_after_country_code(digits, had_plus=had_plus)
+
     # E.164 allows at most 15 digits including the country code.
     if len(digits) > 15:
         return ParsedPhone(
@@ -222,6 +231,119 @@ def parse_phone(raw: str) -> ParsedPhone:
         return ParsedPhone("", PhoneIssue.BAD_COUNTRY_CODE, "That number does not look right.")
 
     return ParsedPhone(e164, PhoneIssue.OK)
+
+
+#: Country codes whose national numbers are written with a leading 0 that must be
+#: removed before the country code. Covers the countries this bot is actually used
+#: from; deliberately not a blanket rule, because for some numbering plans a leading
+#: 0 is part of the number.
+_TRUNK_ZERO_COUNTRIES = frozenset(
+    {
+        "20",   # Egypt
+        "27",   # South Africa
+        "30",   # Greece
+        "31",   # Netherlands
+        "32",   # Belgium
+        "33",   # France
+        "34",   # Spain
+        "39",   # Italy (mobile numbers start with 3, landlines keep the 0 -> stripped)
+        "40",   # Romania
+        "41",   # Switzerland
+        "43",   # Austria
+        "44",   # United Kingdom
+        "45",   # Denmark
+        "46",   # Sweden
+        "47",   # Norway
+        "48",   # Poland
+        "49",   # Germany
+        "52",   # Mexico
+        "55",   # Brazil
+        "60",   # Malaysia
+        "61",   # Australia
+        "62",   # Indonesia
+        "63",   # Philippines
+        "64",   # New Zealand
+        "66",   # Thailand
+        "81",   # Japan
+        "82",   # South Korea
+        "84",   # Vietnam
+        "90",   # Türkiye
+        "91",   # India
+        "92",   # Pakistan
+        "94",   # Sri Lanka
+        "98",   # Iran
+        "212",  # Morocco
+        "213",  # Algeria
+        "216",  # Tunisia
+        "218",  # Libya
+        "220",  # Gambia
+        "221",  # Senegal
+        "233",  # Ghana
+        "234",  # Nigeria
+        "249",  # Sudan
+        "250",  # Rwanda
+        "251",  # Ethiopia
+        "252",  # Somalia
+        "254",  # Kenya
+        "255",  # Tanzania
+        "256",  # Uganda
+        "257",  # Burundi
+        "258",  # Mozambique
+        "260",  # Zambia
+        "263",  # Zimbabwe
+        "264",  # Namibia
+        "265",  # Malawi
+        "267",  # Botswana
+        "268",  # Eswatini
+        "351",  # Portugal
+        "352",  # Luxembourg
+        "353",  # Ireland
+        "358",  # Finland
+        "370",  # Lithuania
+        "371",  # Latvia
+        "372",  # Estonia
+        "380",  # Ukraine
+        "381",  # Serbia
+        "385",  # Croatia
+        "386",  # Slovenia
+        "420",  # Czechia
+        "421",  # Slovakia
+        "966",  # Saudi Arabia
+        "971",  # UAE
+        "972",  # Israel
+        "974",  # Qatar
+        "977",  # Nepal
+        "994",  # Azerbaijan
+    }
+)
+
+#: Minimum national-number length we accept after stripping the trunk zero, so a
+#: number that merely starts with 0 is not shortened into nonsense.
+_MIN_NATIONAL_DIGITS = 8
+
+
+def _drop_trunk_after_country_code(digits: str, *, had_plus: bool) -> str:
+    """Remove a national trunk ``0`` that was kept after the country code.
+
+    ``+2510912345678`` -> ``+251912345678``. Returns ``digits`` unchanged whenever
+    the country is unknown, no ``0`` follows the country code, or the remainder
+    would be too short to be a real number.
+    """
+    if not isinstance(digits, str) or not digits:
+        return digits
+    for length in (3, 2, 1):
+        country = digits[:length]
+        if country not in _TRUNK_ZERO_COUNTRIES:
+            continue
+        rest = digits[length:]
+        if not rest.startswith("0"):
+            return digits
+        stripped = rest.lstrip("0")
+        # Guard: only strip when what is left is still a plausible national number.
+        if len(stripped) < _MIN_NATIONAL_DIGITS:
+            return digits
+        return country + stripped
+    return digits
 
 
 def _has_known_call_prefix(digits: str) -> bool:
@@ -409,6 +531,25 @@ def _describe_this_attempt(sent: object) -> CodeDelivery:
             f"Open <a href='{url}'>{url}</a> to continue.",
             getattr(sent_type, "length", None),
             action_required=True,
+        )
+    if isinstance(sent_type, auth_types.SentCodeTypeFirebaseSms):
+        # Android/Google-service numbers: Telegram hands the code to Google Play
+        # services, which shows it as a one-tap prompt *inside the Telegram app* on
+        # that device - it never becomes an SMS. Reporting this as "unknown" (as the
+        # bot used to) makes people wait for an SMS that Telegram was never going to
+        # send, which is a big part of the "no code ever arrives" complaint.
+        return CodeDelivery(
+            DeliveryChannel.TELEGRAM_APP,
+            "Code delivered by Google Play services",
+            "This number gets its login code through <b>Google Play services</b>, not "
+            "SMS: Telegram hands it to your phone and it appears as a "
+            "<b>“Confirm” prompt inside the Telegram app</b> on the device that has "
+            "this number, or in the <b>“Telegram” service chat</b>.\n\n"
+            "📲 Open Telegram on that phone and look for the prompt or the code. "
+            "Nothing will arrive by SMS for this attempt.\n\n"
+            "⚠️ If nothing appears there, use <b>📷 QR Login</b> or "
+            "<b>📧 Get the code by email</b> — those do not depend on this channel.",
+            length,
         )
     if isinstance(sent_type, auth_types.SentCodeTypeSetUpEmailRequired):
         return CodeDelivery(
@@ -737,6 +878,12 @@ class PhoneLoginSession:
         # Optional persistence (SQLite) so a host restart during login does not
         # silently throw away a login attempt the owner already started.
         self._persist: PersistCallback | None = None
+        self._load_session: Callable[[], Awaitable[str | None]] | None = None
+        #: Last persisted snapshot, kept in memory so ``restore()`` can rebuild the
+        #: attempt without a second database round-trip.
+        self._last_snapshot: dict[str, object] | None = None
+        self._save_session: Callable[[str | None], Awaitable[None]] | None = None
+        self._session_tasks: set[asyncio.Task] = set()
         self._clear_persisted: ClearCallback | None = None
 
     def set_notify(self, notify: NotifyCallback | None) -> None:
@@ -751,6 +898,38 @@ class PhoneLoginSession:
             await notify(text)
         except Exception as exc:  # pragma: no cover - notification is best effort
             logger.debug("Could not notify the owner: %s", exc)
+
+    def set_session_store(
+        self,
+        load: Callable[[], Awaitable[str | None]] | None,
+        save: Callable[[str | None], Awaitable[None]] | None,
+    ) -> None:
+        """Persist the *temporary login client's* session string.
+
+        This is what makes a login survive the host restarting between "send your
+        number" and "type the code" - the normal case on Render Free, which sleeps
+        after 15 minutes idle and redeploys on every push. Telegram binds
+        ``phone_code_hash`` to the auth key of the connection that requested the
+        code, so keeping that connection's session is the only way the code the
+        owner is holding can still be accepted afterwards.
+        """
+        self._load_session = load
+        self._save_session = save
+
+    def _store_session(self, client: TelegramClient | None) -> None:
+        save, self._save_session = self._save_session, self._save_session
+        if save is None:
+            return
+        value: str | None = None
+        if client is not None:
+            try:
+                value = client.session.save()
+            except Exception:  # pragma: no cover - defensive
+                value = None
+        task = asyncio.create_task(save(value))
+        # Keep a reference so the task is not garbage collected mid-flight.
+        self._session_tasks.add(task)
+        task.add_done_callback(self._session_tasks.discard)
 
     def set_persistence(
         self,
@@ -778,6 +957,8 @@ class PhoneLoginSession:
         }
 
     async def _save(self) -> None:
+        if self._pending is not None:
+            self._last_snapshot = self._snapshot()
         if self._persist is None or self._pending is None:
             return
         try:
@@ -811,6 +992,7 @@ class PhoneLoginSession:
         await self._stop_keepalive()
         pending, self._pending = self._pending, None
         await self._discard()
+        self._store_session(None)
         if pending is not None:
             try:
                 await pending.client.disconnect()
@@ -851,6 +1033,76 @@ class PhoneLoginSession:
             await client.connect()
 
     # -- step 1: phone -> code -----------------------------------------
+    def seed_snapshot(self, snapshot: dict[str, object] | None) -> None:
+        """Hand ``restore()`` the persisted attempt (including credentials)."""
+        self._last_snapshot = snapshot
+
+    async def restore(self) -> bool:
+        """Reconnect a login attempt that was interrupted by a process restart.
+
+        The owner sent a number, Telegram accepted it, and the host restarted before
+        the code was typed - on Render Free that happens on every deploy and after
+        15 minutes idle. Telegram ties ``phone_code_hash`` to the auth key of the
+        connection that asked for the code, so the attempt can only continue if that
+        connection's session was kept. It is; this rebuilds the client from it, so
+        the code the owner already has is still accepted.
+        """
+        if self._pending is not None:
+            return True
+        if self._load_session is None:
+            return False
+        try:
+            stored = await self._load_session()
+        except Exception as exc:  # pragma: no cover - storage is best effort
+            logger.debug("Could not load a saved login session: %s", exc)
+            return False
+        if not stored:
+            return False
+        snapshot = self._last_snapshot
+        if not snapshot or not snapshot.get("phone") or not snapshot.get("phone_code_hash"):
+            return False
+
+        api_id = snapshot.get("api_id")
+        api_hash = snapshot.get("api_hash")
+        if not api_id or not api_hash:
+            # api_hash is never snapshotted on purpose; the caller supplies creds.
+            return False
+
+        try:
+            client = make_login_client(
+                int(api_id), str(api_hash), session=StringSession(str(stored))
+            )
+            await client.connect()
+        except Exception as exc:
+            logger.info("Could not rebuild the interrupted login connection: %s", exc)
+            return False
+
+        channel = snapshot.get("delivery_channel")
+        delivery = None
+        for candidate in DeliveryChannel:
+            if candidate.value == channel:
+                delivery = CodeDelivery(candidate, channel.replace("_", " ").title(), "")
+                break
+        pending = PendingLogin(
+            client=client,
+            api_id=int(api_id),
+            api_hash=str(api_hash),
+            phone=str(snapshot["phone"]),
+            phone_code_hash=str(snapshot["phone_code_hash"]),
+            delivery=delivery,
+            code_length=snapshot.get("code_length"),  # type: ignore[arg-type]
+            resend_count=int(snapshot.get("resend_count") or 0),
+        )
+        self._set_pending(pending)
+        # The interrupted attempt has already used its one automatic resend, if any.
+        pending.channel_escalated = True
+        await self._start_keepalive(client)
+        logger.info(
+            "Resumed the interrupted login attempt for %s (code still valid).",
+            pending.phone,
+        )
+        return True
+
     async def request_code(self, api_id: int, api_hash: str, raw_phone: str) -> LoginResult:
         """Validate the number, request a code and record where it was delivered."""
         parsed = parse_phone(raw_phone)
@@ -886,6 +1138,8 @@ class PhoneLoginSession:
         )
         await self._start_keepalive(client)
         await self._save()
+        # Keep this connection's session so a restart can pick the attempt up again.
+        self._store_session(client)
         logger.info(
             "Login code requested for %s via %s (length=%s, email_setup_required=%s)",
             parsed.e164,
