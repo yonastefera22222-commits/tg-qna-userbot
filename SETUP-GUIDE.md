@@ -83,9 +83,20 @@ Your repo: `github.com/yonastefera22222-commits/tg-qna-userbot` → click **Fork
 > | `ENCRYPTION_KEY` | Keeps stored secrets readable across restarts |
 > | `BOT_STATE_B64` | Groups, AI keys and settings (export from the dashboard) |
 >
-> Generate `TG_STRING_SESSION` once with `python tools/make_session.py` (it explains
-> itself), then paste it into the host's **Environment** tab. That is the only step
-> that removes the code from the login entirely.
+> **You do not need a computer to get `TG_STRING_SESSION`.** Once the bot is
+> connected (even briefly), open its dashboard → **Account** →
+> **🔑 Get Session String**. It sends you a `.txt` file plus the string inline.
+> Copy the file's value verbatim into the host's **Environment** tab as
+> `TG_STRING_SESSION`. From then on the bot starts already logged in and there is
+> no code to lose. (A terminal alternative is `python tools/make_session.py`.)
+
+> **The bot now keeps itself awake.** Free services sleep after 15 minutes without
+> *inbound* HTTP, and Telegram polling is outbound — so the bot used to be spun
+> down while doing its job. It now pings its own public `/health` every 10 minutes
+> (`KEEPALIVE_PING_SECONDS`, default 600; set `0` to disable). Set `PUBLIC_URL` if
+> the host does not provide `RENDER_EXTERNAL_URL`. Note that keeping a free
+> instance awake consumes its 750 monthly instance hours, which covers ~31 days of
+> one service — enough for a single always-on bot.
 
 > **The blueprint does not ask for your Telegram API ID and Hash.** Those are
 > **not** environment variables in `render.yaml`, so a blueprint deploy leaves them

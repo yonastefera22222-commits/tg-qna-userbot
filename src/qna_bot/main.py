@@ -190,6 +190,10 @@ async def async_main() -> None:
             login_manager=browser_login,
         )
         await health_server.start()
+        # Keep the service awake: a spun-down free instance loses its filesystem,
+        # and the Telegram login is on it.
+        if env.public_url and env.keepalive_ping_seconds > 0:
+            health_server.start_self_ping(env.public_url, env.keepalive_ping_seconds)
 
     owner_id = await ctx.get_owner_id()
     if owner_id is None:

@@ -9,9 +9,11 @@ deliberately ignore that link when it was clicked inside the app.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 
+import aiohttp
 from aiohttp import web
 
 from .browser_login import BrowserLoginManager, render_login_page
@@ -35,6 +37,7 @@ class HealthServer:
         self._login_manager = login_manager
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+        self._ping_task: asyncio.Task | None = None
 
     @property
     def bound_port(self) -> int:
@@ -59,10 +62,60 @@ class HealthServer:
         logger.info("Health HTTP server listening on http://%s:%d/health", self._host, self.bound_port)
 
     async def stop(self) -> None:
+        if self._ping_task is not None:
+            self._ping_task.cancel()
+            self._ping_task = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
             self._site = None
+
+    # -- keep-alive ------------------------------------------------------
+    def start_self_ping(self, public_url: str, interval_seconds: float) -> None:
+        """Ping our own /health so the host never sees 15 idle minutes.
+
+        Render Free spins a service down after 15 minutes without **inbound** HTTP
+        (https://render.com/docs/free). The bot's Telegram connection is *outbound*
+        polling, so it does not count, and with no web traffic the service sleeps
+        even while it is doing its job. A sleeping service loses its filesystem -
+        including data/bot.db, where the login lives - so the bot has to generate
+        its own inbound traffic.
+
+        A request to the service's own public URL goes through the host's router,
+        so it counts as inbound traffic exactly like a visitor would. Every 10
+        minutes keeps a 15-minute timer from ever expiring.
+        """
+        if interval_seconds <= 0:
+            logger.info("Self-ping disabled (KEEPALIVE_PING_SECONDS=0).")
+            return
+        if self._ping_task is not None:
+            return
+        self._ping_task = asyncio.create_task(
+            self._ping_forever(public_url, interval_seconds),
+            name="health-self-ping",
+        )
+        logger.info(
+            "Self-ping enabled: %s/health every %ds (prevents free-tier spin-down).",
+            public_url,
+            int(interval_seconds),
+        )
+
+    async def _ping_forever(self, public_url: str, interval_seconds: float) -> None:
+        url = public_url.rstrip("/") + "/health"
+        # Let the service finish booting before the first request.
+        await asyncio.sleep(min(60, interval_seconds))
+        while True:
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as session:
+                    async with session.get(url) as resp:
+                        logger.debug("Self-ping %s -> %s", url, resp.status)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a failed ping must not kill the task
+                logger.debug("Self-ping failed (%s); will retry", exc)
+            await asyncio.sleep(interval_seconds)
 
     async def _handle_health(self, _request: web.Request) -> web.Response:
         payload = {"status": "ok", **self._status_provider()}

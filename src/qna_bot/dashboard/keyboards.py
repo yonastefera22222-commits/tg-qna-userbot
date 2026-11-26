@@ -423,6 +423,10 @@ def account_menu_kb(is_connected: bool) -> InlineKeyboardMarkup:
         callback_data="acc:export_render",
     )
     b.button(
+        text="🔑 Get Session String (survives restarts)",
+        callback_data="acc:session_string",
+    )
+    b.button(
         text="🎁 Share Setup With Someone (no credentials)",
         callback_data="acc:export_share",
     )

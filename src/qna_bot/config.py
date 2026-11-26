@@ -55,6 +55,10 @@ class EnvConfig:
     data_dir: Path
     encryption_key: str | None
     log_level: str
+    #: Seconds between self-pings that keep a free host from spinning down.
+    #: Render Free sleeps after 15 idle minutes of *inbound* HTTP, and the bot's
+    #: Telegram polling is outbound, so it has to generate its own traffic.
+    keepalive_ping_seconds: int
 
     @property
     def db_path(self) -> Path:
@@ -99,4 +103,5 @@ def load_env_config() -> EnvConfig:
         data_dir=data_dir,
         encryption_key=(os.getenv("ENCRYPTION_KEY") or "").strip() or None,
         log_level=(os.getenv("LOG_LEVEL") or "INFO").strip().upper(),
+        keepalive_ping_seconds=_parse_int(os.getenv("KEEPALIVE_PING_SECONDS")) or 600,
     )
