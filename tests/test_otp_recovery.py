@@ -46,3 +46,63 @@ def test_a_failed_qr_start_explains_itself() -> None:
 
     src = inspect.getsource(wizard._show_qr_image)
     assert "did not issue a QR token" in src
+
+
+# ---------------------------------------------------------------------------
+# "Still no QR code" - the handler started two logins at once
+# ---------------------------------------------------------------------------
+
+
+def test_the_qr_button_starts_exactly_one_login() -> None:
+    """Starting the browser flow *and* a QR login made Telegram cancel the token.
+
+    Two live connections for one login attempt: Telegram rejects the second
+    ``auth.exportLoginToken``, ``start_qr_login`` returns ``url=None``, and the
+    screen says "Telegram did not issue a QR token" instead of showing an image.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from qna_bot.dashboard.handlers import wizard
+    from qna_bot.userbot.login import LoginResult, LoginStatus
+
+    browser = SimpleNamespace(
+        start=AsyncMock(side_effect=AssertionError("browser login must not be started")),
+        page_url=MagicMock(return_value="https://example.test/login/abc"),
+    )
+    userbot = SimpleNamespace(
+        start_qr_login=AsyncMock(
+            return_value=(
+                LoginResult(LoginStatus.CODE_SENT, "Scan this QR code."),
+                "tg://login?token=abc",
+            )
+        ),
+        qr_code=MagicMock(return_value=b"\x89PNG\r\n\x1a\npayload"),
+    )
+    ctx = SimpleNamespace(
+        browser_login=browser,
+        userbot=userbot,
+        env=SimpleNamespace(public_url="https://example.test"),
+        db=SimpleNamespace(get_setting=AsyncMock(return_value=None)),
+    )
+    state = SimpleNamespace(
+        get_data=AsyncMock(return_value={"api_id": 12345, "api_hash": "a" * 32}),
+        set_state=AsyncMock(),
+        update_data=AsyncMock(),
+    )
+    message = SimpleNamespace(
+        answer_photo=AsyncMock(), edit_text=AsyncMock(), answer=AsyncMock()
+    )
+    callback = SimpleNamespace(
+        answer=AsyncMock(),
+        message=message,
+        bot=SimpleNamespace(edit_message_text=AsyncMock()),
+    )
+
+    asyncio.run(wizard.cb_login_qr(callback, ctx, state))
+
+    browser.start.assert_not_awaited()
+    userbot.start_qr_login.assert_awaited_once()
+    message.answer_photo.assert_awaited_once()
+    assert userbot.qr_code.called

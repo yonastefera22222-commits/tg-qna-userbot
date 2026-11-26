@@ -71,7 +71,8 @@ from telethon.tl.functions.account import (
     SendVerifyEmailCodeRequest,
     VerifyEmailRequest,
 )
-from telethon.tl.functions.auth import ResendCodeRequest
+from telethon.tl.functions.auth import ResendCodeRequest, SendCodeRequest
+from telethon.tl.types import CodeSettings
 from telethon.tl.types import auth as auth_types
 
 logger = logging.getLogger(__name__)
@@ -645,6 +646,67 @@ def translate_signin_error(exc: Exception) -> LoginResult:
 #:
 #: The values are deliberately a plain, widely-installed Android build rather
 #: than anything unusual, and they are used only for the *login* connection.
+def code_settings() -> CodeSettings | None:
+    """The delivery channels to permit when asking Telegram for a login code.
+
+    Telethon calls ``auth.sendCode`` with a bare ``CodeSettings()``, whose every
+    flag is ``None`` - and an unset TL flag means "not allowed". So the bot was
+    literally telling Telegram not to use the SMS/FlashCall/Firebase channels,
+    then wondering why no code arrived.
+
+    ``allow_app_hash`` is the one that matters most here. Telethon computes the
+    ``api_id``/``api_hash`` application hash and sends it with ``auth.sendCode``
+    only when this flag is set; Telegram's anti-spam uses that hash to recognise a
+    known third-party application rather than treating every login as an
+    unrecognised client and silently dropping the code. Leaving it unset is a real,
+    reproducible difference between this bot and a well-behaved client.
+
+    Everything else is sent as an explicit ``False`` rather than ``None`` so the
+    request states a decision instead of omitting one.
+    """
+    try:
+        return CodeSettings(
+            allow_flashcall=False,
+            current_number=False,
+            allow_app_hash=True,
+            allow_missed_call=False,
+            allow_firebase=True,
+            unknown_number=False,
+        )
+    except Exception as exc:  # pragma: no cover - older Telethon builds
+        logger.warning("Could not build CodeSettings (%s); using the default", exc)
+        return None
+
+
+async def _request_login_code(client: TelegramClient, phone: str):
+    """``send_code_request`` with the delivery flags set explicitly.
+
+    Falls back to Telethon's own helper (all flags unset) only when the explicit
+    request cannot be built, so behaviour is never worse than before.
+    """
+    settings = code_settings()
+    api_id = getattr(client, "api_id", None)
+    api_hash = getattr(client, "api_hash", None)
+    # Only a real client is asked directly. Anything else (a stand-in, or a wrapper
+    # without api credentials) keeps using Telethon's own helper.
+    if settings is None or api_id is None or api_hash is None or not isinstance(client, TelegramClient):
+        return await client.send_code_request(phone)
+    sent = await client(
+        SendCodeRequest(
+            phone_number=phone,
+            api_id=api_id,
+            api_hash=api_hash,
+            settings=settings,
+        )
+    )
+    if isinstance(sent, auth_types.SentCodeSuccess):  # pragma: no cover - API contract
+        raise RuntimeError("Telegram logged in without asking for a code")
+    # Keep Telethon's own bookkeeping in step: later calls read this cache.
+    if sent.phone_code_hash:
+        client._phone_code_hash[phone] = sent.phone_code_hash
+    return sent
+
+
 DEVICE_MODEL = "Pixel 6"
 SYSTEM_VERSION = "SDK 33"
 APP_VERSION = "10.2.0 (4300)"
@@ -813,7 +875,7 @@ class PhoneLoginSession:
         client = make_login_client(api_id, api_hash)
         try:
             await client.connect()
-            sent = await client.send_code_request(parsed.e164)
+            sent = await _request_login_code(client, parsed.e164)
         except Exception as exc:
             try:
                 await client.disconnect()
@@ -1176,7 +1238,7 @@ class PhoneLoginSession:
 
         # 2) Fallback: brand new request from the same (still connected) client.
         try:
-            sent = await pending.client.send_code_request(pending.phone)
+            sent = await _request_login_code(pending.client, pending.phone)
         except Exception as exc:
             logger.warning("Fresh send_code_request failed for %s: %s", pending.phone, exc)
             return translate_send_error(exc, pending.phone)
@@ -1257,7 +1319,7 @@ class PhoneLoginSession:
             return translate_signin_error(PhoneCodeExpiredError(request=None))
 
         try:
-            sent = await pending.client.send_code_request(pending.phone)
+            sent = await _request_login_code(pending.client, pending.phone)
         except Exception as exc:
             return translate_send_error(exc, pending.phone)
 
