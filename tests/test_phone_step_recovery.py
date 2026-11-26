@@ -29,7 +29,6 @@ import pytest
 
 from qna_bot.dashboard.filters import NotACommand
 from qna_bot.dashboard.handlers import wizard
-from qna_bot.userbot.login import PhoneIssue, parse_phone
 
 
 def test_the_back_button_does_not_cancel_a_live_attempt() -> None:
@@ -67,41 +66,69 @@ def test_choosing_the_phone_method_releases_a_stale_attempt() -> None:
         "00251912345678",
         "+15551234567",
         "tel:+251912345678",
-        # A too-short number is still obviously a phone attempt, not a random
-        # message: it should reach msg_phone and get its precise hint.
-        "+2519123",
+        "0912345678",  # national trunk prefix: let msg_phone explain the country code
+        "+2519123",  # too short, but unmistakably a dial attempt
     ],
 )
 def test_a_phone_number_is_recognised_as_one(text: str) -> None:
-    """The catch-all uses this to decide whether to recover the step."""
-    parsed = parse_phone(text)
-    recognised_by_issue = parsed.issue in (
-        PhoneIssue.OK,
-        PhoneIssue.TOO_SHORT,
-        PhoneIssue.TOO_LONG,
-    )
-    import re
+    from qna_bot.dashboard.handlers.wizard import _looks_like_a_phone_number
 
-    recognised_by_shape = bool(re.fullmatch(r"\+?\d{7,15}", re.sub(r"[^\d+]", "", text) or ""))
-    assert recognised_by_issue or recognised_by_shape, f"{text!r} would dead-end"
+    assert _looks_like_a_phone_number(text), f"{text!r} would dead-end"
 
 
 @pytest.mark.parametrize(
     "text",
-    ["hello", "how much is gold today?", "go", "ጥሩ ነው", "", "?"],
+    [
+        "hello",
+        "how much is gold today?",
+        "go",
+        "ጥሩ ነው",
+        "",
+        "?",
+    ],
 )
 def test_ordinary_chatter_is_not_mistaken_for_a_phone(text: str) -> None:
     """Recovery must not swallow normal messages into the login flow."""
-    parsed = parse_phone(text)
-    import re
+    from qna_bot.dashboard.handlers.wizard import _looks_like_a_phone_number
 
-    recognised_by_issue = parsed.issue in (
-        PhoneIssue.OK,
-        PhoneIssue.TOO_SHORT,
-        PhoneIssue.TOO_LONG,
-    )
-    recognised_by_shape = bool(re.fullmatch(r"\+?\d{7,15}", re.sub(r"[^\d+]", "", text) or ""))
-    assert not (recognised_by_issue or recognised_by_shape), f"{text!r} was treated as a phone"
+    assert not _looks_like_a_phone_number(text), f"{text!r} was treated as a phone"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "12345678",  # a typical API ID from my.telegram.org
+        "9876543",
+        "1234567",
+        "123456",
+        "0123456",
+        "12345678901234",  # arbitrary digit run, no dialling code
+    ],
+)
+def test_an_api_id_is_never_treated_as_a_phone(text: str) -> None:
+    """The regression from #43: an API ID was swallowed by the phone step.
+
+    With the ID eaten, the hash was never stored, and every later attempt failed
+    with "Missing API credentials" - the exact loop reported afterwards.
+    """
+    from qna_bot.dashboard.handlers.wizard import _looks_like_a_phone_number
+
+    assert not _looks_like_a_phone_number(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "0123456789abcdef0123456789abcdef",
+        "9876543210fedcba9876543210fedcba",
+        "ABCDEF0123456789ABCDEF0123456789",
+    ],
+)
+def test_an_api_hash_is_never_treated_as_a_phone(text: str) -> None:
+    """A hash is 32 hex chars, sometimes all digits, and must never be a number."""
+    from qna_bot.dashboard.handlers.wizard import _looks_like_a_phone_number
+
+    assert not _looks_like_a_phone_number(text)
 
 
 def test_the_catch_all_calls_the_phone_handler() -> None:
@@ -142,3 +169,79 @@ def test_notacommand_still_lets_a_number_through() -> None:
         text = "+251912345678"
 
     assert NotACommand()  # constructible
+
+
+# ---------------------------------------------------------------------------
+# The API ID / Hash loop:  "Missing API credentials. Send /setup" on repeat
+# ---------------------------------------------------------------------------
+
+
+def test_an_api_id_arriving_with_no_step_is_taken_not_shrugged_at() -> None:
+    """Being told to re-enter credentials, then ignored when you do, is the loop."""
+    import inspect
+
+    src = inspect.getsource(wizard.msg_any_fallback)
+    assert "waiting_api_id" in src
+    assert "msg_api_id(" in src
+
+
+def test_the_api_credentials_are_stored_when_entered() -> None:
+    """They used to live only in conversation state, so a restart lost them."""
+    import inspect
+
+    id_src = inspect.getsource(wizard.msg_api_id)
+    hash_src = inspect.getsource(wizard.msg_api_hash)
+
+    assert 'set_setting("tg_api_id"' in id_src
+    assert 'set_setting("tg_api_id"' in hash_src
+    assert 'set_setting("tg_api_hash"' in hash_src
+
+
+@pytest.mark.asyncio
+async def test_the_whole_credential_flow_saves_and_then_requests_a_code() -> None:
+    """End-to-end with stubs: ID, hash, then phone - the reported sequence."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    store: dict = {}
+    db = MagicMock()
+    db.set_setting = AsyncMock(side_effect=lambda k, v: store.__setitem__(k, v))
+    db.get_setting = AsyncMock(side_effect=lambda k, d=None: store.get(k, d))
+
+    ctx = MagicMock()
+    ctx.db = db
+    ctx.env = SimpleNamespace(tg_api_id=None, tg_api_hash=None)
+    ctx.userbot.start_phone_login = AsyncMock(
+        return_value=SimpleNamespace(
+            status=wizard.LoginStatus.CODE_SENT, message="ok", delivery=None, retry_after=None
+        )
+    )
+    ctx.userbot.pending_phone = "+251912345678"
+    ctx.userbot.last_code_delivery = None
+    ctx.userbot.email_setup_required = False
+
+    held: dict = {}
+    state = MagicMock()
+    state.get_state = AsyncMock(return_value=None)
+    state.get_data = AsyncMock(side_effect=lambda: dict(held))
+    state.update_data = AsyncMock(side_effect=lambda **kw: held.update(kw))
+    state.set_state = AsyncMock()
+
+    def msg(text: str):
+        return SimpleNamespace(text=text, answer=AsyncMock(), chat=MagicMock(id=1))
+
+    # 1. API ID typed into an empty conversation.
+    first = msg("12345678")
+    await wizard.msg_any_fallback(first, ctx, state)
+    assert store.get("tg_api_id") == 12345678
+    assert not ctx.userbot.start_phone_login.called, "an API ID must not start the login"
+
+    # 2. API Hash.
+    second = msg("0123456789abcdef0123456789abcdef")
+    await wizard.msg_api_hash(second, ctx, state)
+    assert store.get("tg_api_hash") == "0123456789abcdef0123456789abcdef"
+
+    # 3. Phone number - this is what used to say "Missing API credentials".
+    third = msg("+251912345678")
+    await wizard.msg_any_fallback(third, ctx, state)
+    assert ctx.userbot.start_phone_login.called, "the login should now start"

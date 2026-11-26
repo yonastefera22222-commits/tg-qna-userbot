@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ...ai.providers import PROVIDERS, fetch_live_models
-from ...userbot.login import CodeDelivery, LoginStatus, PhoneIssue, parse_phone
+from ...userbot.login import CodeDelivery, LoginStatus
 from ..context import AppContext, safe_delete_message, safe_edit_text
 from ..filters import NotACommand
 from ..keyboards import (
@@ -257,13 +257,20 @@ async def cb_step1_creds(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(NotACommand(), WizardStates.waiting_api_id)
-async def msg_api_id(message: Message, state: FSMContext) -> None:
+async def msg_api_id(message: Message, ctx: AppContext, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     await safe_delete_message(message)
     if not raw.isdigit():
         await message.answer("❌ API ID must be a number (e.g. <code>12345678</code>). Try again:")
         return
     await state.update_data(api_id=int(raw))
+    # Store it immediately rather than waiting for the hash. If the conversation
+    # state is lost between these two messages, the ID is still in the database and
+    # the owner is only asked for the hash - instead of both, again, forever.
+    try:
+        await ctx.db.set_setting("tg_api_id", int(raw))
+    except Exception as exc:  # noqa: BLE001 - never block the step on storage
+        logger.warning("Could not store tg_api_id yet: %s", exc)
     await state.set_state(WizardStates.waiting_api_hash)
     await message.answer(
         f"✅ API ID saved (<code>{raw}</code>).\n\n"
@@ -359,6 +366,63 @@ async def cb_login_phone(callback: CallbackQuery, ctx: AppContext, state: FSMCon
         "Telegram app for this number, not by SMS. I will tell you exactly where "
         "it went after you send the number.</i>",
     )
+
+
+#: Dialling codes that make a bare digit string a phone number rather than an
+#: API ID. Deliberately a *positive* list instead of "7-15 digits", because an API
+#: ID is 6-9 digits and any length-based heuristic confuses the two.
+_CALL_PREFIXES = (
+    "1", "20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43",
+    "44", "45", "46", "47", "48", "49", "51", "52", "53", "54", "55", "56", "57",
+    "58", "60", "61", "62", "63", "64", "65", "66", "81", "82", "84", "86", "90",
+    "91", "92", "93", "94", "95", "98", "212", "213", "216", "218", "220", "221",
+    "233", "234", "249", "251", "252", "254", "255", "256", "257", "258", "260",
+    "261", "263", "264", "265", "266", "267", "268", "269", "351", "352", "353",
+    "358", "380", "381", "385", "420", "421", "503", "504", "505", "506", "507",
+    "509", "549", "591", "593", "595", "598", "601", "628", "673", "855", "856",
+    "880", "886", "960", "961", "962", "963", "964", "965", "966", "967", "968",
+    "971", "972", "973", "974", "975", "977", "992", "993", "994", "995", "998",
+)
+
+
+def _looks_like_a_phone_number(text: str) -> bool:
+    """True only for something that is unmistakably a dialable number.
+
+    Used by the catch-all to recover a lost login step. It must never claim an
+    API ID (6-9 digits, no dialling code) or an API Hash (32 hex characters,
+    which can be all digits).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    # An API Hash is 32 hex characters and can be entirely numeric-ish; it must
+    # never be mistaken for a number. Likewise require the input to *look* like
+    # phone input at all, so a hex string with letters is rejected before the
+    # digits are stripped out of it.
+    if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+        return False
+    if not re.fullmatch(r"(?i)(tel:)?[\d\s+\-().]+", raw):
+        return False
+    digits = re.sub(r"[^\d+]", "", raw)
+    if digits.startswith("+"):
+        # An explicit international prefix is unambiguous, and an API ID is never
+        # written that way. Allow a short one through so msg_phone can say it is
+        # too short, which is more useful than "I am not waiting for input".
+        return bool(re.fullmatch(r"\+\d{7,15}", digits))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if not digits.isdigit():
+        return False
+    if digits.startswith("0"):
+        # A leading 0 is a national trunk prefix - never an API ID. Let it reach
+        # the phone step so msg_phone can explain that the country code is
+        # missing, which is far more useful than "I am not waiting for input".
+        return len(digits) >= 10
+    # A bare number needs a real dialling code and a plausible length: >= 10
+    # digits excludes every API ID, and <= 13 excludes arbitrary digit runs.
+    if not (10 <= len(digits) <= 13):
+        return False
+    return any(digits.startswith(prefix) for prefix in _CALL_PREFIXES)
 
 
 @router.message(NotACommand(), WizardStates.waiting_phone)
@@ -1491,19 +1555,28 @@ async def msg_any_fallback(message: Message, ctx: AppContext, state: FSMContext)
     if current is None:
         # A phone number typed into an empty conversation is not "input while not
         # waiting" - it is someone in the middle of the login whose step got lost.
-        # This happened every time the owner reached the phone prompt through
-        # "Login Options" / "Try Again": those handlers set the state to None, so
-        # the number arrived with nothing waiting for it and was answered with a
-        # shrug. Recover instead of lecturing: recognise the number, restore the
-        # step, and continue exactly as if the button had just been pressed.
-        parsed = parse_phone(text)
-        if parsed.issue in (
-            PhoneIssue.OK,
-            PhoneIssue.TOO_SHORT,
-            PhoneIssue.TOO_LONG,
-        ) or re.fullmatch(r"\+?\d{7,15}", re.sub(r"[^\d+]", "", text) or ""):
+        # This happened when the owner reached the phone prompt through a screen
+        # that cleared the state, so the number arrived with nothing waiting for
+        # it and was answered with a shrug.
+        #
+        # The test must be *positive*: an international number, or a bare `+`
+        # number. A first attempt also accepted any 7-15 digits, which swallowed
+        # the API ID - "12345678" passed this check, so the wizard jumped to the
+        # phone step, never stored the hash, and every later attempt failed with
+        # "Missing API credentials". A dialling code is exactly what such a number
+        # has and an API ID does not.
+        if _looks_like_a_phone_number(text):
             await state.set_state(WizardStates.waiting_phone)
             await msg_phone(message, ctx, state)
+            return
+
+        # Likewise an API ID arriving with no step: that is someone typing the
+        # credential again after "Missing API credentials. Send /setup", without
+        # actually re-entering the wizard. Answering with a shrug is what made the
+        # loop feel infinite - take the value instead.
+        if re.fullmatch(r"\d{6,9}", text):
+            await state.set_state(WizardStates.waiting_api_id)
+            await msg_api_id(message, ctx, state)
             return
 
         hint = (
