@@ -106,6 +106,10 @@ class Database:
         self._db_path = db_path
         self._cipher = cipher
         self._conn: aiosqlite.Connection | None = None
+        #: Secret keys whose stored value could not be decrypted with the current
+        #: key. Populated on read so the dashboard/diagnostics can tell the owner
+        #: "this was lost when ENCRYPTION_KEY changed" instead of showing a blank.
+        self.undecryptable: set[str] = set()
 
     async def connect(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,7 +210,25 @@ class Database:
             return default
         raw_val = row["value"]
         if key in SECRET_SETTING_KEYS:
-            return self._cipher.decrypt(raw_val)
+            try:
+                return self._cipher.decrypt(raw_val)
+            except ValueError:
+                # The value was encrypted with a different key: ENCRYPTION_KEY was
+                # blanked, replaced, or the generated key file was lost when the
+                # host wiped its disk. Raising here took down whatever called it
+                # (a boot step, a diagnostics command, the wizard) with a traceback
+                # the owner never sees, so the bot looked simply dead.
+                #
+                # Reading a setting must not be able to crash the process. The
+                # secret is unrecoverable either way; the only useful response is
+                # to report it as absent and let the caller ask for it again.
+                logger.error(
+                    "Cannot decrypt %s: stored with a different ENCRYPTION_KEY. "
+                    "Treating it as unset; re-enter it to fix this.",
+                    key,
+                )
+                self.undecryptable.add(key)
+                return default
         try:
             return json.loads(raw_val)
         except json.JSONDecodeError:

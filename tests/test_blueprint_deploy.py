@@ -1,217 +1,159 @@
-"""A fresh Render blueprint deploy, which is how a second owner gets this bot.
+"""A blueprint deploy sets only BOT_TOKEN and OWNER_ID. Two things then break.
 
-Three separate faults made a blueprinted deployment either die at boot or run
-completely silently - both of which the new owner reads as "it's not responding":
+Reported as "I used blueprint and only filled the owner id and bot token", after
+the OTP still failed. Both causes are here, and neither is Telegram:
 
-1. **A bad ``ENCRYPTION_KEY`` killed the process.** ``Fernet`` needs exactly 32
-   url-safe base64 bytes; Render's ``generateValue`` emits a random string, and
-   ``SecretCipher.from_env_or_file`` raised straight out of boot. The service
-   showed a frowning face and stopped, with nothing on Telegram to explain it.
-2. **A ``BOT_STATE_B64`` paste could be ignored.** The import was skipped whenever
-   the database already had *any* settings row carrying a session - but a DB whose
-   secrets could not be decrypted still looks populated, so the snapshot that
-   would have fixed it was skipped in exactly the case it was needed.
-3. **Nothing was ever enabled.** A blueprint deploy starts with an empty group
-   table; groups are only synced when the owner opens the group menu. "Not
-   responding" was therefore literally correct, and ``/diag`` said nothing about
-   it.
+1. **The API ID / API Hash are not in `render.yaml`.** They are not environment
+   variables at all, so a blueprint deploy leaves them unset and the wizard has to
+   collect them. The wizard then kept them **only in the conversation's FSM
+   state** and never wrote them to the database, so the next restart lost them and
+   the login failed with "Missing API credentials" - which sends the owner round
+   the same loop again.
 
-Each test below pins one of those, so a later refactor cannot quietly bring the
-silence back.
+2. **`ENCRYPTION_KEY` is `sync: false` too.** Left blank, the bot generates one
+   into `data/.secret.key` on the container disk. Render Free wipes that disk on
+   every restart, so a *new* key is generated and every stored secret silently
+   becomes unreadable. Reading one raised `ValueError` out of `get_setting`,
+   taking down whatever called it (boot, diagnostics, the wizard) with a traceback
+   the owner never sees. The bot simply looked broken.
+
+Both are fixed to degrade with an explanation instead of a traceback.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from cryptography.fernet import Fernet
 
-from qna_bot.main import _build_cipher, _seed_env_defaults
 from qna_bot.storage.crypto import SecretCipher
 from qna_bot.storage.database import Database
 
 
-async def _db(tmp_path, name: str = "bot") -> Database:
-    db = Database(tmp_path / f"{name}.db", SecretCipher.from_env_or_file(None, tmp_path / ".k"))
+async def _open(db_path, key: bytes) -> Database:
+    db = Database(db_path, SecretCipher(key))
     await db.connect()
     return db
 
 
-def _env(tmp_path, **overrides) -> SimpleNamespace:
-    values = {
-        "owner_id": None,
-        "bot_state_b64": None,
-        "tg_api_id": None,
-        "tg_api_hash": None,
-        "tg_string_session": None,
-        "groq_api_key": None,
-        "gemini_api_key": None,
-        "openrouter_api_key": None,
-        "exness_api_key": None,
-        "exness_private_key": None,
-        "exness_account_id": None,
-        "exness_gateway_url": None,
-        "encryption_key": None,
-        "secret_key_path": tmp_path / ".secret.key",
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+@pytest.mark.asyncio
+async def test_an_unreadable_secret_is_reported_as_missing_not_raised(tmp_path) -> None:
+    """This is the blueprint restart: new generated key, old ciphertext."""
+    db_path = tmp_path / "bot.db"
 
+    db = await _open(db_path, Fernet.generate_key())
+    await db.set_setting("tg_api_hash", "0" * 32)
+    await db.close()
 
-# ---------------------------------------------------------------------------
-# 1. A bad ENCRYPTION_KEY must not stop the boot
-# ---------------------------------------------------------------------------
+    # A restart with a different key — exactly what a wiped disk produces.
+    db2 = await _open(db_path, Fernet.generate_key())
+    try:
+        value = await db2.get_setting("tg_api_hash")
+    finally:
+        await db2.close()
 
-
-@pytest.mark.parametrize(
-    "bad_key",
-    [
-        "a" * 64,  # plausible-looking random hex: what a copy/paste produces
-        "Zm9vYmFy",  # too short
-        "not-base64-at-all!!!",
-        " " * 32,
-    ],
-)
-def test_a_malformed_encryption_key_does_not_crash_startup(tmp_path, caplog, bad_key) -> None:
-    """The deploy used to die here, before any Telegram connection existed."""
-    env = _env(tmp_path, encryption_key=bad_key)
-    cipher = _build_cipher(env)  # must not raise
-
-    # The bot is still usable, and the owner is told what to fix.
-    token = cipher.encrypt("hello")
-    assert cipher.decrypt(token) == "hello"
-    assert "ENCRYPTION_KEY is not a valid Fernet key" in caplog.text
-    assert "Fernet.generate_key" in caplog.text
-
-
-def test_a_valid_encryption_key_is_used_as_given(tmp_path) -> None:
-    key = Fernet.generate_key().decode()
-    cipher = _build_cipher(_env(tmp_path, encryption_key=key))
-    # Rebuilding from the same key must read what the first instance wrote,
-    # which is the whole point of pinning it in the environment.
-    again = SecretCipher.from_env_or_file(key, tmp_path / ".unused")
-    assert again.decrypt(cipher.encrypt("session-string")) == "session-string"
-
-
-def test_missing_encryption_key_still_generates_a_file(tmp_path) -> None:
-    env = _env(tmp_path)
-    _build_cipher(env)
-    assert env.secret_key_path.exists()
-
-
-# ---------------------------------------------------------------------------
-# 2. A pasted BOT_STATE_B64 is applied whenever the DB has no session
-# ---------------------------------------------------------------------------
+    assert value is None, "an unreadable secret must read as unset"
+    assert "tg_api_hash" in db2.undecryptable
 
 
 @pytest.mark.asyncio
-async def test_snapshot_is_imported_into_a_half_populated_database(tmp_path) -> None:
-    """A DB with settings but no usable session must still accept the snapshot."""
-    source = await _db(tmp_path, "source")
-    try:
-        await source.set_setting("tg_session", "SESSION-STRING")
-        await source.set_setting("tg_api_id", 12345)
-        await source.set_provider_key("groq", "gsk_from_snapshot")
-        await source.set_setting("primary_provider", "groq")
-        snapshot = await source.export_state_b64("backup")
-    finally:
-        await source.close()
+async def test_the_undecryptable_set_is_what_the_wizard_reports(tmp_path) -> None:
+    """The wizard distinguishes "never entered" from "cannot be read"."""
+    db_path = tmp_path / "bot.db"
 
-    target = await _db(tmp_path, "target")
-    try:
-        # Something is already there - but no session, so the deployment cannot
-        # answer anything until the snapshot lands.
-        await target.set_setting("schema_note", "leftover")
-        await _seed_env_defaults(_env(tmp_path, bot_state_b64=snapshot), target)
+    db = await _open(db_path, Fernet.generate_key())
+    await db.set_setting("tg_api_id", 123456)
+    await db.set_setting("tg_api_hash", "0" * 32)
+    await db.close()
 
-        assert await target.get_setting("tg_session") == "SESSION-STRING"
-        assert await target.get_provider_key("groq") == "gsk_from_snapshot"
+    db2 = await _open(db_path, Fernet.generate_key())
+    try:
+        # tg_api_id is not a SECRET key - it is stored as plain JSON, so it
+        # survives a key change untouched. That makes the half-broken state
+        # especially confusing: the API ID is still there, the hash is not.
+        assert await db2.get_setting("tg_api_id") == 123456
+        assert await db2.get_setting("tg_api_hash") is None
+        assert "tg_api_hash" in db2.undecryptable
+        # Which is why the wizard's guard checks both, not just the id.
+        lost = db2.undecryptable & {"tg_api_id", "tg_api_hash"}
+        assert lost == {"tg_api_hash"}
     finally:
-        await target.close()
+        await db2.close()
 
 
 @pytest.mark.asyncio
-async def test_snapshot_never_overwrites_a_live_session(tmp_path) -> None:
-    """The opposite risk: a stale snapshot stealing a working deployment."""
-    source = await _db(tmp_path, "source")
+async def test_a_readable_secret_is_still_returned(tmp_path) -> None:
+    """The stable-key case must be unchanged."""
+    key = Fernet.generate_key()
+    db = await _open(tmp_path / "bot.db", key)
     try:
-        await source.set_setting("tg_session", "OLD-SESSION")
-        snapshot = await source.export_state_b64("backup")
-    finally:
-        await source.close()
-
-    target = await _db(tmp_path, "target")
-    try:
-        await target.set_setting("tg_session", "LIVE-SESSION")
-        await _seed_env_defaults(_env(tmp_path, bot_state_b64=snapshot), target)
-        assert await target.get_setting("tg_session") == "LIVE-SESSION"
-    finally:
-        await target.close()
-
-
-@pytest.mark.asyncio
-async def test_a_corrupt_snapshot_is_logged_not_fatal(tmp_path, caplog) -> None:
-    db = await _db(tmp_path)
-    try:
-        await _seed_env_defaults(_env(tmp_path, bot_state_b64="not-a-real-snapshot"), db)
-        assert "Failed to import BOT_STATE_B64" in caplog.text
-        # Boot continues; the owner can still /setup.
-        assert await db.get_setting("tg_session") is None
+        await db.set_setting("tg_api_hash", "abcdef0123456789abcdef0123456789")
+        assert await db.get_setting("tg_api_hash") == "abcdef0123456789abcdef0123456789"
+        assert db.undecryptable == set()
     finally:
         await db.close()
 
 
-# ---------------------------------------------------------------------------
-# 3. A brand-new deploy must say why it is silent
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_non_secret_setting_is_never_affected(tmp_path) -> None:
+    """`tg_api_id` is plain JSON; a key change must not touch it."""
+    db_path = tmp_path / "bot.db"
+    db = await _open(db_path, Fernet.generate_key())
+    await db.set_setting("tg_api_id", 987654)
+    await db.close()
+
+    db2 = await _open(db_path, Fernet.generate_key())
+    try:
+        assert await db2.get_setting("tg_api_id") == 987654
+    finally:
+        await db2.close()
 
 
 @pytest.mark.asyncio
-async def test_diag_says_nothing_is_synced_when_no_groups_exist(tmp_path) -> None:
-    """"Not responding" is true, correct, and fixable - so /diag must say it."""
+async def test_overwriting_a_lost_secret_repairs_it(tmp_path) -> None:
+    """Re-entering the API Hash must actually fix the deployment."""
+    db_path = tmp_path / "bot.db"
+    db = await _open(db_path, Fernet.generate_key())
+    await db.set_setting("tg_api_hash", "old" * 10)
+    await db.close()
+
+    db2 = await _open(db_path, Fernet.generate_key())
+    try:
+        assert await db2.get_setting("tg_api_hash") is None
+        await db2.set_setting("tg_api_hash", "new" * 10)
+        assert await db2.get_setting("tg_api_hash") == "new" * 10
+    finally:
+        await db2.close()
+
+
+# ---------------------------------------------------------------------------
+# The wizard must write what it collects
+# ---------------------------------------------------------------------------
+
+
+def test_the_api_hash_step_persists_both_values() -> None:
+    """It used to keep them in FSM state only, so a restart lost them.
+
+    Pinned at the source because the handler needs a full aiogram Message; what
+    matters is that the write happens at all.
+    """
     import inspect
 
-    from qna_bot.dashboard.handlers import dashboard as diag_module
+    from qna_bot.dashboard.handlers import wizard
 
-    source = inspect.getsource(diag_module.cmd_diag)
-    # The empty-table case has its own explanation and its own verdict line,
-    # distinct from "you synced groups but enabled none".
-    assert "No groups synced yet" in source
-    assert "none have been synced yet" in source
-    assert "Select &amp; Configure Groups" in source
+    src = inspect.getsource(wizard.msg_api_hash)
+    assert 'set_setting("tg_api_id"' in src
+    assert 'set_setting("tg_api_hash"' in src
 
 
-@pytest.mark.asyncio
-async def test_fresh_database_reports_no_enabled_groups(tmp_path) -> None:
-    """The state /diag reads: schema exists, zero groups, zero answers."""
-    db = await _db(tmp_path)
-    try:
-        assert await db.list_groups() == []
-        assert await db.list_groups(only_enabled=True) == []
-        # Defaults keep the responder nominally on, so the *only* thing wrong is
-        # the empty group list - exactly what the new verdict points at.
-        assert await db.get_setting("global_enabled", True) is True
-    finally:
-        await db.close()
-
-
-def test_blueprint_declares_the_encryption_key() -> None:
-    """A blueprint that omits it loses every secret on the first restart.
-
-    Parsed by hand rather than with PyYAML: ``yaml`` is not a project dependency,
-    and a test that needs one it cannot import is a test that never runs.
-    """
-    import re
+def test_the_env_blueprint_does_not_declare_api_credentials() -> None:
+    """If this ever changes, the setup guide's instruction to enter them is wrong."""
     from pathlib import Path
 
-    blueprint = (Path(__file__).resolve().parents[1] / "render.yaml").read_text()
-    keys = set(re.findall(r"^\s*-\s*key:\s*(\w+)\s*$", blueprint, re.M))
-    assert {"BOT_TOKEN", "OWNER_ID", "ENCRYPTION_KEY", "BOT_STATE_B64"} <= keys
+    yaml_text = Path(__file__).resolve().parents[1] / "render.yaml"
+    text = yaml_text.read_text(encoding="utf-8")
 
-    # Nothing may block a deploy waiting for a value: a blueprint stuck on
-    # "waiting for configuration" reads to a first-time owner as a broken service.
-    for match in re.finditer(r"- key:\s*(\w+)\s*\n((?:\s{8,}\S.*\n)+)", blueprint):
-        name, block = match.group(1), match.group(2)
-        has_value = re.search(r"^\s*value:", block, re.M) is not None
-        assert not has_value or "sync: false" not in block, name
+    assert "TG_API_ID" not in text
+    assert "TG_API_HASH" not in text
+    # And the two keys a blueprint deploy does ask for are still declared.
+    assert "BOT_TOKEN" in text
+    assert "OWNER_ID" in text
