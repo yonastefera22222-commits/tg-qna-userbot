@@ -66,6 +66,27 @@ Your repo: `github.com/yonastefera22222-commits/tg-qna-userbot` → click **Fork
 > bot now logs a clear `ENCRYPTION_KEY is not a valid Fernet key` warning and keeps
 > running, but every secret stored under the old key becomes unreadable.
 
+> **On a free host, the database itself is temporary.** Render's docs are explicit
+> ([Deploy for Free](https://render.com/docs/free)): free web services have an
+> *ephemeral filesystem*, and "any changes to your web service's filesystem
+> (uploaded images, local SQLite databases, etc.) are **lost** every time the
+> service redeploys, restarts, or spins down". A free service spins down after 15
+> minutes without traffic. The bot keeps its Telegram login in `data/bot.db`, so a
+> plain free deploy **cannot** keep a login for long — the wizard will be undone.
+>
+> **Two settings make it durable, and only these:**
+>
+> | Variable | What it preserves |
+> |---|---|
+> | `TG_API_ID`, `TG_API_HASH` | Stop re-entering your API credentials every restart |
+> | `TG_STRING_SESSION` | The login itself — no OTP screen, ever again |
+> | `ENCRYPTION_KEY` | Keeps stored secrets readable across restarts |
+> | `BOT_STATE_B64` | Groups, AI keys and settings (export from the dashboard) |
+>
+> Generate `TG_STRING_SESSION` once with `python tools/make_session.py` (it explains
+> itself), then paste it into the host's **Environment** tab. That is the only step
+> that removes the code from the login entirely.
+
 > **The blueprint does not ask for your Telegram API ID and Hash.** Those are
 > **not** environment variables in `render.yaml`, so a blueprint deploy leaves them
 > unset and the bot will ask for them in the wizard (Step 1). Enter them from

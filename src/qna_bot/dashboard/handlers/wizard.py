@@ -89,6 +89,22 @@ async def _show_wizard_welcome(target: Message | CallbackQuery, ctx: AppContext,
         "4️⃣ Select which group chats to answer questions in\n\n"
         "🔒 <i>Sensitive messages (keys, passwords) are auto-deleted and encrypted at rest.</i>"
     )
+    # Say the quiet part out loud. Render Free has no persistent disk
+    # (https://render.com/docs/free): every redeploy, restart and spin-down erases
+    # data/bot.db, which is where the wizard is about to put everything. On that
+    # host the wizard can be completed and then silently undone 15 minutes later,
+    # so the owner needs the durable channel named before they start, not after
+    # their third attempt.
+    if ctx.env.public_url and not has_env_creds:
+        text += (
+            "\n\n⚠️ <b>Before you start — do you see a free host here?</b>\n"
+            "On <b>Render Free</b> the disk is <b>wiped</b> on every deploy, restart "
+            "and sleep (it sleeps after 15 idle minutes), so anything entered below "
+            "is lost when that happens. Set <code>TG_API_ID</code>, "
+            "<code>TG_API_HASH</code> and <code>ENCRYPTION_KEY</code> in the host's "
+            "<b>Environment</b> tab, or you will be asked for them again and again. "
+            "Once logged in, also save <b>BOT_STATE_B64</b> so the session survives."
+        )
     kb = wizard_welcome_kb(has_env_creds=has_env_creds, is_connected=ctx.userbot.is_connected)
     if isinstance(target, CallbackQuery):
         await safe_edit_text(target, text, reply_markup=kb)
