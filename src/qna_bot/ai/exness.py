@@ -96,6 +96,45 @@ ACCESS_POINT_TTL_SECONDS = 3600.0
 #: name is not offered, a suffixed variant is tried.
 _INSTRUMENT_SUFFIXES = ("", "m", "c", "z", "#", ".raw")
 
+#: Brokers do not agree on what oil and the indices are called, and the same
+#: account may name them differently again (``USTEC`` vs ``USTECm`` vs ``NAS100``).
+#: Unlike the FX pairs, these cannot be derived from a currency pair, so each
+#: instrument carries the names it is quoted under. The first entry is the symbol
+#: this bot reports; the rest are alternatives tried against the account's own
+#: instrument list before giving up.
+#:
+#: Getting this wrong is invisible from the outside: an unrecognised instrument
+#: produces no quote at all, and the answer degrades to "no live data" - which
+#: looks exactly like a broken feed.
+_INSTRUMENT_ALIASES: dict[str, tuple[str, ...]] = {
+    # -- oil ---------------------------------------------------------------
+    # Exness quotes WTI as USOIL (or XTIUSD on some account types); UKOIL/BRENT
+    # is the Brent contract.
+    "USOIL": ("USOIL", "XTIUSD", "WTIUSD", "WTICOUSD", "CRUDOIL", "OILUSD", "USCRUDE", "WTI"),
+    "UKOIL": ("UKOIL", "XBRUSD", "BRENTUSD", "BRENT", "UKBRENT", "XBR"),
+    "NATGAS": ("NATGAS", "XNGUSD", "NGAS", "NATURALGAS", "GASUSD"),
+    # -- US indices --------------------------------------------------------
+    "USTEC": ("USTEC", "NAS100", "US100", "USTECH", "NASDAQ", "NASUSD", "NDX", "USATEC"),
+    "US500": ("US500", "SPX500", "SP500", "US500SPX", "SPX", "USSPX"),
+    "US30": ("US30", "DJ30", "DOW30", "WS30", "US30USD", "DJIA"),
+    "US2000": ("US2000", "RUSSELL2000", "RUT", "US2000USD"),
+    # -- European / Asian indices -----------------------------------------
+    "GER40": ("GER40", "DE40", "GER30", "DE30", "DAX", "DAX40", "GERMANY40"),
+    "UK100": ("UK100", "FTSE100", "FTSE", "GB100"),
+    "FRA40": ("FRA40", "FR40", "CAC40", "CAC"),
+    "EU50": ("EU50", "STOXX50", "ESX50"),
+    "JP225": ("JP225", "JPN225", "NIKKEI", "NIKKEI225", "JPY225"),
+    "HK50": ("HK50", "HSI", "HANG SENG", "HANGSENG"),
+    "AUS200": ("AUS200", "ASX200", "AU200"),
+}
+
+#: Every alias -> the canonical symbol this bot reports, built once.
+_ALIAS_TO_INSTRUMENT: dict[str, str] = {
+    alias.upper().replace(" ", ""): canonical
+    for canonical, aliases in _INSTRUMENT_ALIASES.items()
+    for alias in aliases
+}
+
 #: The tightest timeframe whose history window still comfortably covers "now".
 #: S1 history is only retained for a day; M1 for a year, which is plenty.
 QUOTE_TIMEFRAME = "M1"
@@ -423,16 +462,26 @@ class ExnessClient:
         """
         if not available:
             return instrument
-        if instrument in available:
-            return instrument
-        upper = instrument.upper()
-        for suffix in _INSTRUMENT_SUFFIXES:
-            candidate = f"{upper}{suffix}"
-            if candidate in available:
-                return candidate
+
+        upper = instrument.upper().replace(" ", "")
+        # Broker synonyms first: the account may quote this instrument under a
+        # completely different name (USTEC / NAS100 / US100 are the same index).
+        candidates = list(_INSTRUMENT_ALIASES.get(upper, (upper,)))
+        if upper not in candidates:
+            candidates.append(upper)
+
+        # Then each name with each account-type suffix.
+        for name in candidates:
+            name = name.upper().replace(" ", "")
+            for suffix in _INSTRUMENT_SUFFIXES:
+                candidate = f"{name}{suffix}"
+                if candidate in available:
+                    return candidate
+
         # Case-insensitive last resort (the list is normally uppercase already).
+        wanted = {name.upper().replace(" ", "") for name in candidates}
         for name in available:
-            if name.upper() == upper:
+            if name.upper().replace(" ", "") in wanted:
                 return name
         raise ExnessError(f"Exness account does not offer {instrument}", code=4000)
 

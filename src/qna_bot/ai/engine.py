@@ -14,7 +14,13 @@ from .forex import group_guidance as forex_group_guidance
 from .forex import is_refusal
 from .forex_math import solve_forex_math
 from .language import ANSWER_IN_LANGUAGE_INSTRUCTION, detect_language, prompt_guidance
-from .market import MarketFeed, MarketSnapshot, parse_period_query
+from .market import (
+    MarketFeed,
+    MarketSnapshot,
+    asks_for_mechanics,
+    asks_for_quote,
+    parse_period_query,
+)
 from .math_solver import try_solve_math
 from .providers import (
     DEFAULT_SPEED_MODE,
@@ -394,6 +400,27 @@ class AIEngine:
                         answer=computed.formatted(),
                         provider="local_market",
                         model="ohlc-history",
+                        latency_ms=elapsed_ms,
+                        language=detect_language(asked),
+                    )
+
+        # 1c. A plain price question ("USOIL price?", "US Tech 100 now?") is
+        #     answered from one Exness read and returned with no model call.
+        #     This is the same bargain the local math path makes: the bot
+        #     already holds the exact number, so a model can only add latency
+        #     and a chance to mistype it. Verified against the feed's own
+        #     "live" flag, so a shut market still says so instead of quoting
+        #     Friday's close as current.
+        if forex_group and live_data and asked and not image:
+            if asks_for_quote(asked) and not asks_for_mechanics(asked):
+                quote_answer = await self.market_feed.live_quote_answer(asked)
+                if quote_answer is not None:
+                    elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                    return AnswerResult(
+                        answered=True,
+                        answer=quote_answer,
+                        provider="local_market",
+                        model="exness-quote",
                         latency_ms=elapsed_ms,
                         language=detect_language(asked),
                     )

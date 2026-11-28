@@ -296,6 +296,7 @@ async def test_candle_query_uses_a_negative_count_and_one_from(creds) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("open_market")
 async def test_fresh_candle_becomes_a_live_exness_quote(creds) -> None:
     fake = FakeExness(candles={"EURUSD": candle_payload(price=1.12345)})
     feed = _feed(fake, creds)

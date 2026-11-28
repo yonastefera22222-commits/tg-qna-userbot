@@ -150,7 +150,10 @@ async def cb_test(callback: CallbackQuery, ctx: AppContext) -> None:
         ("exness_api_key", "exness_private_key", "exness_account_id", "exness_gateway_url")
     ))
     try:
-        snapshot = await feed.snapshot("EURUSD and gold")
+        # One symbol from each family this bot answers from. Testing only FX
+        # proved the credentials worked while oil and the indices could still
+        # answer "No live data" - a green tick over a broken answer.
+        snapshot = await feed.snapshot("EURUSD, gold, USOIL and the US Tech 100")
     finally:
         await feed.close()
 
@@ -174,11 +177,21 @@ async def cb_test(callback: CallbackQuery, ctx: AppContext) -> None:
         return
 
     sample = "\n".join(f"• {html.escape(q.label(detailed=True))}" for q in snapshot.quotes)
+    missing = ""
+    if snapshot.failed:
+        # Named, not counted: a missing instrument is a question about what the
+        # account carries, and it must not be presented as a successful test.
+        listed = ", ".join(html.escape(i) for i in snapshot.failed)
+        missing = (
+            "\n\n⚠️ <b>Not on this account:</b> "
+            f"{listed}\n"
+            "<i>Questions about these will answer 'No live data'.</i>"
+        )
     await safe_edit_text(
         callback,
         "🟢 <b>Exness connected</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{sample}\n\n"
+        f"{sample}{missing}\n\n"
         "<i>These prices came from your account. Forex groups will use them.</i>",
         reply_markup=exness_menu_kb(await _configured(ctx)),
     )
