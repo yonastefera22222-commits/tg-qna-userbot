@@ -86,7 +86,21 @@ INDICES = MarketClass(
     "follows the underlying exchange or fixing; weekdays only",
 )
 
-_BY_KEY = {c.key: c for c in (CRYPTO, FOREX, METALS, INDICES)}
+#: Energy - WTI (``USOIL``), Brent and natural gas. A commodity future is not a
+#: currency pair: it is shut at the weekend with its exchange, and its daily
+#: settlement is not the FX 22:00 UTC close. Kept as its own class rather than
+#: folded into FOREX because oil is exactly the instrument that used to be
+#: classified as FX by default, which made a Sunday-evening "USOIL price" claim
+#: to be live while the oil market had not reopened.
+COMMODITIES = MarketClass(
+    "commodities",
+    CLOSED_WEEKENDS,
+    "energy futures; shut at the weekend with the exchange",
+)
+
+_BY_KEY = {
+    c.key: c for c in (CRYPTO, FOREX, METALS, INDICES, COMMODITIES)
+}
 
 
 def market_class_for(instrument: str) -> MarketClass:
@@ -100,13 +114,20 @@ def market_class_for(instrument: str) -> MarketClass:
     symbol = (instrument or "").upper()
     # Imported here, not at module scope: market.py imports this module, and the
     # instrument sets live there to keep one list of what the feed can quote.
-    from .market import _CRYPTO_SYMBOLS
+    from .market import _CRYPTO_SYMBOLS, _INDEX_SYMBOLS
 
     if symbol in _CRYPTO_SYMBOLS:
         return CRYPTO
     if symbol in ("XAUUSD", "XAGUSD"):
         return METALS
     if symbol in ("DXY", "US10Y"):
+        return INDICES
+    # Energy first, then the equity indices: both were previously FOREX by
+    # default, which is the safe-ish side for weekends but the wrong answer for
+    # a commodity that has not reopened yet.
+    if symbol in ("USOIL", "UKOIL", "NATGAS"):
+        return COMMODITIES
+    if symbol in _INDEX_SYMBOLS:
         return INDICES
     return FOREX
 

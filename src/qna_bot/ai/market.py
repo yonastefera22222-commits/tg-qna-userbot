@@ -160,9 +160,42 @@ _CRYPTO_SYMBOLS: dict[str, str] = {
     "LTCUSD": "LTCUSD",
 }
 
+#: Oil and the indices. Named here so a question about them is *recognised*; the
+#: owner's Exness account decides which names it actually quotes (see
+#: ``exness._INSTRUMENT_ALIASES``). Without these entries "USOIL" and
+#: "US Tech 100" matched nothing, the feed returned an empty snapshot, and the
+#: answer degraded to "no live data" - indistinguishable from a dead feed.
+_INDEX_AND_COMMODITY_SYMBOLS: dict[str, str] = {
+    "USOIL": "USOIL",
+    "UKOIL": "UKOIL",
+    "NATGAS": "NATGAS",
+    "USTEC": "USTEC",
+    "US500": "US500",
+    "US30": "US30",
+    "US2000": "US2000",
+    "GER40": "GER40",
+    "UK100": "UK100",
+    "FRA40": "FRA40",
+    "EU50": "EU50",
+    "JP225": "JP225",
+    "HK50": "HK50",
+    "AUS200": "AUS200",
+}
+
+#: The equity indices and index CFDs, excluding energy. The calendar needs the
+#: split because oil and the Nasdaq do not observe the same session.
+_INDEX_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "USTEC", "US500", "US30", "US2000",
+        "GER40", "UK100", "FRA40", "EU50", "JP225", "HK50", "AUS200",
+        "DXY", "US10Y",
+    }
+)
+
 FEEDABLE_INSTRUMENTS: frozenset[str] = frozenset(
     {
         *_CRYPTO_SYMBOLS,
+        *_INDEX_AND_COMMODITY_SYMBOLS,
         "XAUUSD",
         "XAGUSD",
         "DXY",
@@ -195,6 +228,51 @@ _NICKNAME_RE = re.compile(
     + _TICKER_END
 )
 _PAIR_TOKEN_RE = re.compile(_TICKER_START + r"([A-Z]{3})\s*[/\-]?\s*([A-Z]{3})" + _TICKER_END)
+
+#: How a trader writes oil and the indices in a sentence. "US Tech 100" is the
+#: name on the platform; "USTEC", "NAS100" and "the Nasdaq" are the same index.
+#: Matching is phrase-based and case-insensitive because these names contain
+#: spaces and punctuation, which the token regexes above deliberately reject.
+#: Longest phrase first, so "us tech 100" wins over "us tech" and "crude oil"
+#: over "oil".
+_INDEX_PHRASES: dict[str, str] = {
+    "us tech 100": "USTEC", "us tech": "USTEC", "us tech 100 index": "USTEC",
+    "nasdaq 100": "USTEC", "nasdaq": "USTEC", "ustech": "USTEC", "ustec": "USTEC",
+    "nas100": "USTEC", "us100": "USTEC", "ndx": "USTEC",
+    "s&p 500": "US500", "s&p500": "US500", "spx500": "US500", "sp500": "US500",
+    "s&p": "US500", "spx": "US500", "us500": "US500",
+    "dow jones": "US30", "dow 30": "US30", "dj30": "US30", "ws30": "US30",
+    "us30": "US30", "djia": "US30",
+    "russell 2000": "US2000", "russell": "US2000", "us2000": "US2000",
+    "dax 40": "GER40", "dax40": "GER40", "dax": "GER40", "ger40": "GER40",
+    "de40": "GER40", "ger30": "GER40", "de30": "GER40",
+    "ftse 100": "UK100", "ftse100": "UK100", "ftse": "UK100", "uk100": "UK100",
+    "cac 40": "FRA40", "cac40": "FRA40", "cac": "FRA40", "fra40": "FRA40",
+    "stoxx 50": "EU50", "stoxx": "EU50", "eu50": "EU50", "esx50": "EU50",
+    "nikkei 225": "JP225", "nikkei": "JP225", "jpn225": "JP225", "jp225": "JP225",
+    "hang seng": "HK50", "hangseng": "HK50", "hk50": "HK50", "hsi": "HK50",
+    "asx 200": "AUS200", "aus200": "AUS200", "asx200": "AUS200",
+    "wti crude": "USOIL", "wti": "USOIL", "us oil": "USOIL", "usoil": "USOIL",
+    "crude oil": "USOIL", "crude": "USOIL", "oil": "USOIL", "xtiusd": "USOIL",
+    "wticousd": "USOIL", "uscrude": "USOIL",
+    "brent crude": "UKOIL", "brent": "UKOIL", "uk oil": "UKOIL", "ukoil": "UKOIL",
+    "xbrusd": "UKOIL",
+    "natural gas": "NATGAS", "nat gas": "NATGAS", "natgas": "NATGAS",
+    "xngusd": "NATGAS",
+}
+
+#: One regex over every phrase, longest first so the most specific name wins.
+#: The optional trailing letter is the account-type suffix a trader copies off
+#: their own platform (``USOILm``, ``USTECm``); it is dropped before the lookup.
+_INDEX_PHRASE_RE = re.compile(
+    _TICKER_START
+    + r"("
+    + "|".join(re.escape(k) for k in sorted(_INDEX_PHRASES, key=len, reverse=True))
+    + r")"
+    + r"(?:m|c|z)?"
+    + _TICKER_END,
+    re.IGNORECASE,
+)
 
 #: Currencies that can form a spot pair. Recognition only - the owner's Exness
 #: account decides which of these it actually quotes.
@@ -528,6 +606,87 @@ def parse_period_query(text: str) -> PeriodQuery | None:
                        instrument=instruments[0] if instruments else None)
 
 
+#: "What is the price of X", "X now?", "current X rate", "how much is X".
+#: Deliberately about the *price itself*, never about analysis: "EURUSD
+#: prediction" and "why did oil fall" must still reach a model, because no feed
+#: can answer them and a canned number would be wrong about the question.
+_QUOTE_INTENT_RES = (
+    re.compile(
+        r"\b(?:what(?:'s|\s+is)?|whats)\s+(?:the\s+)?"
+        r"(?:current\s+|live\s+|today'?s?\s+|right\s+now\s+)?"
+        r"(?:price|rate|quote|value|level|market\s+price)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:current|live|today'?s?|spot)\s+(?:price|rate|quote|level)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bhow\s+much\s+is\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:price|rate|quote|trading\s+at|at\s+what\s+price)\s+"
+        r"(?:of|for|on)\b",
+        re.IGNORECASE,
+    ),
+    # The bare form groups here actually use: "USOIL price?", "eurusd rate",
+    # "US Tech 100 now?". Anchored to the end so "price action analysis" and
+    # "price prediction" do not qualify - those need reasoning, not a quote.
+    re.compile(
+        r"\b(?:price|rate|quote|now|today)\s*[?!.]*\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def asks_for_quote(text: str) -> bool:
+    """True when the question is *only* "what is the price right now".
+
+    Used to answer from a single Exness read with no model call, which is what
+    makes a price question as fast as the local arithmetic. The test is kept
+    strict on purpose: a question that also asks *why* or *where next* needs
+    reasoning, so it falls through to the normal path.
+    """
+    if not text or len(text) > 160:
+        return False
+    return any(pattern.search(text) for pattern in _QUOTE_INTENT_RES)
+
+
+def format_quote_answer(instrument: str, quote: Quote) -> str:
+    """The one-line answer a price question gets.
+
+    Just the number: this is posted into a giveaway group, and "USOIL 71.42"
+    is what a trader would type. A shut market says so, because Friday's close
+    presented as the live price is a wrong answer, not a terse one.
+    """
+    price = quote.formatted()
+    if quote.kind == "market_closed":
+        return f"{instrument} {price} (market closed)"
+    return f"{instrument} {price}"
+
+
+#: Trading mechanics and definitions. These share words with a price question -
+#: "what is the value of a pip in USOIL" reads as a price request but is a
+#: definition, and answering "USOIL 71.42" to it would be confidently wrong.
+#: They are excluded from the local quote path so they keep reaching a model,
+#: which is the only thing that can explain them.
+_MECHANICS_RE = re.compile(
+    r"\b(?:pips?|pipettes?|points?\s+value|lots?|lot\s+size|mini\s+lot|"
+    r"micro\s+lot|standard\s+lot|leverage|margin|spread|swap|commission|"
+    r"contract\s+size|tick\s+size|tick\s+value|notional|risk|drawdown|"
+    r"stop\s*loss|take\s*profit|position\s+size|what\s+does\s+\w+\s+mean)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_mechanics(text: str) -> bool:
+    """True when the question is about *how trading works*, not a price.
+
+    Used to keep such questions out of the local quote path: they mention an
+    instrument and often the word "price" or "value", but the answer is an
+    explanation no feed can supply.
+    """
+    return bool(text) and bool(_MECHANICS_RE.search(text))
+
+
 def _decimals_for(instrument: str) -> int:
     if "JPY" in instrument:
         return 3
@@ -538,6 +697,10 @@ def _decimals_for(instrument: str) -> int:
         return 2
     if instrument in ("DXY", "US10Y"):
         return 3
+    # Oil is quoted in dollars to 2 dp on the platform, and so are the index
+    # points - 5 dp would read as a tick chart rather than a price.
+    if instrument in _INDEX_AND_COMMODITY_SYMBOLS:
+        return 3 if instrument == "NATGAS" else 2
     return 5
 
 
@@ -560,6 +723,12 @@ def normalise_instrument(token: str) -> str | None:
             return f"{base}{quote}"
     if cleaned in FEEDABLE_INSTRUMENTS:
         return cleaned
+    # A broker synonym ("NAS100", "WTI", "SPX500") names the same instrument.
+    from .exness import _ALIAS_TO_INSTRUMENT
+
+    alias = _ALIAS_TO_INSTRUMENT.get(cleaned)
+    if alias is not None:
+        return alias
     return None
 
 
@@ -574,6 +743,15 @@ def instruments_in(text: str, *, limit: int = 4) -> list[str]:
         return []
     found: list[str] = []
     upper = text.upper()
+
+    for match in _INDEX_PHRASE_RE.finditer(text):
+        phrase = match.group(1).lower().strip()
+        instrument = _INDEX_PHRASES.get(phrase)
+        if instrument is None:
+            # The suffix letter was consumed by the regex, not by the phrase.
+            instrument = _INDEX_PHRASES.get(phrase.rstrip("mcz"))
+        if instrument is not None and instrument not in found:
+            found.append(instrument)
 
     for match in _CRYPTO_PAIR_RE.finditer(text):
         instrument = _CRYPTO_NAMES.get(match.group(1).upper())
@@ -707,6 +885,34 @@ class MarketFeed:
         snapshot = await self._fetch_all(instruments)
         self._cache[key] = (time.monotonic(), snapshot)
         return snapshot
+
+    async def live_quote_answer(self, text: str) -> str | None:
+        """A bare price for a bare price question, with no model in the path.
+
+        The local math solver answers arithmetic in under a millisecond and the
+        group gets an exact number. A price question deserves the same: one
+        Exness read, formatted here, posted as the answer. Asking a model to
+        repeat a figure the bot already holds adds a round trip, a token budget
+        and a chance to mistype the digits.
+
+        Returns ``None`` - never a partial or invented answer - whenever the
+        question is not a plain price question, names no instrument, or the
+        feed could not supply a number. The caller then falls through to the
+        normal path, which is exactly where such a question belonged anyway.
+        """
+        instruments = instruments_in(text)
+        if len(instruments) != 1:
+            # Two instruments in one sentence is a comparison ("EURUSD vs
+            # DXY"), which is a sentence, not a number.
+            return None
+        instrument = instruments[0]
+
+        snapshot = await self.snapshot(text)
+        quote = snapshot.quotes[0] if snapshot.quotes else None
+        if quote is None:
+            return None
+
+        return format_quote_answer(instrument, quote)
 
     async def _fetch_all(self, instruments: list[str]) -> MarketSnapshot:
         snapshot = MarketSnapshot()

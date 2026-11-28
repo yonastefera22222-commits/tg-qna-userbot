@@ -514,7 +514,14 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
                     "AI menu → 📈 Exness Prices to add the API key"
                 )
             else:
-                probe = await feed.snapshot("EURUSD and gold")
+                # The probe spans the instrument families, not just FX: an
+                # account can quote EURUSD perfectly and still not offer USOIL
+                # or the US Tech 100, and that difference is invisible from a
+                # Forex-only probe. It is also the exact reason "USOIL" used to
+                # answer "No live data" while this screen showed green.
+                probe = await feed.snapshot(
+                    "EURUSD, gold, USOIL and the US Tech 100"
+                )
                 if probe.is_empty():
                     reason = feed.last_error or "no price returned"
                     lines.append(
@@ -523,13 +530,21 @@ async def cmd_diag(message: Message, ctx: AppContext) -> None:
                         "price questions will answer <code>No live data</code>"
                     )
                 else:
-                    sample = "; ".join(q.label(detailed=True) for q in probe.quotes[:3])
+                    sample = "; ".join(q.label(detailed=True) for q in probe.quotes[:4])
                     lines.append(
                         f"🟢 <b>Live prices:</b> {html.escape(sample)}"
                     )
                     if any(q.kind == "market_closed" for q in probe.quotes):
                         lines.append(
                             "   <i>market closed — these are the last Exness ticks</i>"
+                        )
+                    if probe.failed:
+                        # Named, not counted: "USOIL" missing is a broker
+                        # question ("does this account carry oil?"), while a
+                        # count alone would look like a transient failure.
+                        missing = ", ".join(html.escape(i) for i in probe.failed)
+                        lines.append(
+                            f"   ⚠️ <i>not offered by this Exness account: {missing}</i>"
                         )
 
     # Per-group verdict

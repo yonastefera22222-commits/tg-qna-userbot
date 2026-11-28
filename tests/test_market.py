@@ -70,18 +70,29 @@ BTC_CLOSES = [
     64855.84, 64893.95, 62987.27, 61901.82, 58798.98, 60094.09, 64000.00, 61605.06,
 ]
 def _all_weekdays() -> list[datetime]:
-    """The last 32 *trading* days, newest last, ending today.
+    """The last 32 *trading* days, newest last, ending on the newest session.
 
     Built from weekdays rather than the last 32 calendar days: "last week" is
     now a calendar Monday-Friday, so a fixture that spans whole weeks is the
     only one whose expected answer does not change with the day CI runs.
+
+    "Today" is included only when the exchange printed a session today. On a
+    Saturday or Sunday the newest real bar is Friday's, so the fixture must say
+    so - otherwise the payload contains a Saturday bar and asserts a high that
+    no market wrote. That was a latent flaw in this fixture: it only ever
+    surfaced when the suite ran at a weekend, and it looked like a feed bug.
     """
     today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    days: list[datetime] = [today]
     probe = today
+    while probe.weekday() >= 5:
+        probe -= timedelta(days=1)
+    days: list[datetime] = [probe]
     while len(days) < 32:
         probe -= timedelta(days=1)
-        if probe.weekday() < 5 or len(days) >= 28:
+        # Weekdays only, with no "close enough" fallback: a fixture that pads
+        # itself with Saturday bars is a fixture asserting a session the market
+        # never printed, which is exactly the bug being tested for.
+        if probe.weekday() < 5:
             days.append(probe)
     return list(reversed(days))
 
@@ -284,6 +295,7 @@ def test_prompt_without_data_keeps_the_refusal_rule() -> None:
 
 
 # --- fetching --------------------------------------------------------------
+@pytest.mark.usefixtures("open_market")
 @pytest.mark.asyncio
 async def test_fx_quote_comes_from_exness() -> None:
     fake = FakeExness(candles={"EURUSD": candle_payload(price=1.0984)})
